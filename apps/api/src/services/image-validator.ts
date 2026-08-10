@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import sharp from 'sharp';
+import exifReader from 'exif-reader';
 
 const MAX_LONG_EDGE_PX = 1_600;
 const MAX_INPUT_PIXELS = 40_000_000;
@@ -10,6 +11,22 @@ const CONTENT_TYPES = {
   png: 'image/png',
   webp: 'image/webp',
 } as const;
+const ALLOWED_IMAGE_EXIF_FIELDS = new Set([
+  'Orientation',
+  'XResolution',
+  'YResolution',
+  'ResolutionUnit',
+  'YCbCrPositioning',
+  'ExifTag',
+]);
+const ALLOWED_PHOTO_EXIF_FIELDS = new Set([
+  'ExifVersion',
+  'ComponentsConfiguration',
+  'FlashpixVersion',
+  'ColorSpace',
+  'PixelXDimension',
+  'PixelYDimension',
+]);
 
 export interface ValidatedImage {
   detectedContentType: (typeof CONTENT_TYPES)[keyof typeof CONTENT_TYPES];
@@ -45,7 +62,9 @@ export async function validateMealImage(
   if (Math.max(metadata.width, metadata.height) > MAX_LONG_EDGE_PX) {
     throw new ImageValidationError('IMAGE_DIMENSIONS_TOO_LARGE');
   }
-  if (metadata.exif) throw new ImageValidationError('IMAGE_METADATA_PRESENT');
+  if (metadata.exif && containsSensitiveExif(metadata.exif)) {
+    throw new ImageValidationError('IMAGE_METADATA_PRESENT');
+  }
 
   return {
     detectedContentType,
@@ -60,4 +79,25 @@ export class ImageValidationError extends Error {
   constructor(readonly code: string) {
     super(code);
   }
+}
+function containsSensitiveExif(buffer: Buffer) {
+  try {
+    const parsed = exifReader(buffer);
+    if (parsed.GPSInfo || parsed.Iop || parsed.Thumbnail) return true;
+    return (
+      hasUnexpectedFields(parsed.Image, ALLOWED_IMAGE_EXIF_FIELDS) ||
+      hasUnexpectedFields(parsed.Photo, ALLOWED_PHOTO_EXIF_FIELDS)
+    );
+  } catch {
+    return true;
+  }
+}
+
+function hasUnexpectedFields(
+  fields: Record<string, unknown> | undefined,
+  allowed: ReadonlySet<string>,
+) {
+  return fields
+    ? Object.keys(fields).some((field) => !allowed.has(field))
+    : false;
 }

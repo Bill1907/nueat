@@ -1,9 +1,16 @@
 import { useState } from 'react';
-import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import {
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  View,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { authClient, useAuthSession } from '@/auth/client';
 import { ActiveNutritionTargetCard } from '@/components/active-nutrition-target-card';
+import { MealPhotoUploadCard } from '@/components/meal-photo-upload-card';
 
 import { NutritionStandardCard } from '@/components/nutrition-standard-card';
 import { ThemedText } from '@/components/themed-text';
@@ -35,7 +42,8 @@ export default function HomeScreen() {
           paddingTop: Platform.OS === 'web' ? 96 : insets.top + Spacing.four,
           paddingBottom: insets.bottom + BottomTabInset + Spacing.four,
         },
-      ]}>
+      ]}
+    >
       <ThemedView style={styles.container}>
         <View style={styles.header}>
           <ThemedText style={styles.brand}>NUEAT</ThemedText>
@@ -44,6 +52,8 @@ export default function HomeScreen() {
             기록을 시작하면 오늘의 영양 격차와 다음 식사 선택지를 알려드려요.
           </ThemedText>
         </View>
+
+        <MealPhotoUploadCard />
 
         <ActiveNutritionTargetCard />
 
@@ -67,7 +77,11 @@ export default function HomeScreen() {
             accessibilityState={{ disabled: isSigningOut }}
             disabled={isSigningOut}
             onPress={() => void signOut()}
-            style={({ pressed }) => [styles.signOutButton, pressed && styles.pressed]}>
+            style={({ pressed }) => [
+              styles.signOutButton,
+              pressed && styles.pressed,
+            ]}
+          >
             <ThemedText type="smallBold" style={styles.signOutText}>
               {isSigningOut ? '로그아웃 중…' : '로그아웃'}
             </ThemedText>

@@ -67,7 +67,9 @@ Onboarding is an authenticated six-step flow: consent, goal, birth year/calculat
 
 The home target card reads the authenticated active target endpoint and renders pending, limited, loading, retry, and versioned active-target states. Stored integer units are formatted only at the display boundary.
 
-Image uploads use a private Railway Bucket through S3-compatible presigned URLs. The API creates opaque keys, signs five-minute PUTs, verifies ownership, declared size/type, decoded file signature, dimensions, EXIF absence, and SHA-256 before marking an asset `validated`. Validated inference assets expire after 24 hours; rejected objects are deleted immediately or queued for retry.
+Image uploads use a private Railway Bucket through S3-compatible presigned URLs. The API creates opaque keys, signs five-minute PUTs, verifies ownership, declared size/type, decoded file signature, dimensions, GPS/non-normalized EXIF absence, and SHA-256 before marking an asset `validated`. Validated inference assets expire after 24 hours; rejected objects are deleted immediately or queued for retry.
+
+The Expo home screen provides camera and library selection, re-encodes every image as JPEG, scales the long edge to 1,600px, retries compression below 10MB, uploads with native progress/cancellation, and calls server completion. One interrupted draft is stored under the app document directory for at most 24 hours and is removed after validation or explicit discard.
 
 ## Railway
 

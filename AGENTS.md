@@ -11,7 +11,7 @@ The client is an Expo/React Native application written in TypeScript and routed 
 Meal images are stored in a private Railway Bucket. The API authenticates the user, generates server-owned object keys, and issues short-lived presigned upload/download access. Persist object keys, never signed URLs. Validate upload size, MIME type, and file signatures before recognition, and delete objects with the owning meal or account.
 
 Re-encode uploads client-side to remove EXIF/GPS, cap the long edge at 1,600px and size at 10MB, and remove local temporary files after upload. Presigned uploads expire after 5 minutes. Inference assets expire within 24 hours; only sanitized 512px thumbnails persist with meal history. Deletion must be performed through retryable `asset_deletion_job` records before account hard deletion. Never log image bytes, base64, signed URLs, object keys, EXIF, or email addresses.
-Upload completion is server-authoritative: compare the stored object with the declared contract, decode it with Sharp, reject unsupported signatures, dimensions above 1,600px, and retained EXIF, then persist dimensions and SHA-256. Never trust client completion metadata.
+Upload completion is server-authoritative: compare the stored object with the declared contract, decode it with Sharp, reject unsupported signatures, dimensions above 1,600px, GPS or non-normalized EXIF fields, then persist dimensions and SHA-256. Never trust client completion metadata.
 
 Planned core flow: authenticated presigned upload → private image storage → food candidates → user confirmation → canonical food mapping → deterministic nutrition calculation → daily gap calculation → constrained recommendation ranking → AI-authored explanation. Generated models may recognize or explain food, but MUST NOT invent nutrition values. Persist source IDs, dataset versions, serving conversions, confidence, and calculation versions. The AI provider/model remains undecided and must be selected through Korean-food golden-set evaluation.
 
@@ -80,6 +80,10 @@ bun run --cwd packages/database db:migrate
 - `apps/mobile/src/components/onboarding/onboarding-flow.tsx`: Six-step authenticated onboarding and calculated/limited result confirmation.
 - `apps/mobile/src/components/onboarding/form.ts`: Testable mobile form-to-API unit conversions and required-consent gate.
 - `apps/mobile/src/components/active-nutrition-target-card.tsx`: Home target loading, error, pending, limited, and active states.
+- `apps/mobile/src/components/meal-photo-upload-card.tsx`: Camera/library selection and explicit prepare/upload/validate/retry/cancel states.
+- `apps/mobile/src/uploads/image-preprocessor.ts`: Re-encoding, 1,600px resize, compression attempts, and durable draft creation.
+- `apps/mobile/src/uploads/image-upload-client.ts`: Signed PUT progress/cancellation and server completion.
+- `apps/mobile/src/uploads/image-upload-draft.ts`: Single 24-hour local retry draft; never stores signed URLs.
 - `apps/mobile/.env.example`: Public API URL configuration; `EXPO_PUBLIC_*` variables MUST NOT contain secrets.
 - `apps/api/src/server.ts`: Fastify composition, CORS, redacted logging, and error contracts.
 - `apps/api/src/auth/auth.ts`: Better Auth email OTP policy.

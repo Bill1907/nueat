@@ -25,6 +25,35 @@ describe('meal image validation', () => {
     expect(result.sha256).toMatch(/^[a-f0-9]{64}$/);
   });
 
+  test('accepts normalized orientation and dimension EXIF without private fields', async () => {
+    const bytes = await sharp({
+      create: { width: 100, height: 80, channels: 3, background: '#16794A' },
+    })
+      .jpeg()
+      .withMetadata({ orientation: 1 })
+      .toBuffer();
+
+    await expect(validateMealImage(bytes, 'image/jpeg')).resolves.toMatchObject(
+      {
+        width: 100,
+        height: 80,
+      },
+    );
+  });
+
+  test('rejects retained descriptive EXIF fields', async () => {
+    const bytes = await sharp({
+      create: { width: 100, height: 80, channels: 3, background: '#16794A' },
+    })
+      .jpeg()
+      .withMetadata({ exif: { IFD0: { Copyright: 'private metadata' } } })
+      .toBuffer();
+
+    await expect(validateMealImage(bytes, 'image/jpeg')).rejects.toMatchObject({
+      code: 'IMAGE_METADATA_PRESENT',
+    });
+  });
+
   test('rejects declared content types that differ from decoded bytes', async () => {
     const bytes = await sharp({
       create: { width: 20, height: 20, channels: 3, background: '#ffffff' },

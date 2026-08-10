@@ -36,13 +36,24 @@ export async function apiRequest<T>(
       headers,
       credentials: Platform.OS === 'web' ? 'include' : undefined,
     });
-  } catch {
+  } catch (cause) {
+    if (cause instanceof Error && cause.name === 'AbortError') throw cause;
     throw new ApiError('네트워크 연결을 확인하고 다시 시도해 주세요.');
   }
 
   if (!response.ok) {
     if (response.status === 401)
       throw new ApiError('로그인 상태를 확인해 주세요.');
+    try {
+      const payload = (await response.json()) as {
+        error?: { message?: unknown };
+      };
+      if (typeof payload.error?.message === 'string') {
+        throw new ApiError(payload.error.message);
+      }
+    } catch (cause) {
+      if (cause instanceof ApiError) throw cause;
+    }
     throw new ApiError();
   }
 
