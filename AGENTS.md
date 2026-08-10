@@ -19,6 +19,7 @@ Planned core flow: authenticated presigned upload → private image storage → 
 - `apps/mobile/src/app/`: Expo Router screens and layouts.
 - `apps/mobile/src/components/`: Reusable mobile UI components.
 - `apps/mobile/src/hooks/`: Shared React hooks.
+- `apps/mobile/src/auth/`: Better Auth client, secure session storage, and auth input rules.
 - `apps/mobile/assets/`: App icons and bundled images.
 - `apps/api/src/`: Fastify server, Better Auth configuration, routes, and external service adapters.
 - `packages/domain/src/`: Pure versioned nutrition and safety policies shared by mobile and API.
@@ -55,8 +56,11 @@ bun run --cwd packages/database db:migrate
 - Preserve raw inputs and versioned calculation references so displayed totals are reproducible.
 - Store nutrient quantities in integer minimum units; `null` means unavailable and MUST remain distinct from zero.
 - Treat confirmed calculation snapshots and consent events as immutable append-only records.
+- Serving and nutrient arithmetic lives in `packages/domain/src/meal-nutrition.ts`: use integer milliunits/milligrams, BigInt intermediates, and positive half-up rounding. Never assume `1ml = 1g`.
+- A meal nutrient total is publishable only when every item has that nutrient; preserve partial known totals and missing-item counts instead of understating intake.
 - API errors use `{ error: { code, message, requestId } }`; never expose stack traces or secret-bearing upstream errors.
 - Better Auth OTPs are six digits, hashed at rest, valid for five minutes, and limited to three attempts. Keep social and password login disabled.
+- Native auth cookies belong in Expo SecureStore through `@better-auth/expo`; never persist session tokens in AsyncStorage or application state. Web storage is only a preview fallback.
 
 ## Important Files
 
@@ -66,10 +70,15 @@ bun run --cwd packages/database db:migrate
 - `apps/mobile/src/app/_layout.tsx`: Root navigation layout.
 - `apps/mobile/src/app/index.tsx`: Initial route.
 - `apps/mobile/src/app/explore.tsx`: User-visible nutrition calculation standard and safety policy.
+- `apps/mobile/src/components/auth/email-otp-screen.tsx`: Email/OTP login, resend cooldown, and client-side attempt UX.
+- `apps/mobile/src/components/auth/auth-gate.tsx`: Session restoration and authenticated route gate.
+- `apps/mobile/src/auth/client.ts`: Better Auth Expo client and SecureStore integration.
+- `apps/mobile/.env.example`: Public API URL configuration; `EXPO_PUBLIC_*` variables MUST NOT contain secrets.
 - `apps/api/src/server.ts`: Fastify composition, CORS, redacted logging, and error contracts.
 - `apps/api/src/auth/auth.ts`: Better Auth email OTP policy.
 - `apps/api/.env.example`: API and Railway environment contract.
 - `packages/domain/src/nutrition-targets.ts`: KDRI target policy, provenance constants, and limited-mode rules.
+- `packages/domain/src/meal-nutrition.ts`: Serving conversion, item calculation, completeness-aware aggregation, and calculation errors.
 - `packages/database/src/schema/index.ts`: Database schema export.
 - `packages/database/drizzle.config.ts`: Migration configuration.
 - `packages/database/.env.example`: Neon connection variable template; real credentials belong in ignored `.env.local` or Railway secrets.

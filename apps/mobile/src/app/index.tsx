@@ -1,5 +1,8 @@
-import { Platform, ScrollView, StyleSheet, View } from 'react-native';
+import { useState } from 'react';
+import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+import { authClient, useAuthSession } from '@/auth/client';
 
 import { NutritionStandardCard } from '@/components/nutrition-standard-card';
 import { ThemedText } from '@/components/themed-text';
@@ -10,6 +13,17 @@ import { useTheme } from '@/hooks/use-theme';
 export default function HomeScreen() {
   const insets = useSafeAreaInsets();
   const theme = useTheme();
+  const session = useAuthSession();
+  const [isSigningOut, setIsSigningOut] = useState(false);
+
+  async function signOut() {
+    setIsSigningOut(true);
+    try {
+      await authClient.signOut();
+    } finally {
+      setIsSigningOut(false);
+    }
+  }
 
   return (
     <ScrollView
@@ -53,6 +67,25 @@ export default function HomeScreen() {
           </ThemedText>
         </View>
         <NutritionStandardCard />
+
+        <ThemedView type="backgroundElement" style={styles.accountCard}>
+          <View style={styles.accountCopy}>
+            <ThemedText type="smallBold">로그인 계정</ThemedText>
+            <ThemedText type="small" themeColor="textSecondary">
+              {session.data?.user.email}
+            </ThemedText>
+          </View>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityState={{ disabled: isSigningOut }}
+            disabled={isSigningOut}
+            onPress={() => void signOut()}
+            style={({ pressed }) => [styles.signOutButton, pressed && styles.pressed]}>
+            <ThemedText type="smallBold" style={styles.signOutText}>
+              {isSigningOut ? '로그아웃 중…' : '로그아웃'}
+            </ThemedText>
+          </Pressable>
+        </ThemedView>
       </ThemedView>
     </ScrollView>
   );
@@ -110,5 +143,28 @@ const styles = StyleSheet.create({
   sectionHeader: {
     gap: Spacing.one,
     paddingTop: Spacing.two,
+  },
+  accountCard: {
+    minHeight: 72,
+    padding: Spacing.three,
+    borderRadius: 18,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.three,
+  },
+  accountCopy: {
+    flex: 1,
+    gap: Spacing.half,
+  },
+  signOutButton: {
+    minHeight: 44,
+    justifyContent: 'center',
+    paddingHorizontal: Spacing.three,
+  },
+  signOutText: {
+    color: '#C43D3D',
+  },
+  pressed: {
+    opacity: 0.7,
   },
 });

@@ -25,6 +25,7 @@ bun run lint
 Local secrets belong in ignored `.env.local` files. Start from:
 
 - `apps/api/.env.example`
+- `apps/mobile/.env.example`
 - `packages/database/.env.example`
 
 Database commands connect directly to the configured Neon PostgreSQL instance:
@@ -35,6 +36,10 @@ bun run db:migrate
 ```
 
 Review generated SQL under `packages/database/drizzle/` before migrating.
+
+## Nutrition calculation
+
+`packages/domain/src/meal-nutrition.ts` converts sourced household servings to integer milligrams and calculates nutrients with BigInt intermediates and positive half-up rounding. Volume and household units require a matching `FoodServing`; missing nutrients remain partial and are never treated as zero.
 
 ## API
 
@@ -47,6 +52,8 @@ GET|POST /api/auth/*
 ```
 
 Authentication uses Better Auth email OTP only. Resend sends six-digit OTPs from `NUEAT <auth@boseong.dev>`; codes expire after five minutes and allow three attempts.
+
+The Expo client gates product routes behind the session, stores native auth cookies in SecureStore, restores sessions on launch, and provides email entry, six-digit OTP, 60-second resend cooldown, three-attempt UX, and logout. `EXPO_PUBLIC_API_URL` is public configuration and defaults to `https://api-nueat.boseong.dev`; never place secrets in an `EXPO_PUBLIC_*` variable.
 
 ## Railway
 

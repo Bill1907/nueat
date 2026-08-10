@@ -173,7 +173,7 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 | Feedback | target_type/id, rating, reason_code, correction, free_text |
 | AnalyticsEvent | user/anonymous session ids, allowlisted properties, occurred_at; 민감정보·OTP·signed URL 제외 |
 
-계산 원칙: 모든 양은 정수 최소 단위로 저장하고 `MealItem.grams_mg × NutrientProfile(value per basis_mg) ÷ basis_mg`를 명시적인 반올림 규칙으로 계산한다. 결측값은 `null`이며 0으로 간주하지 않는다. 확정 시 원본 영양 프로필·출처·데이터셋·계산 버전과 입력값을 immutable snapshot으로 보존한다. 목표 변경은 기존 `NutritionProfile`을 수정하지 않고 유효기간을 종료한 뒤 새 버전을 생성한다.
+계산 원칙: 표시 단위의 1은 `amount_milliunits=1,000`, 질량은 mg 정수로 저장한다. g 입력은 `amount_milliunits=grams_mg`이며 ml·인분·공기·조각은 출처가 있는 정확한 `FoodServing` 변환 없이는 계산하지 않는다. 영양값은 `grams_mg × profile_value ÷ basis_mg`를 BigInt 중간값과 양수 half-up 반올림으로 계산해 부동소수점·overflow를 방지한다. 결측값은 `null`이며 0으로 간주하지 않는다. 한 항목이라도 특정 영양소가 결측이면 해당 식사 총계는 `null/partial`로 표시하되 알려진 합계와 결측 항목 수를 함께 유지한다. 확정 시 원본 영양 프로필·출처·데이터셋·계산 버전과 입력값을 immutable snapshot으로 보존한다. 목표 변경은 기존 `NutritionProfile`을 수정하지 않고 유효기간을 종료한 뒤 새 버전을 생성한다.
 
 ## 9. AI 및 영양 데이터 아키텍처
 
@@ -208,6 +208,8 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 - 모노레포의 패키지 매니저·스크립트·테스트와 API 런타임은 Bun으로 통일한다. Expo 도구 호환을 위해 개발·CI 환경에는 Node.js LTS도 유지한다.
 - API는 `/health/live`, Neon을 확인하는 `/health/ready`, Better Auth `/api/auth/*`, 인증 사용자 `/api/me`를 제공한다. 오류 응답은 request ID를 포함한 안정적인 공통 계약을 사용한다.
 - OTP는 6자리·5분 만료·3회 시도·재발급 시 회전·해시 저장을 적용하며 발송 요청은 60초당 3회로 제한한다. 전역 rate limit은 Neon DB에 저장해 Railway 다중 인스턴스에서도 공유한다.
+- Expo 앱은 `@better-auth/expo`와 SecureStore로 세션 쿠키를 보관하고 앱 시작 시 복원한다. 미인증 사용자는 제품 탭 대신 이메일→OTP 화면을 보고, OTP 재발송은 60초 대기·로컬 3회 실패 UX를 적용한다.
+- 로그아웃 시 서버 세션을 종료하고 SecureStore 인증 쿠키를 제거한다. AsyncStorage·분석 이벤트·React 상태에 세션 토큰을 영구 저장하지 않는다.
 - Railway는 root Dockerfile로 API만 빌드하고 pre-deploy migration 후 `/health/ready`를 통과해야 배포를 완료한다.
 - 식사 이미지는 비공개 Railway Bucket에 저장한다. DB에는 영구 URL이 아닌 object key와 검증된 메타데이터만 저장한다.
 - 업로드 전 API가 사용자 인증과 권한을 확인하고 서버가 object key를 생성한 뒤 짧은 만료 시간의 presigned upload 정보를 발급한다. 콘텐츠 형식과 최대 크기를 서명 조건으로 제한한다.
