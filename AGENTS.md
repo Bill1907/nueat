@@ -15,6 +15,7 @@ Upload completion is server-authoritative: compare the stored object with the de
 Validated images attach to at most one MealLog. `POST /api/meal-logs` is idempotent by image asset and creates only a `draft`; mock recognition is versioned as `mock-recognition-v1`, contains labels/portions/confidence only, and MUST NOT be treated as nutrition data or confirmed intake.
 
 Planned core flow: authenticated presigned upload → private image storage → food candidates → user confirmation → canonical food mapping → deterministic nutrition calculation → daily gap calculation → constrained recommendation ranking → AI-authored explanation. Generated models may recognize or explain food, but MUST NOT invent nutrition values. Persist source IDs, dataset versions, serving conversions, confidence, and calculation versions. The AI provider/model remains undecided and must be selected through Korean-food golden-set evaluation.
+The initial canonical catalog is `packages/database/src/fixtures/core-korean-foods.ts`: exactly 20 analyzed K-FIND 음식 DB records from release `2025-12-29`. Preserve the K-FCDB food code, dataset version, integer scaling, gram-only serving evidence, and MFDS attribution/copyright reference. Do not infer ml-to-g conversions.
 
 ## Key Directories
 
@@ -89,6 +90,8 @@ bun run --cwd packages/database db:migrate
 - `apps/mobile/src/components/meal-confirmation-modal.tsx`: Draft image, mock candidates, confidence, and item add/edit/delete UI.
 - `apps/mobile/src/api/meal-drafts.ts`: Authenticated MealLog draft and item mutation client.
 - `apps/mobile/src/meals/meal-draft-policy.ts`: Pure meal-time inference, portion parsing, and serving-unit labels.
+- `apps/mobile/src/api/foods.ts`: Authenticated source-backed canonical food search client.
+- `apps/mobile/src/meals/food-selection-policy.ts`: Pure Korean label comparison and mapping-validity rules.
 - `apps/api/src/server.ts`: Fastify composition, CORS, redacted logging, and error contracts.
 - `apps/api/src/auth/auth.ts`: Better Auth email OTP policy.
 - `apps/api/.env.example`: API and Railway environment contract.
@@ -96,6 +99,7 @@ bun run --cwd packages/database db:migrate
 - `apps/api/src/routes/nutrition-target.ts`: Authenticated pending/limited/active nutrition-target response for product surfaces.
 - `apps/api/src/routes/image-asset.ts`: Authenticated upload intents, server validation completion, safe status, and download signing.
 - `apps/api/src/routes/meal-log.ts`: Owned image attachment, idempotent draft creation, versioned mock recognition, and draft item mutations.
+- `apps/api/src/routes/food.ts`: Authenticated normalized food search with preferred sourced profiles and servings.
 - `apps/api/src/services/image-object-store.ts`: S3-compatible Railway Bucket adapter and sanitized storage errors.
 - `apps/api/src/services/image-validator.ts`: Decoding, type/dimension/metadata validation, and SHA-256 derivation.
 - `packages/domain/src/nutrition-targets.ts`: KDRI target policy, provenance constants, and limited-mode rules.
@@ -103,6 +107,7 @@ bun run --cwd packages/database db:migrate
 - `packages/domain/src/meal-nutrition.ts`: Serving conversion, item calculation, completeness-aware aggregation, and calculation errors.
 - `packages/database/src/schema/index.ts`: Database schema export.
 - `packages/database/src/schema/meal.ts`: MealLog/MealItem state, recognition provenance, ownership links, and draft constraints.
+- `packages/database/src/fixtures/core-korean-foods.ts`: Versioned K-FIND 20-food manifest and source attribution.
 - `packages/database/drizzle.config.ts`: Migration configuration.
 - `packages/database/.env.example`: Neon connection variable template; real credentials belong in ignored `.env.local` or Railway secrets.
 - `Dockerfile` and `railway.json`: Railway API build, migration, readiness, and restart policy.

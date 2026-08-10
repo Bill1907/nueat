@@ -61,6 +61,8 @@ POST /api/meal-logs
 GET|PATCH|DELETE /api/meal-logs/:mealLogId
 POST /api/meal-logs/:mealLogId/items
 PATCH|DELETE /api/meal-logs/:mealLogId/items/:itemId
+GET  /api/foods/search
+PUT  /api/meal-logs/:mealLogId/items/:itemId/food
 ```
 
 Authentication uses Better Auth email OTP only. Resend sends six-digit OTPs from `NUEAT <auth@boseong.dev>`; codes expire after five minutes and allow three attempts.
@@ -76,6 +78,8 @@ Image uploads use a private Railway Bucket through S3-compatible presigned URLs.
 The Expo home screen provides camera and library selection, re-encodes every image as JPEG, scales the long edge to 1,600px, retries compression below 10MB, uploads with native progress/cancellation, and calls server completion. One interrupted draft is stored under the app document directory for at most 24 hours and is removed after validation or explicit discard.
 
 A validated image is attached to exactly one draft MealLog. Draft creation is idempotent by image asset, atomically claims the owned asset, persists `mock-recognition-v1` results, and returns editable items. Mock labels and confidence values are UI scaffolding only: drafts never count as consumed food and contain no invented nutrition values.
+
+Canonical food search is source-backed. The initial 20-food Korea-first fixture uses analyzed 100g rows from the official K-FIND `음식 DB` release `2025-12-29`; nutrients retain the original food code, dataset version, source registry, and verified gram serving. Editing a mapped label clears its canonical food/profile linkage, while selecting a search result restores the mapping explicitly.
 
 ## Railway
 

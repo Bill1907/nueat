@@ -28,6 +28,9 @@ export interface MealDraftItem {
   recognitionConfidenceBps: number | null;
   portionConfidenceBps: number | null;
   userCorrected: boolean;
+  foodId: string | null;
+  nutrientProfileId: string | null;
+  mappingConfidenceBps: number | null;
 }
 
 export interface MealDraftResponse {
@@ -84,6 +87,19 @@ export function deleteMealDraftItem(mealLogId: string, itemId: string) {
   return apiRequest<MealDraftResponse>(
     `/api/meal-logs/${mealLogId}/items/${itemId}`,
     { method: 'DELETE' },
+  );
+}
+export function mapMealDraftItemFood(
+  mealLogId: string,
+  itemId: string,
+  foodId: string,
+) {
+  return apiRequest<MealDraftResponse>(
+    `/api/meal-logs/${mealLogId}/items/${itemId}/food`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ foodId }),
+    },
   );
 }
 

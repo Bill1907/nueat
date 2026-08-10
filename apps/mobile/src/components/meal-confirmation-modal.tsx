@@ -1,5 +1,5 @@
 import { Image } from 'expo-image';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Modal,
   Pressable,
@@ -14,15 +14,21 @@ import {
   deleteMealDraftItem,
   getMealDraft,
   getMealImageDownloadIntent,
+  mapMealDraftItemFood,
   type MealDraftItem,
   type MealDraftResponse,
   type MealUnit,
   updateMealDraftItem,
 } from '@/api/meal-drafts';
+import { searchFoods, type CanonicalFood } from '@/api/foods';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import { decimalToMilliunits, mealUnitLabel } from '@/meals/meal-draft-policy';
+import {
+  isFoodMappingCurrent,
+  normalizeKoreanFoodLabel,
+} from '@/meals/food-selection-policy';
 
 const units: MealUnit[] = ['g', 'ml', 'serving', 'bowl', 'piece'];
 
@@ -31,6 +37,9 @@ type ItemForm = {
   amount: string;
   unit: MealUnit;
 };
+type FoodSearchState =
+  | { status: 'idle' | 'loading' | 'empty'; foods: CanonicalFood[] }
+  | { status: 'error'; foods: CanonicalFood[]; message: string };
 
 export function MealConfirmationModal({
   mealLogId,
@@ -48,6 +57,19 @@ export function MealConfirmationModal({
   const [loadedMealLogId, setLoadedMealLogId] = useState<string | null>(null);
   const [savingItemId, setSavingItemId] = useState<string | null>(null);
 
+  const [foodSearchItemId, setFoodSearchItemId] = useState<string | null>(null);
+  const [foodQuery, setFoodQuery] = useState('');
+  const [foodSearchState, setFoodSearchState] = useState<FoodSearchState>({
+    status: 'idle',
+    foods: [],
+  });
+  const [mappedFoods, setMappedFoods] = useState<Record<string, CanonicalFood>>(
+    {},
+  );
+  const [invalidatedMappings, setInvalidatedMappings] = useState<Set<string>>(
+    new Set(),
+  );
+  const foodSearchRequest = useRef(0);
   useEffect(() => {
     if (!visible || !mealLogId) return;
     let active = true;
@@ -61,6 +83,11 @@ export function MealConfirmationModal({
         setImageUrl(null);
         setData(mealDraft);
         setForms(formsFromItems(mealDraft.items));
+        setMappedFoods({});
+        setInvalidatedMappings(new Set());
+        void loadMappedFoods(mealDraft.items).then((foods) => {
+          if (active) setMappedFoods(foods);
+        });
 
         const intent = await getMealImageDownloadIntent(
           mealDraft.mealLog.imageAssetId,
@@ -75,12 +102,92 @@ export function MealConfirmationModal({
       active = false;
     };
   }, [mealLogId, visible]);
+  async function runFoodSearch() {
+    const query = normalizeKoreanFoodLabel(foodQuery);
+    if (!foodSearchItemId) return;
+    if (!query) {
+      setFoodSearchState({ status: 'empty', foods: [] });
+      return;
+    }
+
+    const requestId = ++foodSearchRequest.current;
+    setFoodSearchState({ status: 'loading', foods: [] });
+    try {
+      const { foods } = await searchFoods(query);
+      if (requestId !== foodSearchRequest.current) return;
+      setFoodSearchState({
+        status: foods.length === 0 ? 'empty' : 'idle',
+        foods,
+      });
+    } catch (cause) {
+      if (requestId !== foodSearchRequest.current) return;
+      setFoodSearchState({
+        status: 'error',
+        foods: [],
+        message: errorMessage(cause),
+      });
+    }
+  }
 
   function applyResponse(response: MealDraftResponse) {
     setData(response);
     setLoadedMealLogId(response.mealLog.id);
     setForms(formsFromItems(response.items));
+    setMappedFoods((current) =>
+      Object.fromEntries(
+        response.items.flatMap((item) => {
+          const food = current[item.id];
+          return item.foodId === food?.id ? [[item.id, food]] : [];
+        }),
+      ),
+    );
   }
+
+  function updateRecognizedLabel(item: MealDraftItem, recognizedLabel: string) {
+    updateForm(item.id, { recognizedLabel });
+    if (!item.foodId) return;
+
+    const food = mappedFoods[item.id];
+    setInvalidatedMappings((current) => {
+      const next = new Set(current);
+      if (isFoodMappingCurrent(recognizedLabel, food ?? null)) {
+        next.delete(item.id);
+      } else {
+        next.add(item.id);
+      }
+      return next;
+    });
+  }
+
+  async function selectFood(item: MealDraftItem, food: CanonicalFood) {
+    if (!mealLogId) return;
+    setSavingItemId(item.id);
+    setLoadError(null);
+    try {
+      const response = await mapMealDraftItemFood(mealLogId, item.id, food.id);
+      setMappedFoods((current) => ({ ...current, [item.id]: food }));
+      setInvalidatedMappings((current) => {
+        const next = new Set(current);
+        next.delete(item.id);
+        return next;
+      });
+      applyResponse(response);
+      setForms((current) => ({
+        ...current,
+        [item.id]: {
+          ...current[item.id],
+          recognizedLabel: food.canonicalNameKo,
+        },
+      }));
+      setFoodSearchItemId(null);
+      setFoodQuery('');
+    } catch (cause) {
+      setLoadError(errorMessage(cause));
+    } finally {
+      setSavingItemId(null);
+    }
+  }
+
 
   function updateForm(itemId: string, update: Partial<ItemForm>) {
     setForms((current) => ({
@@ -105,9 +212,10 @@ export function MealConfirmationModal({
     setSavingItemId(item.id);
     setLoadError(null);
     try {
+      const recognizedLabel = form.recognizedLabel.trim();
       applyResponse(
         await updateMealDraftItem(mealLogId, item.id, {
-          recognizedLabel: form.recognizedLabel.trim(),
+          ...(recognizedLabel === item.recognizedLabel ? {} : { recognizedLabel }),
           amountMilliunits,
           unit: form.unit,
         }),
@@ -206,6 +314,13 @@ export function MealConfirmationModal({
               const form = forms[item.id];
               if (!form) return null;
               const saving = savingItemId === item.id;
+              const mappedFood = mappedFoods[item.id];
+              const mappingNeedsReconnect =
+                item.foodId !== null &&
+                (invalidatedMappings.has(item.id) ||
+                  (mappedFood !== undefined &&
+                    !isFoodMappingCurrent(form.recognizedLabel, mappedFood)));
+              const searchOpen = foodSearchItemId === item.id;
               return (
                 <View key={item.id} style={styles.itemCard}>
                   <ThemedText type="smallBold">음식</ThemedText>
@@ -213,11 +328,117 @@ export function MealConfirmationModal({
                     accessibilityLabel="음식 이름"
                     editable={!saving}
                     onChangeText={(recognizedLabel) =>
-                      updateForm(item.id, { recognizedLabel })
+                      updateRecognizedLabel(item, recognizedLabel)
                     }
                     style={styles.input}
                     value={form.recognizedLabel}
                   />
+                  {item.foodId && !mappingNeedsReconnect && (
+                    <ThemedText type="small" style={styles.mappingConnected}>
+                      공식 DB 연결
+                      {mappedFood
+                        ? ` · ${mappedFood.nutrientProfile.sourceDisplayName} · ${mappedFood.nutrientProfile.datasetVersion}`
+                        : ' · 출처 정보 확인 중'}
+                    </ThemedText>
+                  )}
+                  {mappingNeedsReconnect && (
+                    <ThemedText
+                      accessibilityRole="alert"
+                      type="smallBold"
+                      style={styles.mappingInvalid}
+                    >
+                      다시 연결 필요
+                    </ThemedText>
+                  )}
+                  <ModalButton
+                    disabled={saving}
+                    label={searchOpen ? '음식 검색 닫기' : '한국 음식 DB 검색'}
+                    onPress={() => {
+                      if (searchOpen) {
+                        setFoodSearchItemId(null);
+                        foodSearchRequest.current += 1;
+                        setFoodSearchState({ status: 'idle', foods: [] });
+                        setFoodQuery('');
+                      } else {
+                        setFoodSearchItemId(item.id);
+                        setFoodSearchState({ status: 'idle', foods: [] });
+                        setFoodQuery(form.recognizedLabel);
+                      }
+                    }}
+                    secondary
+                  />
+                  {searchOpen && (
+                    <View style={styles.foodSearch}>
+                      <TextInput
+                        accessibilityLabel="한국 음식 DB 검색어"
+                        autoFocus
+                        editable={!saving}
+                        onChangeText={setFoodQuery}
+                        placeholder="음식 이름을 입력해 주세요"
+                        style={styles.input}
+                        value={foodQuery}
+                      />
+                      <ModalButton
+                        disabled={saving || foodSearchState.status === 'loading'}
+                        label="공식 DB 검색 실행"
+                        onPress={() => void runFoodSearch()}
+                        secondary
+                      />
+                      {foodSearchState.status === 'loading' && (
+                        <ThemedText type="small" themeColor="textSecondary">
+                          공식 음식 DB를 검색하고 있어요.
+                        </ThemedText>
+                      )}
+                      {foodSearchState.status === 'empty' && (
+                        <ThemedText type="small" themeColor="textSecondary">
+                          검색 결과가 없어요.
+                        </ThemedText>
+                      )}
+                      {foodSearchState.status === 'error' && (
+                        <ThemedText
+                          accessibilityRole="alert"
+                          type="small"
+                          style={styles.errorText}
+                        >
+                          {foodSearchState.message}
+                        </ThemedText>
+                      )}
+                      {foodSearchState.foods.map((food) => (
+                        <Pressable
+                          key={food.id}
+                          accessibilityLabel={[
+                            food.canonicalNameKo,
+                            food.category,
+                            food.nutrientProfile.sourceDisplayName,
+                            food.nutrientProfile.datasetVersion,
+                            `제공량 ${food.servings.map((serving) => serving.labelKo).join(', ') || '없음'}`,
+                          ].join(', ')}
+                          accessibilityRole="button"
+                          disabled={saving}
+                          onPress={() => void selectFood(item, food)}
+                          style={({ pressed }) => [
+                            styles.foodResult,
+                            (pressed || saving) && styles.pressed,
+                          ]}
+                        >
+                          <ThemedText type="smallBold">
+                            {food.canonicalNameKo}
+                          </ThemedText>
+                          <ThemedText type="small" themeColor="textSecondary">
+                            {food.category}
+                            {food.preparation ? ` · ${food.preparation}` : ''}
+                          </ThemedText>
+                          <ThemedText type="small" themeColor="textSecondary">
+                            {food.nutrientProfile.sourceDisplayName} ·{' '}
+                            {food.nutrientProfile.datasetVersion}
+                          </ThemedText>
+                          <ThemedText type="small" themeColor="textSecondary">
+                            제공량: {food.servings.map((serving) => serving.labelKo).join(', ') || '없음'}
+                          </ThemedText>
+                        </Pressable>
+                      ))}
+                    </View>
+                  )}
                   <ThemedText type="small" themeColor="textSecondary">
                     음식 인식 {confidenceLabel(item.recognitionConfidenceBps)} ·
                     양 추정 {confidenceLabel(item.portionConfidenceBps)}
@@ -301,6 +522,28 @@ function formsFromItems(items: MealDraftItem[]) {
   );
 }
 
+async function loadMappedFoods(items: MealDraftItem[]) {
+  const matches = await Promise.all(
+    items
+      .filter((item) => item.foodId)
+      .map(async (item) => {
+        try {
+          const { foods } = await searchFoods(item.recognizedLabel);
+          const food = foods.find((candidate) => candidate.id === item.foodId);
+          return food ? ([item.id, food] as const) : null;
+        } catch {
+          return null;
+        }
+      }),
+  );
+
+  return Object.fromEntries(
+    matches.filter(
+      (match): match is readonly [string, CanonicalFood] => match !== null,
+    ),
+  );
+}
+
 function confidenceLabel(basisPoints: number | null) {
   return basisPoints === null
     ? '확인 필요'
@@ -373,6 +616,18 @@ const styles = StyleSheet.create({
     paddingHorizontal: Spacing.two,
     color: '#1D2A23',
   },
+  foodSearch: { gap: Spacing.two },
+  foodResult: {
+    minHeight: 44,
+    gap: Spacing.half,
+    padding: Spacing.two,
+    borderWidth: 1,
+    borderColor: '#AAB8B0',
+    borderRadius: 10,
+    backgroundColor: '#FFFFFF',
+  },
+  mappingConnected: { color: '#16794A' },
+  mappingInvalid: { color: '#B42318' },
   unitRow: { flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.one },
   unitButton: {
     minHeight: 44,

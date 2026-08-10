@@ -43,6 +43,13 @@
       "when": 1786375477340,
       "tag": "0005_amused_surge",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1786376000000,
+      "tag": "0006_core_korean_foods",
+      "breakpoints": true
     }
   ]
 }

@@ -7,6 +7,9 @@
     "apps/*",
     "packages/*"
   ],
+  "overrides": {
+    "expo-constants": "57.0.10"
+  },
   "scripts": {
     "start": "bun run --filter @nueat/mobile start",
     "mobile": "bun run --filter @nueat/mobile start",

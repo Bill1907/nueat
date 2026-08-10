@@ -1,0 +1,243 @@
+import { afterEach, describe, expect, test } from 'bun:test';
+import {
+  foodAliases,
+  foods,
+  foodServings,
+  mealItems,
+  mealLogs,
+  nutrientProfiles,
+  type Database,
+} from '@nueat/database';
+import type { FastifyInstance } from 'fastify';
+
+import type { Auth } from '../src/auth/auth';
+import { parseEnvironment } from '../src/config/env';
+import { buildServer } from '../src/server';
+
+const environment = parseEnvironment({
+  NODE_ENV: 'test',
+  LOG_LEVEL: 'silent',
+  DATABASE_URL: 'postgresql://user:password@example.com/nueat?sslmode=require',
+  BETTER_AUTH_SECRET: 'a'.repeat(32),
+  BETTER_AUTH_URL: 'https://api.example.test',
+  RESEND_API_KEY: 're_test',
+  TRUSTED_ORIGINS: 'nueat://',
+});
+const mealLogId = '00000000-0000-4000-8000-000000000001';
+const itemId = '00000000-0000-4000-8000-000000000002';
+const foodId = '00000000-0000-4000-8000-000000000003';
+const profileId = '00000000-0000-4000-8000-000000000004';
+const servers: FastifyInstance[] = [];
+
+afterEach(async () => {
+  await Promise.all(servers.splice(0).map((server) => server.close()));
+});
+
+describe('canonical food routes', () => {
+  test('requires authentication', async () => {
+    const server = await createServer(false);
+    const response = await server.inject({ method: 'GET', url: '/api/foods/search?q=김치' });
+    expect(response.statusCode).toBe(401);
+    expect(JSON.parse(response.body).error.code).toBe('UNAUTHORIZED');
+  });
+
+  test('normalizes exact aliases, orders deterministically, and limits results', async () => {
+    const server = await createServer(true, {
+      aliases: [
+        foodAlias('김치나', '00000000-0000-4000-8000-000000000005'),
+        foodAlias('김치', foodId),
+        foodAlias('김치다', '00000000-0000-4000-8000-000000000006'),
+      ],
+      profiles: [
+        { id: profileId, foodId, qualityGrade: 'verified', datasetVersion: '2026-01' },
+        {
+          id: '00000000-0000-4000-8000-000000000008',
+          foodId: '00000000-0000-4000-8000-000000000005',
+          qualityGrade: 'verified',
+          datasetVersion: '2026-01',
+        },
+        {
+          id: '00000000-0000-4000-8000-000000000009',
+          foodId: '00000000-0000-4000-8000-000000000006',
+          qualityGrade: 'verified',
+          datasetVersion: '2026-01',
+        },
+      ],
+    });
+    const response = await server.inject({
+      method: 'GET',
+      url: '/api/foods/search?q=%EA%B9%80%20%EC%B9%98!&limit=2',
+    });
+    const body = JSON.parse(response.body);
+    expect(response.statusCode).toBe(200);
+    expect(body.foods.map((food: { id: string }) => food.id)).toEqual([
+      foodId,
+      '00000000-0000-4000-8000-000000000005',
+    ]);
+  });
+
+  test('returns no results and rejects malformed queries', async () => {
+    const server = await createServer(true, { aliases: [] });
+    const empty = await server.inject({ method: 'GET', url: '/api/foods/search?q=---' });
+    const tooLong = await server.inject({
+      method: 'GET',
+      url: `/api/foods/search?q=${'가'.repeat(101)}`,
+    });
+    const none = await server.inject({ method: 'GET', url: '/api/foods/search?q=없는음식' });
+    expect(empty.statusCode).toBe(400);
+    expect(tooLong.statusCode).toBe(400);
+    expect(JSON.parse(none.body)).toEqual({ foods: [] });
+  });
+
+  test('hides other users, rejects non-drafts and unavailable profiles', async () => {
+    const otherUser = await createServer(true, { mealUserId: 'other-user' });
+    const confirmed = await createServer(true, { mealStatus: 'confirmed' });
+    const unavailable = await createServer(true, { profiles: [] });
+    for (const [server, expected] of [
+      [otherUser, 'MEAL_LOG_NOT_FOUND'],
+      [confirmed, 'INVALID_MEAL_LOG_STATE'],
+      [unavailable, 'FOOD_NUTRIENT_PROFILE_UNAVAILABLE'],
+    ] as const) {
+      const response = await mapFood(server);
+      expect(JSON.parse(response.body).error.code).toBe(expected);
+    }
+  });
+
+  test('maps an item to the preferred profile and returns the full envelope', async () => {
+    const server = await createServer(true);
+    const response = await mapFood(server);
+    const body = JSON.parse(response.body);
+    expect(response.statusCode).toBe(200);
+    expect(body.mealLog.id).toBe(mealLogId);
+    expect(body.items[0]).toMatchObject({
+      id: itemId,
+      recognizedLabel: '김치',
+      foodId,
+      nutrientProfileId: profileId,
+      mappingConfidenceBps: 10000,
+      userCorrected: true,
+    });
+  });
+});
+
+async function mapFood(server: FastifyInstance) {
+  return server.inject({
+    method: 'PUT',
+    url: `/api/meal-logs/${mealLogId}/items/${itemId}/food`,
+    payload: { foodId },
+  });
+}
+
+function foodAlias(alias: string, id: string) {
+  return { foodId: id, canonicalNameKo: alias, category: '반찬', preparation: null, alias };
+}
+
+async function createServer(
+  authenticated: boolean,
+  overrides: {
+    aliases?: Record<string, unknown>[];
+    mealUserId?: string;
+    mealStatus?: string;
+    profiles?: Record<string, unknown>[];
+  } = {},
+) {
+  const state = {
+    aliases: overrides.aliases ?? [foodAlias('김치', foodId)],
+    mealLogQueries: 0,
+    meal: {
+      id: mealLogId,
+      userId: overrides.mealUserId ?? 'user-id',
+      status: overrides.mealStatus ?? 'draft',
+      eatenAt: new Date(),
+      timezone: 'Asia/Seoul',
+      localDate: '2026-08-10',
+      mealType: 'lunch',
+      imageAssetId: null,
+      recognitionStatus: 'ready',
+      recognitionEngineVersion: 'mock-recognition-v1',
+    },
+    item: {
+      id: itemId,
+      mealLogId,
+      recognizedLabel: 'unknown',
+      amountMilliunits: 1000,
+      unit: 'serving',
+      recognitionConfidenceBps: 9000,
+      portionConfidenceBps: 9000,
+      userCorrected: false,
+      foodId: null,
+      nutrientProfileId: null,
+      mappingConfidenceBps: null,
+    },
+    food: { id: foodId, canonicalNameKo: '김치', isDeprecated: false },
+    profiles: overrides.profiles ?? [
+      {
+        id: profileId,
+        foodId,
+        sourceRegistryId: '00000000-0000-4000-8000-000000000007',
+        sourceCode: 'dataset',
+        sourceDisplayName: 'Dataset',
+        sourceItemId: 'kimchi',
+        datasetVersion: '2026-01',
+        basisAmountMg: 100000,
+        energyMillicalories: 150000,
+        carbohydrateMg: 30000,
+        proteinMg: 2000,
+        fatMg: 1000,
+        fiberMg: 1000,
+        qualityGrade: 'verified',
+      },
+    ],
+    servings: [],
+  };
+  const auth = {
+    api: { getSession: async () => (authenticated ? { user: { id: 'user-id' } } : null) },
+  } as unknown as Auth;
+  const server = await buildServer({ environment, auth, database: databaseMock(state) });
+  servers.push(server);
+  return server;
+}
+
+function databaseMock(state: Record<string, any>) {
+  const resultFor = (table: unknown) => {
+    if (table === foodAliases) return state.aliases;
+    if (table === nutrientProfiles) return state.profiles;
+    if (table === foodServings) return state.servings;
+    if (table === foods) return state.food ? [state.food] : [];
+    if (table === mealLogs) {
+      state.mealLogQueries += 1;
+      if (state.meal.userId !== 'user-id') return [];
+      return state.meal.status === 'draft' || state.mealLogQueries > 1
+        ? [state.meal]
+        : [];
+    }
+    if (table === mealItems) return [state.item];
+    return [];
+  };
+  const query = (rows: any[]) => ({
+    limit: async () => rows.slice(0, 1),
+    orderBy: () => query(rows),
+    then: (resolve: (value: any[]) => unknown) => Promise.resolve(rows).then(resolve),
+  });
+  const database = {
+    transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(database),
+    select: () => ({
+      from: (table: unknown) => ({
+        innerJoin: () => ({ where: () => query(resultFor(table)) }),
+        where: () => query(resultFor(table)),
+      }),
+    }),
+    update: (table: unknown) => ({
+      set: (values: Record<string, unknown>) => ({
+        where: () => ({
+          returning: async () => {
+            if (table !== mealItems) return [];
+            Object.assign(state.item, values);
+            return [state.item];
+          },
+        }),
+      }),
+    }),
+  };
+  return database as unknown as Database;
+}

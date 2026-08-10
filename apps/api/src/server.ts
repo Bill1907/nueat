@@ -6,6 +6,7 @@ import type { Auth } from './auth/auth';
 import type { ApiEnvironment } from './config/env';
 import { createS3ImageObjectStore, type ImageObjectStore } from './services/image-object-store';
 import { authRoutes } from './routes/auth';
+import { foodRoutes } from './routes/food';
 import { healthRoutes } from './routes/health';
 import { imageAssetRoutes } from './routes/image-asset';
 import { mealLogRoutes } from './routes/meal-log';
@@ -94,6 +95,10 @@ export async function buildServer(dependencies: ServerDependencies) {
     database: dependencies.database,
   });
   await app.register(mealLogRoutes, {
+    auth: dependencies.auth,
+    database: dependencies.database,
+  });
+  await app.register(foodRoutes, {
     auth: dependencies.auth,
     database: dependencies.database,
   });

@@ -1,11 +1,13 @@
 import {
   assetDeletionJobs,
+  foods,
   imageAssets,
   mealItems,
   mealLogs,
+  nutrientProfiles,
   type Database,
 } from '@nueat/database';
-import { and, eq } from 'drizzle-orm';
+import { and, asc, desc, eq, or } from 'drizzle-orm';
 import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
@@ -54,6 +56,7 @@ const updateMealItemSchema = z
   })
   .strict()
   .refine((value) => Object.keys(value).length > 0);
+const mapFoodSchema = z.object({ foodId: z.uuid() }).strict();
 
 interface MealLogRouteOptions {
   auth: Auth;
@@ -250,7 +253,18 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         );
       const [item] = await options.database
         .update(mealItems)
-        .set({ ...body.data, userCorrected: true, updatedAt: new Date() })
+        .set({
+          ...body.data,
+          ...(body.data.recognizedLabel === undefined
+            ? {}
+            : {
+                foodId: null,
+                nutrientProfileId: null,
+                mappingConfidenceBps: null,
+              }),
+          userCorrected: true,
+          updatedAt: new Date(),
+        })
         .where(
           and(
             eq(mealItems.id, params.data.itemId),
@@ -259,6 +273,90 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         )
         .returning(mealItemSelection);
       if (!item) return mealLogNotFound(reply, request);
+      const items = await findMealItems(options.database, mealLog.id);
+      return mealLogResponse(mealLog, items);
+    },
+  );
+  app.put(
+    '/api/meal-logs/:mealLogId/items/:itemId/food',
+    async (request, reply) => {
+      const userId = await requireUserId(request, reply, options.auth);
+      if (!userId) return;
+      const params = mealItemIdParamsSchema.safeParse(request.params);
+      const body = mapFoodSchema.safeParse(request.body);
+      if (!params.success || !body.success)
+        return invalidRequest(reply, request);
+      const mealLog = await findOwnedDraftMealLog(
+        options.database,
+        params.data.mealLogId,
+        userId,
+      );
+      if (!mealLog)
+        return mealLogStateOrNotFound(
+          options.database,
+          params.data.mealLogId,
+          userId,
+          reply,
+          request,
+        );
+
+      const mapped = await options.database.transaction(async (tx) => {
+        const [food] = await tx
+          .select({ id: foods.id, canonicalNameKo: foods.canonicalNameKo })
+          .from(foods)
+          .where(
+            and(
+              eq(foods.id, body.data.foodId),
+              eq(foods.isDeprecated, false),
+            ),
+          )
+          .limit(1);
+        if (!food) return { kind: 'food_not_found' as const };
+
+        const [profile] = await tx
+          .select({ id: nutrientProfiles.id })
+          .from(nutrientProfiles)
+          .where(
+            and(
+              eq(nutrientProfiles.foodId, food.id),
+              or(
+                eq(nutrientProfiles.qualityGrade, 'verified'),
+                eq(nutrientProfiles.qualityGrade, 'estimated'),
+              ),
+            ),
+          )
+          .orderBy(
+            desc(nutrientProfiles.qualityGrade),
+            desc(nutrientProfiles.datasetVersion),
+            asc(nutrientProfiles.id),
+          )
+          .limit(1);
+        if (!profile) return { kind: 'profile_unavailable' as const };
+
+        const [item] = await tx
+          .update(mealItems)
+          .set({
+            recognizedLabel: food.canonicalNameKo,
+            foodId: food.id,
+            nutrientProfileId: profile.id,
+            mappingConfidenceBps: 10_000,
+            userCorrected: true,
+            updatedAt: new Date(),
+          })
+          .where(
+            and(
+              eq(mealItems.id, params.data.itemId),
+              eq(mealItems.mealLogId, mealLog.id),
+            ),
+          )
+          .returning(mealItemSelection);
+        return item ? { kind: 'mapped' as const } : { kind: 'item_not_found' as const };
+      });
+
+      if (mapped.kind === 'food_not_found') return foodNotFound(reply, request);
+      if (mapped.kind === 'profile_unavailable')
+        return foodNutrientProfileUnavailable(reply, request);
+      if (mapped.kind === 'item_not_found') return mealLogNotFound(reply, request);
       const items = await findMealItems(options.database, mealLog.id);
       return mealLogResponse(mealLog, items);
     },
@@ -375,6 +473,9 @@ const mealItemSelection = {
   recognitionConfidenceBps: mealItems.recognitionConfidenceBps,
   portionConfidenceBps: mealItems.portionConfidenceBps,
   userCorrected: mealItems.userCorrected,
+  foodId: mealItems.foodId,
+  nutrientProfileId: mealItems.nutrientProfileId,
+  mappingConfidenceBps: mealItems.mappingConfidenceBps,
 };
 
 function mockItems(mealLogId: string) {
@@ -545,6 +646,28 @@ function invalidMealLogState(reply: FastifyReply, request: FastifyRequest) {
     error: {
       code: 'INVALID_MEAL_LOG_STATE',
       message: '현재 식사 기록 상태에서는 요청을 처리할 수 없습니다.',
+      requestId: request.id,
+    },
+  });
+}
+function foodNotFound(reply: FastifyReply, request: FastifyRequest) {
+  return reply.status(404).send({
+    error: {
+      code: 'FOOD_NOT_FOUND',
+      message: '음식을 찾을 수 없습니다.',
+      requestId: request.id,
+    },
+  });
+}
+
+function foodNutrientProfileUnavailable(
+  reply: FastifyReply,
+  request: FastifyRequest,
+) {
+  return reply.status(409).send({
+    error: {
+      code: 'FOOD_NUTRIENT_PROFILE_UNAVAILABLE',
+      message: '사용 가능한 영양 정보를 찾을 수 없습니다.',
       requestId: request.id,
     },
   });

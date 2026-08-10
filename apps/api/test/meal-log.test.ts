@@ -138,6 +138,11 @@ describe('meal log routes', () => {
       },
     });
     expect(add.statusCode).toBe(201);
+    Object.assign(state.items[0]!, {
+      foodId: '00000000-0000-4000-8000-000000000010',
+      nutrientProfileId: '00000000-0000-4000-8000-000000000011',
+      mappingConfidenceBps: 10_000,
+    });
     const edit = await server.inject({
       method: 'PATCH',
       url: `/api/meal-logs/${mealId}/items/${itemId}`,
@@ -145,6 +150,19 @@ describe('meal log routes', () => {
     });
     expect(edit.statusCode).toBe(200);
     expect(JSON.parse(edit.body).items[0].userCorrected).toBe(true);
+    expect(JSON.parse(edit.body).items[0].foodId).not.toBeNull();
+
+    const rename = await server.inject({
+      method: 'PATCH',
+      url: `/api/meal-logs/${mealId}/items/${itemId}`,
+      payload: { recognizedLabel: '새 음식 이름' },
+    });
+    expect(rename.statusCode).toBe(200);
+    expect(JSON.parse(rename.body).items[0]).toMatchObject({
+      foodId: null,
+      nutrientProfileId: null,
+      mappingConfidenceBps: null,
+    });
     const remove = await server.inject({
       method: 'DELETE',
       url: `/api/meal-logs/${mealId}/items/${itemId}`,
