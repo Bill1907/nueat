@@ -49,11 +49,19 @@ GET  /health/ready
 GET  /health
 GET  /api/me
 GET|POST /api/auth/*
+GET  /api/onboarding/status
+POST /api/onboarding/preview
+PUT  /api/onboarding/complete
+GET  /api/nutrition-targets/active
 ```
 
 Authentication uses Better Auth email OTP only. Resend sends six-digit OTPs from `NUEAT <auth@boseong.dev>`; codes expire after five minutes and allow three attempts.
 
 The Expo client gates product routes behind the session, stores native auth cookies in SecureStore, restores sessions on launch, and provides email entry, six-digit OTP, 60-second resend cooldown, three-attempt UX, and logout. `EXPO_PUBLIC_API_URL` is public configuration and defaults to `https://api-nueat.boseong.dev`; never place secrets in an `EXPO_PUBLIC_*` variable.
+
+Onboarding is an authenticated six-step flow: consent, goal, birth year/calculation sex, body metrics, activity/safety screening, and KDRI result confirmation. Completion writes current consent hashes and either a versioned nutrition profile or a terminal limited-mode status in one Neon transaction.
+
+The home target card reads the authenticated active target endpoint and renders pending, limited, loading, retry, and versioned active-target states. Stored integer units are formatted only at the display boundary.
 
 ## Railway
 

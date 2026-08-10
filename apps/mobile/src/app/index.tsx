@@ -3,6 +3,7 @@ import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native'
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { authClient, useAuthSession } from '@/auth/client';
+import { ActiveNutritionTargetCard } from '@/components/active-nutrition-target-card';
 
 import { NutritionStandardCard } from '@/components/nutrition-standard-card';
 import { ThemedText } from '@/components/themed-text';
@@ -44,21 +45,7 @@ export default function HomeScreen() {
           </ThemedText>
         </View>
 
-        <ThemedView type="backgroundElement" style={styles.goalCard}>
-          <View style={styles.goalHeader}>
-            <ThemedText type="smallBold">내 영양 목표</ThemedText>
-            <View style={styles.pendingBadge}>
-              <ThemedText type="smallBold" style={styles.pendingText}>
-                설정 전
-              </ThemedText>
-            </View>
-          </View>
-          <ThemedText style={styles.goalTitle}>목표 프로필을 먼저 설정해 주세요</ThemedText>
-          <ThemedText type="small" themeColor="textSecondary">
-            나이, 신장, 체중, 활동 수준과 목표를 바탕으로 열량·탄수화물·단백질·지방·식이섬유
-            목표를 계산합니다.
-          </ThemedText>
-        </ThemedView>
+        <ActiveNutritionTargetCard />
 
         <View style={styles.sectionHeader}>
           <ThemedText type="smallBold">목표 계산 기준</ThemedText>
@@ -115,30 +102,6 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     fontWeight: '800',
     letterSpacing: 1.5,
-  },
-  goalCard: {
-    padding: Spacing.four,
-    borderRadius: 20,
-    gap: Spacing.three,
-  },
-  goalHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  pendingBadge: {
-    borderRadius: 999,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    backgroundColor: '#FFF1D6',
-  },
-  pendingText: {
-    color: '#8A5A00',
-  },
-  goalTitle: {
-    fontSize: 20,
-    lineHeight: 28,
-    fontWeight: '700',
   },
   sectionHeader: {
     gap: Spacing.one,

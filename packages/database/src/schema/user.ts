@@ -18,6 +18,11 @@ export const deletionStatusEnum = pgEnum('deletion_status', [
   'active',
   'deletion_pending',
 ]);
+export const onboardingStatusEnum = pgEnum('onboarding_status', [
+  'pending',
+  'completed',
+  'limited',
+]);
 export const consentTypeEnum = pgEnum('consent_type', [
   'terms',
   'privacy',
@@ -45,7 +50,7 @@ export interface NutritionCalculationInputSnapshot {
   calculationSex: 'female' | 'male';
   heightMm: number;
   weightG: number;
-  activityLevel: 'sedentary' | 'light' | 'moderate' | 'high';
+  activityLevel: 'sedentary' | 'light' | 'moderate' | 'high' | 'very_high';
   goalType: 'weight_loss' | 'maintenance' | 'muscle_gain' | 'balanced_diet';
 }
 
@@ -55,17 +60,30 @@ export interface NutritionMacroRatioSnapshot {
   fat: number;
 }
 
-export const userProfiles = pgTable('user_profile', {
-  userId: text('user_id')
-    .primaryKey()
-    .references(() => users.id, { onDelete: 'cascade' }),
-  locale: text('locale').default('ko-KR').notNull(),
-  timezone: text('timezone').default('Asia/Seoul').notNull(),
-  deletionStatus: deletionStatusEnum('deletion_status').default('active').notNull(),
-  deletionRequestedAt: timestamp('deletion_requested_at', { withTimezone: true }),
-  createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
-  updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
-});
+export const userProfiles = pgTable(
+  'user_profile',
+  {
+    userId: text('user_id')
+      .primaryKey()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    locale: text('locale').default('ko-KR').notNull(),
+    timezone: text('timezone').default('Asia/Seoul').notNull(),
+    deletionStatus: deletionStatusEnum('deletion_status').default('active').notNull(),
+    deletionRequestedAt: timestamp('deletion_requested_at', { withTimezone: true }),
+    onboardingStatus: onboardingStatusEnum('onboarding_status').default('pending').notNull(),
+    safetyModeReasonCodes: jsonb('safety_mode_reason_codes').$type<string[]>().default([]).notNull(),
+    onboardingCompletedAt: timestamp('onboarding_completed_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check(
+      'user_profile_onboarding_status_check',
+      sql`(${table.onboardingStatus} = 'pending' and ${table.onboardingCompletedAt} is null)
+        or (${table.onboardingStatus} <> 'pending' and ${table.onboardingCompletedAt} is not null)`,
+    ),
+  ],
+);
 
 export const consents = pgTable(
   'consent',

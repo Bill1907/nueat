@@ -157,7 +157,7 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 
 | 엔터티 | 핵심 필드 |
 | --- | --- |
-| User/UserProfile | Better Auth identity, locale, timezone, deletion_status, deletion_requested_at |
+| User/UserProfile | Better Auth identity, locale, timezone, deletion_status, onboarding_status(pending/completed/limited), safety_mode_reason_codes, onboarding_completed_at |
 | Consent | user_id, type, action, document_version, document_sha256, occurred_at; append-only |
 | NutritionProfile | user_id, goal/body inputs, integer nutrient targets, KDRI·정오표·engine·safety versions, input/macro snapshots, EER/활동계수, effective_from/to |
 | DietaryConstraint | type(allergy/preference/exclusion), food_id/label, severity, source |
@@ -237,6 +237,14 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 - 미성년자, 임신·수유, 섭식장애 위험, 임상 영양 필요, 비정상 신체 입력, BMI 18.5 미만 감량, 75세 이상 체중 변경, 매우 높은 활동 수준은 자동 계산 대신 제한 모드로 전환한다.
 - 생성된 `NutritionProfile`에는 입력 snapshot, EER, 활동계수, 목표 조정, 매크로 비율과 KDRI·정오표·engine·safety 버전을 저장한다. 변경 시 이전 행을 수정하지 않고 새 유효 버전을 생성한다.
 - 앱의 오늘 화면과 `계산 기준` 탭에서 적용 기준·발행기관·정오표·엔진 버전·안전 제한과 공식 출처를 항상 확인할 수 있어야 한다.
+
+### 9.7 온보딩 저장 계약
+
+- 인증된 클라이언트는 `GET /api/onboarding/status`로 진입 상태를 확인하고, `POST /api/onboarding/preview`로 저장 없이 계산/제한 결과를 확인한 뒤 `PUT /api/onboarding/complete`로 확정한다.
+- 모바일 흐름은 필수·선택 동의 → 목표 → 출생연도/계산상 성별 → 신장/체중 → 활동 수준/안전 분기 → 계산 결과 확인의 6단계다.
+- 완료 요청은 서버가 현재 동의 문서 버전과 SHA-256을 사용해 모든 동의 결정을 append-only로 기록한다. 클라이언트가 문서 버전·해시나 계산 결과를 제출해 확정할 수 없다.
+- `user_profile`, 동의 이벤트, 활성 목표 종료와 새 `NutritionProfile` 생성은 하나의 트랜잭션으로 처리한다. 제한 모드는 사유 코드만 저장하고 숫자 목표를 생성하지 않는다.
+- `completed`와 `limited`는 terminal 상태다. 중복 완료 요청은 `409 ONBOARDING_ALREADY_COMPLETED`로 거부한다.
 
 ## 10. 안전 경계
 

@@ -50,6 +50,7 @@ bun run --cwd packages/database db:migrate
 - Keep route files focused on composition; move reusable UI and domain logic out of `apps/mobile/src/app/`.
 - Model nutrition calculations as pure, deterministic functions with fixture-based tests.
 - The target engine uses the versioned 2025 KDRI policy in `packages/domain/src/nutrition-targets.ts`; never duplicate formulas or UI metadata.
+- Onboarding metadata and consent documents live in `packages/domain/src/onboarding.ts`; API and mobile MUST share these values rather than copy labels, versions, hashes, or safety options.
 - Represent loading, empty, error, low-confidence, draft, and confirmed states explicitly.
 - Treat allergies and excluded foods as hard constraints, never ranking preferences.
 - Do not treat missing nutrient values as zero or commit unconfirmed recognition as consumed food.
@@ -61,6 +62,7 @@ bun run --cwd packages/database db:migrate
 - API errors use `{ error: { code, message, requestId } }`; never expose stack traces or secret-bearing upstream errors.
 - Better Auth OTPs are six digits, hashed at rest, valid for five minutes, and limited to three attempts. Keep social and password login disabled.
 - Native auth cookies belong in Expo SecureStore through `@better-auth/expo`; never persist session tokens in AsyncStorage or application state. Web storage is only a preview fallback.
+- Onboarding completion is terminal and transactional: append all current consent decisions, update `user_profile`, and create a versioned nutrition profile only for calculated results. Limited-mode results must not create numeric targets.
 
 ## Important Files
 
@@ -73,11 +75,17 @@ bun run --cwd packages/database db:migrate
 - `apps/mobile/src/components/auth/email-otp-screen.tsx`: Email/OTP login, resend cooldown, and client-side attempt UX.
 - `apps/mobile/src/components/auth/auth-gate.tsx`: Session restoration and authenticated route gate.
 - `apps/mobile/src/auth/client.ts`: Better Auth Expo client and SecureStore integration.
+- `apps/mobile/src/components/onboarding/onboarding-flow.tsx`: Six-step authenticated onboarding and calculated/limited result confirmation.
+- `apps/mobile/src/components/onboarding/form.ts`: Testable mobile form-to-API unit conversions and required-consent gate.
+- `apps/mobile/src/components/active-nutrition-target-card.tsx`: Home target loading, error, pending, limited, and active states.
 - `apps/mobile/.env.example`: Public API URL configuration; `EXPO_PUBLIC_*` variables MUST NOT contain secrets.
 - `apps/api/src/server.ts`: Fastify composition, CORS, redacted logging, and error contracts.
 - `apps/api/src/auth/auth.ts`: Better Auth email OTP policy.
 - `apps/api/.env.example`: API and Railway environment contract.
+- `apps/api/src/routes/onboarding.ts`: Authenticated status, target preview, and atomic completion endpoints.
+- `apps/api/src/routes/nutrition-target.ts`: Authenticated pending/limited/active nutrition-target response for product surfaces.
 - `packages/domain/src/nutrition-targets.ts`: KDRI target policy, provenance constants, and limited-mode rules.
+- `packages/domain/src/onboarding.ts`: Shared consent versions/hashes, Korean labels, profile contract, and target-input conversion.
 - `packages/domain/src/meal-nutrition.ts`: Serving conversion, item calculation, completeness-aware aggregation, and calculation errors.
 - `packages/database/src/schema/index.ts`: Database schema export.
 - `packages/database/drizzle.config.ts`: Migration configuration.

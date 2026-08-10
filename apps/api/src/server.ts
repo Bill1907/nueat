@@ -6,6 +6,8 @@ import type { Auth } from './auth/auth';
 import type { ApiEnvironment } from './config/env';
 import { authRoutes } from './routes/auth';
 import { healthRoutes } from './routes/health';
+import { onboardingRoutes } from './routes/onboarding';
+import { nutritionTargetRoutes } from './routes/nutrition-target';
 import { sessionRoutes } from './routes/session';
 
 export interface ServerDependencies {
@@ -70,6 +72,14 @@ export async function buildServer(dependencies: ServerDependencies) {
     environment,
   });
   await app.register(sessionRoutes, { auth: dependencies.auth });
+  await app.register(onboardingRoutes, {
+    auth: dependencies.auth,
+    database: dependencies.database,
+  });
+  await app.register(nutritionTargetRoutes, {
+    auth: dependencies.auth,
+    database: dependencies.database,
+  });
 
   app.setNotFoundHandler((request, reply) =>
     reply.status(404).send({
