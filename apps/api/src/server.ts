@@ -8,6 +8,7 @@ import { createS3ImageObjectStore, type ImageObjectStore } from './services/imag
 import { authRoutes } from './routes/auth';
 import { healthRoutes } from './routes/health';
 import { imageAssetRoutes } from './routes/image-asset';
+import { mealLogRoutes } from './routes/meal-log';
 import { onboardingRoutes } from './routes/onboarding';
 import { nutritionTargetRoutes } from './routes/nutrition-target';
 import { sessionRoutes } from './routes/session';
@@ -89,6 +90,10 @@ export async function buildServer(dependencies: ServerDependencies) {
     database: dependencies.database,
   });
   await app.register(nutritionTargetRoutes, {
+    auth: dependencies.auth,
+    database: dependencies.database,
+  });
+  await app.register(mealLogRoutes, {
     auth: dependencies.auth,
     database: dependencies.database,
   });

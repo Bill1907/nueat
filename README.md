@@ -57,6 +57,10 @@ POST /api/image-assets/upload-intents
 POST /api/image-assets/:assetId/complete
 GET  /api/image-assets/:assetId
 POST /api/image-assets/:assetId/download-intent
+POST /api/meal-logs
+GET|PATCH|DELETE /api/meal-logs/:mealLogId
+POST /api/meal-logs/:mealLogId/items
+PATCH|DELETE /api/meal-logs/:mealLogId/items/:itemId
 ```
 
 Authentication uses Better Auth email OTP only. Resend sends six-digit OTPs from `NUEAT <auth@boseong.dev>`; codes expire after five minutes and allow three attempts.
@@ -70,6 +74,8 @@ The home target card reads the authenticated active target endpoint and renders 
 Image uploads use a private Railway Bucket through S3-compatible presigned URLs. The API creates opaque keys, signs five-minute PUTs, verifies ownership, declared size/type, decoded file signature, dimensions, GPS/non-normalized EXIF absence, and SHA-256 before marking an asset `validated`. Validated inference assets expire after 24 hours; rejected objects are deleted immediately or queued for retry.
 
 The Expo home screen provides camera and library selection, re-encodes every image as JPEG, scales the long edge to 1,600px, retries compression below 10MB, uploads with native progress/cancellation, and calls server completion. One interrupted draft is stored under the app document directory for at most 24 hours and is removed after validation or explicit discard.
+
+A validated image is attached to exactly one draft MealLog. Draft creation is idempotent by image asset, atomically claims the owned asset, persists `mock-recognition-v1` results, and returns editable items. Mock labels and confidence values are UI scaffolding only: drafts never count as consumed food and contain no invented nutrition values.
 
 ## Railway
 

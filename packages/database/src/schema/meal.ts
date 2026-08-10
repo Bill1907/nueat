@@ -32,6 +32,11 @@ export const imageAssetStatusEnum = pgEnum('image_asset_status', [
   'deletion_pending',
   'deleted',
 ]);
+export const recognitionStatusEnum = pgEnum('recognition_status', [
+  'pending',
+  'ready',
+  'failed',
+]);
 export const assetDeletionJobStatusEnum = pgEnum('asset_deletion_job_status', [
   'pending',
   'processing',
@@ -142,6 +147,9 @@ export const mealLogs = pgTable(
     mealType: mealTypeEnum('meal_type').notNull(),
     status: mealStatusEnum('status').default('draft').notNull(),
     imageAssetId: uuid('image_asset_id').references(() => imageAssets.id, { onDelete: 'set null' }),
+    recognitionStatus: recognitionStatusEnum('recognition_status').default('pending').notNull(),
+    recognitionEngineVersion: text('recognition_engine_version'),
+    recognitionCompletedAt: timestamp('recognition_completed_at', { withTimezone: true }),
     thumbnailAssetId: uuid('thumbnail_asset_id').references(() => imageAssets.id, {
       onDelete: 'set null',
     }),
@@ -156,6 +164,14 @@ export const mealLogs = pgTable(
       table.userId,
       table.eatenLocalDate,
       table.status,
+    ),
+    uniqueIndex('meal_log_image_asset_unique')
+      .on(table.imageAssetId)
+      .where(sql`${table.imageAssetId} is not null`),
+    check(
+      'meal_log_recognition_ready_check',
+      sql`${table.recognitionStatus} <> 'ready'
+        or (${table.recognitionEngineVersion} is not null and ${table.recognitionCompletedAt} is not null)`,
     ),
     check(
       'meal_log_status_timestamps_check',

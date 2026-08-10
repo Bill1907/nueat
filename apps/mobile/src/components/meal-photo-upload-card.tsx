@@ -3,11 +3,18 @@ import * as ImagePicker from 'expo-image-picker';
 import { useEffect, useRef, useState } from 'react';
 import { Linking, Platform, Pressable, StyleSheet, View } from 'react-native';
 
+import {
+  createMealDraft,
+  inferMealType,
+  type MealDraftResponse,
+} from '@/api/meal-drafts';
+import { MealConfirmationModal } from '@/components/meal-confirmation-modal';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import {
   loadLocalUploadDraft,
+  markLocalUploadDraftValidated,
   removeLocalUploadDraft,
   type LocalImageUploadDraft,
 } from '@/uploads/image-upload-draft';
@@ -24,6 +31,8 @@ type Phase =
   | 'ready'
   | 'uploading'
   | 'validating'
+  | 'linking'
+  | 'uploaded'
   | 'success'
   | 'error';
 
@@ -35,7 +44,10 @@ export function MealPhotoUploadCard() {
   const [permissionBlocked, setPermissionBlocked] = useState(false);
   const [validatedAsset, setValidatedAsset] =
     useState<ValidatedImageAsset | null>(null);
+  const [mealLogId, setMealLogId] = useState<string | null>(null);
+  const [confirmationVisible, setConfirmationVisible] = useState(false);
   const abortController = useRef<AbortController | null>(null);
+  const linkingMealDraft = useRef(false);
 
   useEffect(() => {
     let active = true;
@@ -43,7 +55,9 @@ export function MealPhotoUploadCard() {
       .then((restored) => {
         if (!active) return;
         setDraft(restored);
-        setPhase(restored ? 'ready' : 'idle');
+        setPhase(
+          restored?.validatedAssetId ? 'uploaded' : restored ? 'ready' : 'idle',
+        );
       })
       .catch(() => {
         if (active) setPhase('idle');
@@ -58,6 +72,8 @@ export function MealPhotoUploadCard() {
     setError(null);
     setPermissionBlocked(false);
     setValidatedAsset(null);
+    setMealLogId(null);
+    setConfirmationVisible(false);
 
     try {
       const granted = await requestPermission(source);
@@ -102,10 +118,13 @@ export function MealPhotoUploadCard() {
         onProgress: setProgress,
         onStage: setPhase,
       });
-      await removeLocalUploadDraft();
-      setDraft(null);
+      const updatedDraft = markLocalUploadDraftValidated(
+        target,
+        result.assetId,
+      );
+      setDraft(updatedDraft);
       setValidatedAsset(result);
-      setPhase('success');
+      await linkMealDraft(result.assetId);
     } catch (cause) {
       if (cause instanceof Error && cause.name === 'AbortError') {
         setError('업로드를 취소했습니다. 사진은 기기에 보관되어 있어요.');
@@ -120,10 +139,48 @@ export function MealPhotoUploadCard() {
     }
   }
 
+  async function linkMealDraft(
+    assetId = validatedAsset?.assetId ?? draft?.validatedAssetId,
+  ) {
+    if (!assetId || linkingMealDraft.current) return;
+    linkingMealDraft.current = true;
+    setError(null);
+    setPhase('linking');
+
+    try {
+      const now = new Date();
+      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (!timezone) throw new Error('기기의 시간대를 확인하지 못했습니다.');
+      const response: MealDraftResponse = await createMealDraft({
+        imageAssetId: assetId,
+        eatenAt: now.toISOString(),
+        timezone,
+        mealType: inferMealType(now),
+      });
+      try {
+        await removeLocalUploadDraft();
+        setDraft(null);
+      } catch {
+        // The MealLog already owns this validated image; never retry creation because cleanup failed.
+      }
+      setMealLogId(response.mealLog.id);
+      setConfirmationVisible(true);
+      setPhase('success');
+    } catch (cause) {
+      setError(errorMessage(cause));
+      setPhase('uploaded');
+    } finally {
+      linkingMealDraft.current = false;
+    }
+  }
+
   async function discardDraft() {
     abortController.current?.abort();
     await removeLocalUploadDraft();
     setDraft(null);
+    setValidatedAsset(null);
+    setMealLogId(null);
+    setConfirmationVisible(false);
     setError(null);
     setProgress(0);
     setPermissionBlocked(false);
@@ -131,7 +188,10 @@ export function MealPhotoUploadCard() {
   }
 
   const busy =
-    phase === 'preparing' || phase === 'uploading' || phase === 'validating';
+    phase === 'preparing' ||
+    phase === 'uploading' ||
+    phase === 'validating' ||
+    phase === 'linking';
 
   return (
     <ThemedView type="backgroundElement" style={styles.card}>
@@ -163,12 +223,16 @@ export function MealPhotoUploadCard() {
           위치정보를 제거하고 사진 크기를 조정하고 있어요.
         </ThemedText>
       )}
-      {(phase === 'uploading' || phase === 'validating') && (
+      {(phase === 'uploading' ||
+        phase === 'validating' ||
+        phase === 'linking') && (
         <View style={styles.progressSection}>
           <ThemedText type="smallBold">
             {phase === 'uploading'
               ? `업로드 ${Math.round(progress * 100)}%`
-              : '이미지 검증 중'}
+              : phase === 'validating'
+                ? '이미지 검증 중'
+                : '식사 초안을 만들고 있어요'}
           </ThemedText>
           <View style={styles.progressTrack}>
             <View
@@ -186,14 +250,23 @@ export function MealPhotoUploadCard() {
           있어요.
         </ThemedText>
       )}
-      {phase === 'success' && validatedAsset && (
+      {phase === 'uploaded' && (validatedAsset || draft?.validatedAssetId) && (
         <View style={styles.successCopy}>
           <ThemedText type="smallBold" style={styles.successText}>
-            안전하게 업로드했어요
+            사진 업로드를 완료했어요
           </ThemedText>
           <ThemedText type="small" themeColor="textSecondary">
-            {validatedAsset.width}×{validatedAsset.height}px · 다음 단계에서
-            음식을 확인합니다.
+            식사 초안을 만들면 음식을 확인할 수 있어요.
+          </ThemedText>
+        </View>
+      )}
+      {phase === 'success' && mealLogId && (
+        <View style={styles.successCopy}>
+          <ThemedText type="smallBold" style={styles.successText}>
+            식사 초안을 만들었어요
+          </ThemedText>
+          <ThemedText type="small" themeColor="textSecondary">
+            음식을 확인하고 초안으로 저장할 수 있어요.
           </ThemedText>
         </View>
       )}
@@ -234,6 +307,20 @@ export function MealPhotoUploadCard() {
             />
           </>
         )}
+        {!busy &&
+          phase === 'uploaded' &&
+          (validatedAsset || draft?.validatedAssetId) && (
+            <ActionButton
+              label="식사 초안 다시 만들기"
+              onPress={() => void linkMealDraft()}
+            />
+          )}
+        {!busy && phase === 'success' && mealLogId && (
+          <ActionButton
+            label="음식 확인"
+            onPress={() => setConfirmationVisible(true)}
+          />
+        )}
         {(phase === 'uploading' || phase === 'validating') && (
           <ActionButton
             label="취소"
@@ -249,6 +336,11 @@ export function MealPhotoUploadCard() {
           />
         )}
       </View>
+      <MealConfirmationModal
+        mealLogId={mealLogId}
+        onClose={() => setConfirmationVisible(false)}
+        visible={confirmationVisible}
+      />
     </ThemedView>
   );
 }
@@ -273,13 +365,18 @@ async function requestPermission(source: LocalImageUploadDraft['source']) {
 function StatusBadge({ phase }: { phase: Phase }) {
   const label =
     phase === 'success'
-      ? '업로드 완료'
-      : phase === 'uploading' || phase === 'validating' || phase === 'preparing'
-        ? '처리 중'
-        : phase === 'ready'
-          ? '초안 보관'
-          : '확정 전';
-  const success = phase === 'success';
+      ? '초안 저장'
+      : phase === 'uploaded'
+        ? '연결 필요'
+        : phase === 'linking' ||
+            phase === 'uploading' ||
+            phase === 'validating' ||
+            phase === 'preparing'
+          ? '처리 중'
+          : phase === 'ready'
+            ? '초안 보관'
+            : '확정 전';
+  const success = phase === 'success' || phase === 'uploaded';
   return (
     <View style={[styles.badge, success && styles.successBadge]}>
       <ThemedText

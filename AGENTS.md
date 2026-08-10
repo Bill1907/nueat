@@ -12,6 +12,7 @@ Meal images are stored in a private Railway Bucket. The API authenticates the us
 
 Re-encode uploads client-side to remove EXIF/GPS, cap the long edge at 1,600px and size at 10MB, and remove local temporary files after upload. Presigned uploads expire after 5 minutes. Inference assets expire within 24 hours; only sanitized 512px thumbnails persist with meal history. Deletion must be performed through retryable `asset_deletion_job` records before account hard deletion. Never log image bytes, base64, signed URLs, object keys, EXIF, or email addresses.
 Upload completion is server-authoritative: compare the stored object with the declared contract, decode it with Sharp, reject unsupported signatures, dimensions above 1,600px, GPS or non-normalized EXIF fields, then persist dimensions and SHA-256. Never trust client completion metadata.
+Validated images attach to at most one MealLog. `POST /api/meal-logs` is idempotent by image asset and creates only a `draft`; mock recognition is versioned as `mock-recognition-v1`, contains labels/portions/confidence only, and MUST NOT be treated as nutrition data or confirmed intake.
 
 Planned core flow: authenticated presigned upload → private image storage → food candidates → user confirmation → canonical food mapping → deterministic nutrition calculation → daily gap calculation → constrained recommendation ranking → AI-authored explanation. Generated models may recognize or explain food, but MUST NOT invent nutrition values. Persist source IDs, dataset versions, serving conversions, confidence, and calculation versions. The AI provider/model remains undecided and must be selected through Korean-food golden-set evaluation.
 
@@ -85,18 +86,23 @@ bun run --cwd packages/database db:migrate
 - `apps/mobile/src/uploads/image-upload-client.ts`: Signed PUT progress/cancellation and server completion.
 - `apps/mobile/src/uploads/image-upload-draft.ts`: Single 24-hour local retry draft; never stores signed URLs.
 - `apps/mobile/.env.example`: Public API URL configuration; `EXPO_PUBLIC_*` variables MUST NOT contain secrets.
+- `apps/mobile/src/components/meal-confirmation-modal.tsx`: Draft image, mock candidates, confidence, and item add/edit/delete UI.
+- `apps/mobile/src/api/meal-drafts.ts`: Authenticated MealLog draft and item mutation client.
+- `apps/mobile/src/meals/meal-draft-policy.ts`: Pure meal-time inference, portion parsing, and serving-unit labels.
 - `apps/api/src/server.ts`: Fastify composition, CORS, redacted logging, and error contracts.
 - `apps/api/src/auth/auth.ts`: Better Auth email OTP policy.
 - `apps/api/.env.example`: API and Railway environment contract.
 - `apps/api/src/routes/onboarding.ts`: Authenticated status, target preview, and atomic completion endpoints.
 - `apps/api/src/routes/nutrition-target.ts`: Authenticated pending/limited/active nutrition-target response for product surfaces.
 - `apps/api/src/routes/image-asset.ts`: Authenticated upload intents, server validation completion, safe status, and download signing.
+- `apps/api/src/routes/meal-log.ts`: Owned image attachment, idempotent draft creation, versioned mock recognition, and draft item mutations.
 - `apps/api/src/services/image-object-store.ts`: S3-compatible Railway Bucket adapter and sanitized storage errors.
 - `apps/api/src/services/image-validator.ts`: Decoding, type/dimension/metadata validation, and SHA-256 derivation.
 - `packages/domain/src/nutrition-targets.ts`: KDRI target policy, provenance constants, and limited-mode rules.
 - `packages/domain/src/onboarding.ts`: Shared consent versions/hashes, Korean labels, profile contract, and target-input conversion.
 - `packages/domain/src/meal-nutrition.ts`: Serving conversion, item calculation, completeness-aware aggregation, and calculation errors.
 - `packages/database/src/schema/index.ts`: Database schema export.
+- `packages/database/src/schema/meal.ts`: MealLog/MealItem state, recognition provenance, ownership links, and draft constraints.
 - `packages/database/drizzle.config.ts`: Migration configuration.
 - `packages/database/.env.example`: Neon connection variable template; real credentials belong in ignored `.env.local` or Railway secrets.
 - `Dockerfile` and `railway.json`: Railway API build, migration, readiness, and restart policy.

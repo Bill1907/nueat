@@ -16,6 +16,7 @@ export interface LocalImageUploadDraft {
   height: number;
   source: 'camera' | 'library';
   createdAt: string;
+  validatedAssetId?: string;
 }
 
 export async function persistLocalUploadDraft(input: {
@@ -43,10 +44,17 @@ export async function persistLocalUploadDraft(input: {
     source: input.source,
     createdAt: new Date().toISOString(),
   };
-  const metadata = new File(directory, DRAFT_METADATA_NAME);
-  metadata.create({ overwrite: true });
-  metadata.write(JSON.stringify(draft));
+  writeMetadata(draft);
   return draft;
+}
+
+export function markLocalUploadDraftValidated(
+  draft: LocalImageUploadDraft,
+  validatedAssetId: string,
+) {
+  const updated = { ...draft, validatedAssetId };
+  writeMetadata(updated);
+  return updated;
 }
 
 export async function loadLocalUploadDraft() {
@@ -76,6 +84,13 @@ export async function removeLocalUploadDraft() {
   if (!directory.exists) return;
   directory.delete();
 }
+function writeMetadata(draft: LocalImageUploadDraft) {
+  const directory = draftDirectory();
+  directory.create({ idempotent: true, intermediates: true });
+  const metadata = new File(directory, DRAFT_METADATA_NAME);
+  metadata.create({ overwrite: true });
+  metadata.write(JSON.stringify(draft));
+}
 
 function draftDirectory() {
   return new Directory(Paths.document, DRAFT_DIRECTORY_NAME);
@@ -96,7 +111,9 @@ function parseDraft(value: string): LocalImageUploadDraft {
     typeof candidate.width !== 'number' ||
     typeof candidate.height !== 'number' ||
     (candidate.source !== 'camera' && candidate.source !== 'library') ||
-    typeof candidate.createdAt !== 'string'
+    typeof candidate.createdAt !== 'string' ||
+    (candidate.validatedAssetId !== undefined &&
+      typeof candidate.validatedAssetId !== 'string')
   ) {
     throw new Error('Invalid local upload draft');
   }
