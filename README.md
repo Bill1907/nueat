@@ -53,6 +53,10 @@ GET  /api/onboarding/status
 POST /api/onboarding/preview
 PUT  /api/onboarding/complete
 GET  /api/nutrition-targets/active
+POST /api/image-assets/upload-intents
+POST /api/image-assets/:assetId/complete
+GET  /api/image-assets/:assetId
+POST /api/image-assets/:assetId/download-intent
 ```
 
 Authentication uses Better Auth email OTP only. Resend sends six-digit OTPs from `NUEAT <auth@boseong.dev>`; codes expire after five minutes and allow three attempts.
@@ -62,6 +66,8 @@ The Expo client gates product routes behind the session, stores native auth cook
 Onboarding is an authenticated six-step flow: consent, goal, birth year/calculation sex, body metrics, activity/safety screening, and KDRI result confirmation. Completion writes current consent hashes and either a versioned nutrition profile or a terminal limited-mode status in one Neon transaction.
 
 The home target card reads the authenticated active target endpoint and renders pending, limited, loading, retry, and versioned active-target states. Stored integer units are formatted only at the display boundary.
+
+Image uploads use a private Railway Bucket through S3-compatible presigned URLs. The API creates opaque keys, signs five-minute PUTs, verifies ownership, declared size/type, decoded file signature, dimensions, EXIF absence, and SHA-256 before marking an asset `validated`. Validated inference assets expire after 24 hours; rejected objects are deleted immediately or queued for retry.
 
 ## Railway
 
@@ -81,6 +87,18 @@ AUTH_EMAIL_FROM=NUEAT <auth@boseong.dev>
 TRUSTED_ORIGINS=nueat://,https://your-web-origin.example
 LOG_LEVEL=info
 HEALTH_DB_TIMEOUT_MS=2000
+S3_ENDPOINT=https://storage.railway.app
+S3_REGION=auto
+S3_BUCKET=...
+S3_ACCESS_KEY_ID=...
+S3_SECRET_ACCESS_KEY=...
+S3_URL_STYLE=virtual
+IMAGE_UPLOAD_URL_TTL_SECONDS=300
+IMAGE_DOWNLOAD_URL_TTL_SECONDS=120
+IMAGE_MAX_BYTES=10000000
 ```
+
+Map Railway Bucket `ENDPOINT`, `REGION`, `BUCKET`, `ACCESS_KEY_ID`, and `SECRET_ACCESS_KEY` into the corresponding `S3_*` service variables. Use Railway's globally unique `BUCKET` value, not `RAILWAY_BUCKET_NAME`. Until all four required S3 connection values are configured together, existing API features remain available and image mutation endpoints return `503 IMAGE_STORAGE_UNAVAILABLE`.
+The production project uses the private `nueat-images` bucket in Railway's `sin` region. Its service variables are linked by Railway references rather than copied credentials.
 
 Attach the Railway custom domain `api-nueat.boseong.dev` after the first successful deployment. Never commit `.env.local`, OTP values, database credentials, signed URLs, or image object keys.

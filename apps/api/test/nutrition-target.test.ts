@@ -14,6 +14,10 @@ const environment = parseEnvironment({
   BETTER_AUTH_URL: 'https://api-nueat.boseong.dev',
   RESEND_API_KEY: 're_test',
   TRUSTED_ORIGINS: 'nueat://,https://nueat.boseong.dev',
+  S3_ENDPOINT: 'https://storage.railway.app',
+  S3_BUCKET: 'nueat-test',
+  S3_ACCESS_KEY_ID: 'test-access-key',
+  S3_SECRET_ACCESS_KEY: 'test-secret-key',
 });
 
 const openServers: FastifyInstance[] = [];

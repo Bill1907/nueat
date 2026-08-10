@@ -4,8 +4,10 @@ import Fastify, { LogController } from 'fastify';
 
 import type { Auth } from './auth/auth';
 import type { ApiEnvironment } from './config/env';
+import { createS3ImageObjectStore, type ImageObjectStore } from './services/image-object-store';
 import { authRoutes } from './routes/auth';
 import { healthRoutes } from './routes/health';
+import { imageAssetRoutes } from './routes/image-asset';
 import { onboardingRoutes } from './routes/onboarding';
 import { nutritionTargetRoutes } from './routes/nutrition-target';
 import { sessionRoutes } from './routes/session';
@@ -14,10 +16,14 @@ export interface ServerDependencies {
   environment: ApiEnvironment;
   database: Database;
   auth: Auth;
+  imageObjectStore?: ImageObjectStore;
 }
 
 export async function buildServer(dependencies: ServerDependencies) {
   const { environment } = dependencies;
+  const imageObjectStore =
+    dependencies.imageObjectStore ??
+    (environment.imageBucket ? createS3ImageObjectStore(environment.imageBucket) : null);
   const app = Fastify({
     trustProxy: true,
     genReqId: () => crypto.randomUUID(),
@@ -66,6 +72,12 @@ export async function buildServer(dependencies: ServerDependencies) {
   await app.register(healthRoutes, {
     database: dependencies.database,
     databaseTimeoutMs: environment.healthDbTimeoutMs,
+  });
+  await app.register(imageAssetRoutes, {
+    auth: dependencies.auth,
+    database: dependencies.database,
+    environment,
+    objectStore: imageObjectStore,
   });
   await app.register(authRoutes, {
     auth: dependencies.auth,

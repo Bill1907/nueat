@@ -68,6 +68,8 @@ export const imageAssets = pgTable(
     declaredContentType: text('declared_content_type').notNull(),
     detectedContentType: text('detected_content_type'),
     byteSize: integer('byte_size'),
+    pixelWidth: integer('pixel_width'),
+    pixelHeight: integer('pixel_height'),
     sha256: text('sha256'),
     expiresAt: timestamp('expires_at', { withTimezone: true }),
     uploadedAt: timestamp('uploaded_at', { withTimezone: true }),
@@ -81,6 +83,11 @@ export const imageAssets = pgTable(
     index('image_asset_user_created_idx').on(table.userId, table.createdAt),
     index('image_asset_expiry_status_idx').on(table.expiresAt, table.status),
     index('image_asset_parent_idx').on(table.parentAssetId),
+    check(
+      'image_asset_dimensions_check',
+      sql`(${table.pixelWidth} is null and ${table.pixelHeight} is null)
+        or (${table.pixelWidth} > 0 and ${table.pixelHeight} > 0)`,
+    ),
     check('image_asset_byte_size_check', sql`${table.byteSize} is null or ${table.byteSize} > 0`),
     check(
       'image_asset_inference_expiry_check',

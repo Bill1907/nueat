@@ -161,7 +161,7 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 | Consent | user_id, type, action, document_version, document_sha256, occurred_at; append-only |
 | NutritionProfile | user_id, goal/body inputs, integer nutrient targets, KDRI·정오표·engine·safety versions, input/macro snapshots, EER/활동계수, effective_from/to |
 | DietaryConstraint | type(allergy/preference/exclusion), food_id/label, severity, source |
-| ImageAsset | user_id, private bucket/object_key, validation status, detected type, size, sha256; URL 저장 금지 |
+| ImageAsset | user_id, private bucket/object_key, validation status, declared/detected type, size, dimensions, sha256, expiry; URL 저장 금지 |
 | MealLog | user_id, eaten_at/timezone/local_date, meal_type, status, image_asset_id, deletion/purge timestamps |
 | MealItem | meal_log_id, recognized_label, food/nutrient_profile ids, integer amount/grams, component confidences, user_corrected |
 | CalculationSnapshot | meal_log_id, immutable input_snapshot, integer totals, calculation_version, calculated_at |
@@ -227,6 +227,7 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 - 삭제 요청 즉시 새 signed GET 발급과 일일 집계를 차단한다. object 삭제는 transactional deletion job으로 재시도하며 24시간 이내 완료를 목표로 한다.
 - 미사용 upload는 1시간, 미확정 draft는 24시간 후 정리한다. 계정 삭제는 세션 폐기와 접근 차단 후 모든 원본·썸네일 삭제가 완료되어야 사용자 행을 제거할 수 있다.
 - 이미지·base64·signed URL·object key·EXIF·이메일은 분석 및 오류 로그에 기록하지 않는다. 이미지 학습 사용은 별도 opt-in 전까지 금지한다.
+- 업로드 API는 인증된 `POST /api/image-assets/upload-intents` → signed PUT → `POST /api/image-assets/:id/complete` 순서다. 완료 API가 실제 객체를 다시 읽어 계약 일치, 디코딩, 형식, 1,600px 제한, EXIF 제거, SHA-256을 검증한 뒤에만 `validated`로 전환한다.
 
 ### 9.6 영양 목표 계산 기준
 

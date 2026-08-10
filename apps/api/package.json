@@ -10,6 +10,8 @@
     "test": "bun test"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1106.0",
+    "@aws-sdk/s3-request-presigner": "^3.1106.0",
     "@better-auth/expo": "^1.6.26",
     "@fastify/cors": "^11.3.0",
     "@nueat/database": "workspace:*",
@@ -17,6 +19,7 @@
     "better-auth": "^1.6.26",
     "fastify": "^5.11.3",
     "resend": "^6.18.1",
+    "sharp": "^0.35.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {

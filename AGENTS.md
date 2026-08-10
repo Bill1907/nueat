@@ -11,6 +11,7 @@ The client is an Expo/React Native application written in TypeScript and routed 
 Meal images are stored in a private Railway Bucket. The API authenticates the user, generates server-owned object keys, and issues short-lived presigned upload/download access. Persist object keys, never signed URLs. Validate upload size, MIME type, and file signatures before recognition, and delete objects with the owning meal or account.
 
 Re-encode uploads client-side to remove EXIF/GPS, cap the long edge at 1,600px and size at 10MB, and remove local temporary files after upload. Presigned uploads expire after 5 minutes. Inference assets expire within 24 hours; only sanitized 512px thumbnails persist with meal history. Deletion must be performed through retryable `asset_deletion_job` records before account hard deletion. Never log image bytes, base64, signed URLs, object keys, EXIF, or email addresses.
+Upload completion is server-authoritative: compare the stored object with the declared contract, decode it with Sharp, reject unsupported signatures, dimensions above 1,600px, and retained EXIF, then persist dimensions and SHA-256. Never trust client completion metadata.
 
 Planned core flow: authenticated presigned upload → private image storage → food candidates → user confirmation → canonical food mapping → deterministic nutrition calculation → daily gap calculation → constrained recommendation ranking → AI-authored explanation. Generated models may recognize or explain food, but MUST NOT invent nutrition values. Persist source IDs, dataset versions, serving conversions, confidence, and calculation versions. The AI provider/model remains undecided and must be selected through Korean-food golden-set evaluation.
 
@@ -63,6 +64,7 @@ bun run --cwd packages/database db:migrate
 - Better Auth OTPs are six digits, hashed at rest, valid for five minutes, and limited to three attempts. Keep social and password login disabled.
 - Native auth cookies belong in Expo SecureStore through `@better-auth/expo`; never persist session tokens in AsyncStorage or application state. Web storage is only a preview fallback.
 - Onboarding completion is terminal and transactional: append all current consent decisions, update `user_profile`, and create a versioned nutrition profile only for calculated results. Limited-mode results must not create numeric targets.
+- Image asset queries MUST include authenticated ownership. Return opaque asset IDs to clients; never return bucket names or object keys. Signed PUTs are five minutes and signed GETs are two minutes.
 
 ## Important Files
 
@@ -84,6 +86,9 @@ bun run --cwd packages/database db:migrate
 - `apps/api/.env.example`: API and Railway environment contract.
 - `apps/api/src/routes/onboarding.ts`: Authenticated status, target preview, and atomic completion endpoints.
 - `apps/api/src/routes/nutrition-target.ts`: Authenticated pending/limited/active nutrition-target response for product surfaces.
+- `apps/api/src/routes/image-asset.ts`: Authenticated upload intents, server validation completion, safe status, and download signing.
+- `apps/api/src/services/image-object-store.ts`: S3-compatible Railway Bucket adapter and sanitized storage errors.
+- `apps/api/src/services/image-validator.ts`: Decoding, type/dimension/metadata validation, and SHA-256 derivation.
 - `packages/domain/src/nutrition-targets.ts`: KDRI target policy, provenance constants, and limited-mode rules.
 - `packages/domain/src/onboarding.ts`: Shared consent versions/hashes, Korean labels, profile contract, and target-input conversion.
 - `packages/domain/src/meal-nutrition.ts`: Serving conversion, item calculation, completeness-aware aggregation, and calculation errors.

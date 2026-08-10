@@ -8,6 +8,10 @@ const validEnvironment = {
   BETTER_AUTH_SECRET: 'a'.repeat(32),
   BETTER_AUTH_URL: 'https://api-nueat.boseong.dev',
   RESEND_API_KEY: 're_test',
+  S3_ENDPOINT: 'https://storage.railway.app',
+  S3_BUCKET: 'nueat-test',
+  S3_ACCESS_KEY_ID: 'test-access-key',
+  S3_SECRET_ACCESS_KEY: 'test-secret-key',
 };
 
 describe('parseEnvironment', () => {
@@ -22,6 +26,24 @@ describe('parseEnvironment', () => {
     expect(result.authEmailFrom).toBe('NUEAT <auth@boseong.dev>');
     expect(result.trustedOrigins).toEqual(['nueat://', 'https://nueat.boseong.dev']);
     expect(result.corsOrigins).toEqual(['https://nueat.boseong.dev']);
+  });
+
+  test('allows deployment before a bucket is linked and rejects partial credentials', () => {
+    const withoutBucket = parseEnvironment({
+      ...validEnvironment,
+      S3_ENDPOINT: undefined,
+      S3_BUCKET: undefined,
+      S3_ACCESS_KEY_ID: undefined,
+      S3_SECRET_ACCESS_KEY: undefined,
+    });
+
+    expect(withoutBucket.imageBucket).toBeNull();
+    expect(() =>
+      parseEnvironment({
+        ...validEnvironment,
+        S3_SECRET_ACCESS_KEY: undefined,
+      }),
+    ).toThrow('must be set together');
   });
 
   test('rejects short authentication secrets', () => {
