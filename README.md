@@ -1,56 +1,71 @@
-# Welcome to your Expo app 👋
+# NUEAT
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Korea-first AI nutrition coach for traceable meal logging, deterministic nutrition calculations, and actionable next-meal guidance. Product requirements and safety boundaries live in [`PRD.md`](./PRD.md).
 
-## Get started
+## Workspace
 
-1. Install dependencies
+- `apps/mobile`: Expo/React Native client
+- `apps/api`: Bun/Fastify API for auth and product endpoints
+- `packages/domain`: Versioned nutrition and safety policies
+- `packages/database`: Drizzle schema and Neon PostgreSQL migrations
 
-   ```bash
-   npm install
-   ```
+## Development
 
-2. Start the app
-
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+Requirements: Bun 1.3.14 and Node.js LTS for Expo tooling.
 
 ```bash
-npm run reset-project
+bun install
+bun run api       # API watch mode
+bun run mobile    # Expo development server
+bun run typecheck
+bun test
+bun run lint
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+Local secrets belong in ignored `.env.local` files. Start from:
 
-### Other setup steps
+- `apps/api/.env.example`
+- `packages/database/.env.example`
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+Database commands connect directly to the configured Neon PostgreSQL instance:
 
-## Learn more
+```bash
+bun run db:check
+bun run db:migrate
+```
 
-To learn more about developing your project with Expo, look at the following resources:
+Review generated SQL under `packages/database/drizzle/` before migrating.
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+## API
 
-## Join the community
+```text
+GET  /health/live
+GET  /health/ready
+GET  /health
+GET  /api/me
+GET|POST /api/auth/*
+```
 
-Join our community of developers creating universal apps.
+Authentication uses Better Auth email OTP only. Resend sends six-digit OTPs from `NUEAT <auth@boseong.dev>`; codes expire after five minutes and allow three attempts.
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+## Railway
+
+The root `Dockerfile` builds only the API and its workspace dependencies. `railway.json` runs database migrations before deployment and checks `/health/ready`.
+
+Required Railway variables:
+
+```env
+NODE_ENV=production
+HOST=0.0.0.0
+PORT=3000
+DATABASE_URL=postgresql://...
+BETTER_AUTH_SECRET=...
+BETTER_AUTH_URL=https://api-nueat.boseong.dev
+RESEND_API_KEY=...
+AUTH_EMAIL_FROM=NUEAT <auth@boseong.dev>
+TRUSTED_ORIGINS=nueat://,https://your-web-origin.example
+LOG_LEVEL=info
+HEALTH_DB_TIMEOUT_MS=2000
+```
+
+Attach the Railway custom domain `api-nueat.boseong.dev` after the first successful deployment. Never commit `.env.local`, OTP values, database credentials, signed URLs, or image object keys.

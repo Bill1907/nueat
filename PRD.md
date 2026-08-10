@@ -206,6 +206,9 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 - 인증은 Better Auth의 이메일 OTP만 사용하며 소셜 로그인과 비밀번호 로그인은 제공하지 않는다. 영속 데이터는 공유 Neon PostgreSQL 18을 사용하고 개발·migration도 로컬 DB 없이 해당 Neon 인스턴스에 직접 연결한다.
 - OTP 메일은 Resend에서 `NUEAT <auth@boseong.dev>` 발신자로 전송하고, 운영 API의 기본 URL은 `https://api-nueat.boseong.dev`로 사용한다.
 - 모노레포의 패키지 매니저·스크립트·테스트와 API 런타임은 Bun으로 통일한다. Expo 도구 호환을 위해 개발·CI 환경에는 Node.js LTS도 유지한다.
+- API는 `/health/live`, Neon을 확인하는 `/health/ready`, Better Auth `/api/auth/*`, 인증 사용자 `/api/me`를 제공한다. 오류 응답은 request ID를 포함한 안정적인 공통 계약을 사용한다.
+- OTP는 6자리·5분 만료·3회 시도·재발급 시 회전·해시 저장을 적용하며 발송 요청은 60초당 3회로 제한한다. 전역 rate limit은 Neon DB에 저장해 Railway 다중 인스턴스에서도 공유한다.
+- Railway는 root Dockerfile로 API만 빌드하고 pre-deploy migration 후 `/health/ready`를 통과해야 배포를 완료한다.
 - 식사 이미지는 비공개 Railway Bucket에 저장한다. DB에는 영구 URL이 아닌 object key와 검증된 메타데이터만 저장한다.
 - 업로드 전 API가 사용자 인증과 권한을 확인하고 서버가 object key를 생성한 뒤 짧은 만료 시간의 presigned upload 정보를 발급한다. 콘텐츠 형식과 최대 크기를 서명 조건으로 제한한다.
 - 조회 시 소유권을 다시 확인한 뒤 짧은 만료 시간의 presigned GET URL을 발급한다. signed URL은 저장하거나 분석 이벤트에 기록하지 않는다.

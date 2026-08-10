@@ -10,11 +10,15 @@
   "scripts": {
     "start": "bun run --filter @nueat/mobile start",
     "mobile": "bun run --filter @nueat/mobile start",
+    "api": "bun run --filter @nueat/api dev",
+    "api:start": "bun run --filter @nueat/api start",
     "ios": "bun run --filter @nueat/mobile ios",
     "android": "bun run --filter @nueat/mobile android",
     "web": "bun run --filter @nueat/mobile web",
     "lint": "bun run --filter @nueat/mobile lint",
     "typecheck": "bun run --filter '*' typecheck",
-    "test": "bun test"
+    "test": "bun test",
+    "db:check": "bun run --cwd packages/database db:check",
+    "db:migrate": "bun run --cwd packages/database db:migrate"
   }
 }

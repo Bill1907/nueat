@@ -20,6 +20,7 @@ Planned core flow: authenticated presigned upload → private image storage → 
 - `apps/mobile/src/components/`: Reusable mobile UI components.
 - `apps/mobile/src/hooks/`: Shared React hooks.
 - `apps/mobile/assets/`: App icons and bundled images.
+- `apps/api/src/`: Fastify server, Better Auth configuration, routes, and external service adapters.
 - `packages/domain/src/`: Pure versioned nutrition and safety policies shared by mobile and API.
 - `packages/database/src/schema/`: Drizzle data contracts grouped by domain.
 - `packages/database/drizzle/`: Generated, committed PostgreSQL migrations.
@@ -33,6 +34,9 @@ bun run start
 bun run ios
 bun run android
 bun run web
+bun run api
+bun run api:start
+bun test
 bun run lint
 bun run typecheck
 bun run --cwd packages/database db:check
@@ -51,6 +55,8 @@ bun run --cwd packages/database db:migrate
 - Preserve raw inputs and versioned calculation references so displayed totals are reproducible.
 - Store nutrient quantities in integer minimum units; `null` means unavailable and MUST remain distinct from zero.
 - Treat confirmed calculation snapshots and consent events as immutable append-only records.
+- API errors use `{ error: { code, message, requestId } }`; never expose stack traces or secret-bearing upstream errors.
+- Better Auth OTPs are six digits, hashed at rest, valid for five minutes, and limited to three attempts. Keep social and password login disabled.
 
 ## Important Files
 
@@ -60,10 +66,14 @@ bun run --cwd packages/database db:migrate
 - `apps/mobile/src/app/_layout.tsx`: Root navigation layout.
 - `apps/mobile/src/app/index.tsx`: Initial route.
 - `apps/mobile/src/app/explore.tsx`: User-visible nutrition calculation standard and safety policy.
+- `apps/api/src/server.ts`: Fastify composition, CORS, redacted logging, and error contracts.
+- `apps/api/src/auth/auth.ts`: Better Auth email OTP policy.
+- `apps/api/.env.example`: API and Railway environment contract.
 - `packages/domain/src/nutrition-targets.ts`: KDRI target policy, provenance constants, and limited-mode rules.
 - `packages/database/src/schema/index.ts`: Database schema export.
 - `packages/database/drizzle.config.ts`: Migration configuration.
 - `packages/database/.env.example`: Neon connection variable template; real credentials belong in ignored `.env.local` or Railway secrets.
+- `Dockerfile` and `railway.json`: Railway API build, migration, readiness, and restart policy.
 
 ## Runtime/Tooling Preferences
 
