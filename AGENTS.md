@@ -1,3 +1,74 @@
-# Expo HAS CHANGED
+# Repository Guidelines
 
-Read the exact versioned docs at https://docs.expo.dev/versions/v57.0.0/ before writing any code.
+## Project Overview
+
+NUEAT is a Korea-first AI nutrition coach. Users photograph meals, correct recognized foods and portions, review deterministic nutrition totals from traceable data sources, and receive constrained next-meal recommendations. `PRD.md` is the product and safety source of truth.
+
+## Architecture & Data Flow
+
+The client is an Expo/React Native application written in TypeScript and routed with Expo Router. Application routes live in `apps/mobile/src/app/`; reusable mobile UI, hooks, and constants live under `apps/mobile/src/`. The backend runs on Bun as a Fastify service on Railway at `api-nueat.boseong.dev`, uses Better Auth with email OTP only, Drizzle for database access, and Neon PostgreSQL for persistence. Resend sends OTP mail as `NUEAT <auth@boseong.dev>`. Do not add social or password authentication.
+
+Meal images are stored in a private Railway Bucket. The API authenticates the user, generates server-owned object keys, and issues short-lived presigned upload/download access. Persist object keys, never signed URLs. Validate upload size, MIME type, and file signatures before recognition, and delete objects with the owning meal or account.
+
+Re-encode uploads client-side to remove EXIF/GPS, cap the long edge at 1,600px and size at 10MB, and remove local temporary files after upload. Presigned uploads expire after 5 minutes. Inference assets expire within 24 hours; only sanitized 512px thumbnails persist with meal history. Deletion must be performed through retryable `asset_deletion_job` records before account hard deletion. Never log image bytes, base64, signed URLs, object keys, EXIF, or email addresses.
+
+Planned core flow: authenticated presigned upload → private image storage → food candidates → user confirmation → canonical food mapping → deterministic nutrition calculation → daily gap calculation → constrained recommendation ranking → AI-authored explanation. Generated models may recognize or explain food, but MUST NOT invent nutrition values. Persist source IDs, dataset versions, serving conversions, confidence, and calculation versions. The AI provider/model remains undecided and must be selected through Korean-food golden-set evaluation.
+
+## Key Directories
+
+- `apps/mobile/src/app/`: Expo Router screens and layouts.
+- `apps/mobile/src/components/`: Reusable mobile UI components.
+- `apps/mobile/src/hooks/`: Shared React hooks.
+- `apps/mobile/assets/`: App icons and bundled images.
+- `packages/domain/src/`: Pure versioned nutrition and safety policies shared by mobile and API.
+- `packages/database/src/schema/`: Drizzle data contracts grouped by domain.
+- `packages/database/drizzle/`: Generated, committed PostgreSQL migrations.
+- `.gjc/`: Agent runtime state; do not edit for product changes.
+
+## Development Commands
+
+```bash
+bun install
+bun run start
+bun run ios
+bun run android
+bun run web
+bun run lint
+bun run typecheck
+bun run --cwd packages/database db:check
+bun run --cwd packages/database db:migrate
+```
+
+## Code Conventions & Common Patterns
+
+- Use strict TypeScript and functional React components.
+- Keep route files focused on composition; move reusable UI and domain logic out of `apps/mobile/src/app/`.
+- Model nutrition calculations as pure, deterministic functions with fixture-based tests.
+- The target engine uses the versioned 2025 KDRI policy in `packages/domain/src/nutrition-targets.ts`; never duplicate formulas or UI metadata.
+- Represent loading, empty, error, low-confidence, draft, and confirmed states explicitly.
+- Treat allergies and excluded foods as hard constraints, never ranking preferences.
+- Do not treat missing nutrient values as zero or commit unconfirmed recognition as consumed food.
+- Preserve raw inputs and versioned calculation references so displayed totals are reproducible.
+- Store nutrient quantities in integer minimum units; `null` means unavailable and MUST remain distinct from zero.
+- Treat confirmed calculation snapshots and consent events as immutable append-only records.
+
+## Important Files
+
+- `PRD.md`: Requirements, safety boundaries, data model, and acceptance criteria.
+- `package.json`: Runtime dependencies and development scripts.
+- `apps/mobile/app.json`: Expo application configuration.
+- `apps/mobile/src/app/_layout.tsx`: Root navigation layout.
+- `apps/mobile/src/app/index.tsx`: Initial route.
+- `apps/mobile/src/app/explore.tsx`: User-visible nutrition calculation standard and safety policy.
+- `packages/domain/src/nutrition-targets.ts`: KDRI target policy, provenance constants, and limited-mode rules.
+- `packages/database/src/schema/index.ts`: Database schema export.
+- `packages/database/drizzle.config.ts`: Migration configuration.
+- `packages/database/.env.example`: Neon connection variable template; real credentials belong in ignored `.env.local` or Railway secrets.
+
+## Runtime/Tooling Preferences
+
+Use Bun 1.3.14 as the workspace package manager, script runner, test runner, and Railway API runtime; `bun.lock` is the only dependency lockfile. Keep Node.js LTS installed because Expo tooling may invoke Node/npm internally. The app targets Expo SDK 57, React Native, and TypeScript; backend services target Railway with Fastify, Drizzle, Neon PostgreSQL 18, Better Auth, and private Railway Buckets. Database development and migrations run directly against Neon through the ignored `packages/database/.env.local`; do not start local PostgreSQL. Review generated SQL before `db:migrate` because it targets the shared remote database. Prefer Expo-supported client libraries and Bun-compatible server libraries. Do not introduce Cloudflare runtime APIs, switch package managers, or edit generated lockfiles manually.
+
+## Testing & QA
+
+Run `bun run typecheck` and `bun run lint` for code changes. Use `bun test` for domain and backend tests. Nutrition calculations require complete branch and unit coverage, including serving conversion, missing values, rounding, and date/timezone boundaries. Critical flows require device or simulator verification for permission denial, upload failure, offline draft preservation, correction, deletion, and accessibility states.
