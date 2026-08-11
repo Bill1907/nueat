@@ -108,9 +108,17 @@ S3_URL_STYLE=virtual
 IMAGE_UPLOAD_URL_TTL_SECONDS=300
 IMAGE_DOWNLOAD_URL_TTL_SECONDS=120
 IMAGE_MAX_BYTES=10000000
+MEAL_RECOGNITION_MODE=openai
+OPENAI_API_KEY=...
+OPENAI_MODEL=gpt-5.6-luna
+MEAL_RECOGNITION_DEADLINE_MS=20000
+MEAL_RECOGNITION_MAX_OUTPUT_TOKENS=2000
+MEAL_RECOGNITION_MAX_ATTEMPTS=2
+MEAL_RECOGNITION_DAILY_ATTEMPT_QUOTA=20
 ```
 
 Map Railway Bucket `ENDPOINT`, `REGION`, `BUCKET`, `ACCESS_KEY_ID`, and `SECRET_ACCESS_KEY` into the corresponding `S3_*` service variables. Use Railway's globally unique `BUCKET` value, not `RAILWAY_BUCKET_NAME`. Until all four required S3 connection values are configured together, existing API features remain available and image mutation endpoints return `503 IMAGE_STORAGE_UNAVAILABLE`.
 The production project uses the private `nueat-images` bucket in Railway's `sin` region. Its service variables are linked by Railway references rather than copied credentials.
+Live recognition reads private bucket bytes on the API server, rechecks size/content type/SHA-256, and calls OpenAI outside database transactions. `mock` mode is explicit; OpenAI failures never fall back to mock or generate nutrition values.
 
 Attach the Railway custom domain `api-nueat.boseong.dev` after the first successful deployment. Never commit `.env.local`, OTP values, database credentials, signed URLs, or image object keys.

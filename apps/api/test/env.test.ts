@@ -27,6 +27,88 @@ describe('parseEnvironment', () => {
     expect(result.trustedOrigins).toEqual(['nueat://', 'https://nueat.boseong.dev']);
     expect(result.corsOrigins).toEqual(['https://nueat.boseong.dev']);
   });
+  test('defaults meal recognition to mock mode without an OpenAI key', () => {
+    const result = parseEnvironment({
+      ...validEnvironment,
+      OPENAI_API_KEY: '',
+    });
+
+    expect(result.mealRecognition).toEqual({
+      mode: 'mock',
+      apiKey: undefined,
+      model: 'gpt-5.6-luna',
+      deadlineMs: 20_000,
+      maxOutputTokens: 2_000,
+      maxAttempts: 2,
+      dailyAttemptQuota: 20,
+    });
+  });
+
+  test('requires an OpenAI key in openai mode and enforces hard limits', () => {
+    expect(() =>
+      parseEnvironment({
+        ...validEnvironment,
+        MEAL_RECOGNITION_MODE: 'openai',
+      }),
+    ).toThrow('OPENAI_API_KEY is required');
+
+    expect(() =>
+      parseEnvironment({
+        ...validEnvironment,
+        MEAL_RECOGNITION_DEADLINE_MS: '999',
+      }),
+    ).toThrow();
+
+    expect(() =>
+      parseEnvironment({
+        ...validEnvironment,
+        MEAL_RECOGNITION_MAX_OUTPUT_TOKENS: '4001',
+      }),
+    ).toThrow();
+
+    expect(() =>
+      parseEnvironment({
+        ...validEnvironment,
+        MEAL_RECOGNITION_MAX_ATTEMPTS: '4',
+      }),
+    ).toThrow();
+
+    expect(() =>
+      parseEnvironment({
+        ...validEnvironment,
+        MEAL_RECOGNITION_DAILY_ATTEMPT_QUOTA: '101',
+      }),
+    ).toThrow();
+    expect(() =>
+      parseEnvironment({
+        ...validEnvironment,
+        OPENAI_MODEL: 'gpt-5.6',
+      }),
+    ).toThrow();
+  });
+
+  test('parses bounded OpenAI recognition settings', () => {
+    const result = parseEnvironment({
+      ...validEnvironment,
+      MEAL_RECOGNITION_MODE: 'openai',
+      OPENAI_API_KEY: 'sk-test',
+      OPENAI_MODEL: 'gpt-5.6-luna',
+      MEAL_RECOGNITION_DEADLINE_MS: '30000',
+      MEAL_RECOGNITION_MAX_OUTPUT_TOKENS: '2000',
+      MEAL_RECOGNITION_MAX_ATTEMPTS: '3',
+      MEAL_RECOGNITION_DAILY_ATTEMPT_QUOTA: '50',
+    });
+
+    expect(result.mealRecognition).toEqual({
+      mode: 'openai',
+      apiKey: 'sk-test',
+      model: 'gpt-5.6-luna',
+      deadlineMs: 30_000,
+      maxOutputTokens: 2_000,
+      maxAttempts: 3,
+      dailyAttemptQuota: 50,
+    });
+  });
 
   test('allows deployment before a bucket is linked and rejects partial credentials', () => {
     const withoutBucket = parseEnvironment({

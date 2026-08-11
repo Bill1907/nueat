@@ -50,6 +50,27 @@
       "when": 1786376000000,
       "tag": "0006_core_korean_foods",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1786450000000,
+      "tag": "0007_live_recognition_provenance",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1786450100000,
+      "tag": "0008_bitter_meggan",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1786450200000,
+      "tag": "0009_petite_nico_minoru",
+      "breakpoints": true
     }
   ]
 }

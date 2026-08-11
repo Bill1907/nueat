@@ -51,6 +51,37 @@ const environmentSchema = z
       .min(1_000_000)
       .max(10_000_000)
       .default(10_000_000),
+    MEAL_RECOGNITION_MODE: z.enum(['mock', 'openai']).default('mock'),
+    OPENAI_API_KEY: z
+      .string()
+      .trim()
+      .optional()
+      .transform((value) => value || undefined),
+    OPENAI_MODEL: z.literal('gpt-5.6-luna').default('gpt-5.6-luna'),
+    MEAL_RECOGNITION_DEADLINE_MS: z.coerce
+      .number()
+      .int()
+      .min(1_000)
+      .max(60_000)
+      .default(20_000),
+    MEAL_RECOGNITION_MAX_OUTPUT_TOKENS: z.coerce
+      .number()
+      .int()
+      .min(256)
+      .max(4_000)
+      .default(2_000),
+    MEAL_RECOGNITION_MAX_ATTEMPTS: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(3)
+      .default(2),
+    MEAL_RECOGNITION_DAILY_ATTEMPT_QUOTA: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(100)
+      .default(20),
   })
   .superRefine((value, context) => {
     const bucketValues = [
@@ -65,6 +96,13 @@ const environmentSchema = z
         code: 'custom',
         message:
           'S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, and S3_SECRET_ACCESS_KEY must be set together',
+      });
+    }
+    if (value.MEAL_RECOGNITION_MODE === 'openai' && !value.OPENAI_API_KEY) {
+      context.addIssue({
+        code: 'custom',
+        path: ['OPENAI_API_KEY'],
+        message: 'OPENAI_API_KEY is required when MEAL_RECOGNITION_MODE is openai',
       });
     }
   });
@@ -109,6 +147,15 @@ export function parseEnvironment(input: Record<string, string | undefined>) {
     corsOrigins,
     healthDbTimeoutMs: parsed.HEALTH_DB_TIMEOUT_MS,
     imageBucket,
+    mealRecognition: {
+      mode: parsed.MEAL_RECOGNITION_MODE,
+      apiKey: parsed.OPENAI_API_KEY,
+      model: parsed.OPENAI_MODEL,
+      deadlineMs: parsed.MEAL_RECOGNITION_DEADLINE_MS,
+      maxOutputTokens: parsed.MEAL_RECOGNITION_MAX_OUTPUT_TOKENS,
+      maxAttempts: parsed.MEAL_RECOGNITION_MAX_ATTEMPTS,
+      dailyAttemptQuota: parsed.MEAL_RECOGNITION_DAILY_ATTEMPT_QUOTA,
+    },
   } as const;
 }
 

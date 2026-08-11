@@ -40,7 +40,7 @@ describe('meal log routes', () => {
     expect(JSON.parse(response.body).error.code).toBe('UNAUTHORIZED');
   });
 
-  test('creates a processed draft with the exact deterministic mock items', async () => {
+  test('creates a processed draft with the deterministic mock recognizer', async () => {
     const { server, state } = await createServer(true);
     const response = await server.inject({
       method: 'POST',
@@ -54,7 +54,8 @@ describe('meal log routes', () => {
       imageAssetId: imageId,
       status: 'draft',
       recognitionStatus: 'ready',
-      recognitionEngineVersion: 'mock-recognition-v1',
+      recognitionProvider: 'mock',
+      recognitionModel: 'mock-recognition-v2',
       localDate: '2026-08-10',
     });
     expect(
@@ -72,6 +73,21 @@ describe('meal log routes', () => {
     ]);
     expect(state.asset.status).toBe('processed');
   });
+  test('includes an additive recognition outcome without changing mealLog/items', async () => {
+    const { server } = await createServer(true);
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/meal-logs',
+      payload: createPayload(),
+    });
+    const body = JSON.parse(response.body);
+    expect(body).toMatchObject({
+      mealLog: { recognitionStatus: 'ready' },
+      recognitionOutcome: { status: 'ready' },
+    });
+    expect(Array.isArray(body.items)).toBe(true);
+  });
+
 
   test('returns the existing draft when the validated image is retried', async () => {
     const { server, state } = await createServer(true);
@@ -182,6 +198,24 @@ describe('meal log routes', () => {
     expect(state.asset.status).toBe('deletion_pending');
     expect(state.deletionJob?.imageAssetId).toBe(imageId);
   });
+  test('rejects retry and manual conversion after recognition is ready', async () => {
+    const { server, state } = await createServer(true);
+    state.meal = draftMeal();
+
+    const retry = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/recognition/retry`,
+    });
+    const manual = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/recognition/manual`,
+    });
+
+    expect(retry.statusCode).toBe(409);
+    expect(manual.statusCode).toBe(409);
+    expect(state.meal.recognitionStatus).toBe('ready');
+    expect(state.meal.recognitionProvider).toBe('mock');
+  });
 });
 
 function createPayload() {
@@ -203,7 +237,14 @@ function draftMeal() {
     status: 'draft',
     imageAssetId: imageId,
     recognitionStatus: 'ready',
-    recognitionEngineVersion: 'mock-recognition-v1',
+    recognitionProvider: 'mock',
+    recognitionModel: 'mock-recognition-v2',
+    recognitionPromptVersion: 'meal-recognition-prompt-v1',
+    recognitionSchemaVersion: 'meal-recognition-schema-v1',
+    recognitionCompletedAt: new Date('2026-08-10T03:00:01.000Z'),
+    recognitionLastErrorCode: null,
+    recognitionAttemptCount: 1,
+    recognitionNextAttemptAt: null,
   };
 }
 
@@ -236,6 +277,62 @@ async function createServer(
     environment,
     auth,
     database: databaseMock(state),
+    recognitionCoordinator: {
+      async recognize() {
+        if (state.meal?.recognitionStatus !== 'ready') {
+          Object.assign(state.meal ?? {}, {
+            recognitionStatus: 'ready',
+            recognitionProvider: 'mock',
+            recognitionModel: 'mock-recognition-v2',
+            recognitionPromptVersion: 'meal-recognition-prompt-v1',
+            recognitionSchemaVersion: 'meal-recognition-schema-v1',
+            recognitionCompletedAt: new Date('2026-08-10T03:00:01.000Z'),
+            recognitionLastErrorCode: null,
+            recognitionAttemptCount: 1,
+            recognitionNextAttemptAt: null,
+          });
+          if (state.items.length === 0) {
+            state.items.push(
+              {
+                id: itemId,
+                mealLogId: mealId,
+                recognizedLabel: '흰쌀밥',
+                amountMilliunits: 1_000,
+                unit: 'bowl',
+                recognitionRegionIndex: 0,
+                recognitionConfidenceBps: 9_500,
+                portionConfidenceBps: 9_200,
+                userCorrected: false,
+              },
+              {
+                id: `${itemId.slice(0, -1)}4`,
+                mealLogId: mealId,
+                recognizedLabel: '김치찌개',
+                amountMilliunits: 1_000,
+                unit: 'serving',
+                recognitionRegionIndex: 1,
+                recognitionConfidenceBps: 9_300,
+                portionConfidenceBps: 9_000,
+                userCorrected: false,
+              },
+              {
+                id: `${itemId.slice(0, -1)}5`,
+                mealLogId: mealId,
+                recognizedLabel: '배추김치',
+                amountMilliunits: 500,
+                unit: 'serving',
+                recognitionRegionIndex: 2,
+                recognitionConfidenceBps: 9_100,
+                portionConfidenceBps: 8_800,
+                userCorrected: false,
+              },
+            );
+          }
+          state.asset.status = 'processed';
+        }
+        return { status: 'ready' };
+      },
+    },
   });
   servers.push(server);
   return { server, state };

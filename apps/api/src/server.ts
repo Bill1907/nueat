@@ -1,3 +1,4 @@
+import OpenAI from 'openai';
 import cors from '@fastify/cors';
 import type { Database } from '@nueat/database';
 import Fastify, { LogController } from 'fastify';
@@ -5,6 +6,15 @@ import Fastify, { LogController } from 'fastify';
 import type { Auth } from './auth/auth';
 import type { ApiEnvironment } from './config/env';
 import { createS3ImageObjectStore, type ImageObjectStore } from './services/image-object-store';
+import {
+  MealRecognitionCoordinator,
+  type MealRecognitionRunner,
+} from './services/meal-recognition-coordinator';
+import { MockMealRecognizer } from './services/mock-meal-recognizer';
+import {
+  OpenAIMealRecognizer,
+  type OpenAIResponsesClient,
+} from './services/openai-meal-recognizer';
 import { authRoutes } from './routes/auth';
 import { foodRoutes } from './routes/food';
 import { healthRoutes } from './routes/health';
@@ -19,6 +29,7 @@ export interface ServerDependencies {
   database: Database;
   auth: Auth;
   imageObjectStore?: ImageObjectStore;
+  recognitionCoordinator?: MealRecognitionRunner;
 }
 
 export async function buildServer(dependencies: ServerDependencies) {
@@ -26,6 +37,31 @@ export async function buildServer(dependencies: ServerDependencies) {
   const imageObjectStore =
     dependencies.imageObjectStore ??
     (environment.imageBucket ? createS3ImageObjectStore(environment.imageBucket) : null);
+  const recognitionCoordinator =
+    dependencies.recognitionCoordinator ??
+    (imageObjectStore
+      ? new MealRecognitionCoordinator({
+          database: dependencies.database,
+          objectStore: imageObjectStore,
+          recognizer:
+            environment.mealRecognition.mode === 'openai'
+              ? new OpenAIMealRecognizer(
+                  new OpenAI({
+                    apiKey: environment.mealRecognition.apiKey,
+                  }) as unknown as OpenAIResponsesClient,
+                  {
+                    deadlineMs: environment.mealRecognition.deadlineMs,
+                    maxOutputTokens: environment.mealRecognition.maxOutputTokens,
+                  },
+                )
+              : new MockMealRecognizer(),
+          maxBytes: environment.imageBucket?.maxBytes ?? 10_000_000,
+          timeoutMs: environment.mealRecognition.deadlineMs,
+          leaseMs: environment.mealRecognition.deadlineMs + 5_000,
+          maxAttempts: environment.mealRecognition.maxAttempts,
+          dailyQuota: environment.mealRecognition.dailyAttemptQuota,
+        })
+      : unavailableRecognitionRunner);
   const app = Fastify({
     trustProxy: true,
     genReqId: () => crypto.randomUUID(),
@@ -97,6 +133,7 @@ export async function buildServer(dependencies: ServerDependencies) {
   await app.register(mealLogRoutes, {
     auth: dependencies.auth,
     database: dependencies.database,
+    recognitionCoordinator,
   });
   await app.register(foodRoutes, {
     auth: dependencies.auth,
@@ -143,3 +180,13 @@ function getErrorDetails(error: unknown) {
 
   return { statusCode, isValidationError };
 }
+
+const unavailableRecognitionRunner: MealRecognitionRunner = {
+  async recognize() {
+    return {
+      status: 'unavailable',
+      code: 'RECOGNITION_UNAVAILABLE',
+      retryable: false,
+    };
+  },
+};

@@ -1,6 +1,7 @@
 import { Image } from 'expo-image';
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  AppState,
   Modal,
   Pressable,
   ScrollView,
@@ -15,6 +16,8 @@ import {
   getMealDraft,
   getMealImageDownloadIntent,
   mapMealDraftItemFood,
+  retryMealDraftRecognition,
+  startManualMealDraftEntry,
   type MealDraftItem,
   type MealDraftResponse,
   type MealUnit,
@@ -29,6 +32,11 @@ import {
   isFoodMappingCurrent,
   normalizeKoreanFoodLabel,
 } from '@/meals/food-selection-policy';
+import {
+  RECOGNITION_MAX_ELAPSED_MS,
+  recognitionPollDelay,
+  type RecognitionStatus,
+} from '@/meals/meal-recognition-policy';
 
 const units: MealUnit[] = ['g', 'ml', 'serving', 'bowl', 'piece'];
 
@@ -54,9 +62,16 @@ export function MealConfirmationModal({
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [forms, setForms] = useState<Record<string, ItemForm>>({});
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadErrorMealLogId, setLoadErrorMealLogId] = useState<string | null>(null);
   const [loadedMealLogId, setLoadedMealLogId] = useState<string | null>(null);
   const [savingItemId, setSavingItemId] = useState<string | null>(null);
-
+  const [pollGeneration, setPollGeneration] = useState(0);
+  const [recognitionTimedOut, setRecognitionTimedOut] = useState(false);
+  const [manualForm, setManualForm] = useState<{
+    recognizedLabel: string;
+    amount: string;
+    unit: MealUnit | '';
+  } | null>(null);
   const [foodSearchItemId, setFoodSearchItemId] = useState<string | null>(null);
   const [foodQuery, setFoodQuery] = useState('');
   const [foodSearchState, setFoodSearchState] = useState<FoodSearchState>({
@@ -70,57 +85,225 @@ export function MealConfirmationModal({
     new Set(),
   );
   const foodSearchRequest = useRef(0);
+  const mounted = useRef(true);
+  const visibleRef = useRef(visible);
+  const scopeRef = useRef({ mealLogId, generation: 0 });
+  const itemsRef = useRef<MealDraftItem[]>([]);
+  const mutationQueue = useRef(Promise.resolve());
+  const mutationToken = useRef(0);
+  const scopeRequestController = useRef(new AbortController());
+
+  const isCurrent = useCallback((mealId: string, generation: number) => {
+    return (
+      mounted.current &&
+      visibleRef.current &&
+      scopeRef.current.mealLogId === mealId &&
+      scopeRef.current.generation === generation
+    );
+  }, []);
+
+  const applyResponse = useCallback(
+    (
+      response: MealDraftResponse,
+      mealId: string,
+      generation: number,
+    ) => {
+      if (!isCurrent(mealId, generation) || response.mealLog.id !== mealId) return;
+      itemsRef.current = response.items;
+      setData(response);
+      setLoadedMealLogId(response.mealLog.id);
+      setForms(formsFromItems(response.items));
+      setMappedFoods((current) =>
+        Object.fromEntries(
+          response.items.flatMap((item) => {
+            const food = current[item.id];
+            return item.foodId === food?.id ? [[item.id, food]] : [];
+          }),
+        ),
+      );
+    },
+    [isCurrent],
+  );
+
   useEffect(() => {
-    if (!visible || !mealLogId) return;
-    let active = true;
-
-    void (async () => {
-      try {
-        const mealDraft = await getMealDraft(mealLogId);
-        if (!active) return;
-        setLoadedMealLogId(mealLogId);
-        setLoadError(null);
-        setImageUrl(null);
-        setData(mealDraft);
-        setForms(formsFromItems(mealDraft.items));
-        setMappedFoods({});
-        setInvalidatedMappings(new Set());
-        void loadMappedFoods(mealDraft.items).then((foods) => {
-          if (active) setMappedFoods(foods);
-        });
-
-        const intent = await getMealImageDownloadIntent(
-          mealDraft.mealLog.imageAssetId,
-        );
-        if (active) setImageUrl(intent.downloadUrl);
-      } catch (cause) {
-        if (active) setLoadedMealLogId(mealLogId);
-        if (active) setLoadError(errorMessage(cause));
-      }
-    })();
-    return () => {
-      active = false;
+    visibleRef.current = visible;
+    scopeRef.current = {
+      mealLogId,
+      generation: scopeRef.current.generation + 1,
     };
-  }, [mealLogId, visible]);
+    if (!visible || !mealLogId) return;
+    mounted.current = true;
+    const generation = scopeRef.current.generation;
+    let appActive = AppState.currentState === 'active';
+    let attempt = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let loading = false;
+    let requestController = new AbortController();
+    let refreshRequested = false;
+    scopeRequestController.current.abort();
+    scopeRequestController.current = requestController;
+    const startedAt = Date.now();
+
+    const schedule = (status: RecognitionStatus = 'pending') => {
+      const elapsedMs = Date.now() - startedAt;
+      const delay = recognitionPollDelay({
+        status,
+        attempt: attempt++,
+        elapsedMs,
+        isAppActive: appActive,
+      });
+      if (delay !== null && isCurrent(mealLogId, generation) && appActive) {
+        timer = setTimeout(() => void refresh(false), delay);
+      } else if (elapsedMs >= RECOGNITION_MAX_ELAPSED_MS && isCurrent(mealLogId, generation)) {
+        setRecognitionTimedOut(true);
+      }
+    };
+
+    const refresh = async (loadImage: boolean) => {
+      if (!isCurrent(mealLogId, generation) || !appActive) return;
+      if (loading) {
+        refreshRequested = true;
+        return;
+      }
+      loading = true;
+      try {
+        const mealDraft = await getMealDraft(
+          mealLogId,
+          requestController.signal,
+        );
+        if (!isCurrent(mealLogId, generation)) return;
+        setLoadError(null);
+        setLoadErrorMealLogId(mealLogId);
+        setRecognitionTimedOut(false);
+        applyResponse(mealDraft, mealLogId, generation);
+
+        if (mealDraft.items.some((item) => item.foodId)) {
+          const mapped = await loadMappedFoods(
+            mealDraft.items,
+            requestController.signal,
+          );
+          if (!isCurrent(mealLogId, generation)) return;
+          setMappedFoods((current) => ({
+            ...current,
+            ...Object.fromEntries(
+              Object.entries(mapped).filter(([itemId, food]) =>
+                itemsRef.current.some(
+                  (item) => item.id === itemId && item.foodId === food.id,
+                ),
+              ),
+            ),
+          }));
+        }
+
+        if (loadImage) setImageUrl(null);
+        if (loadImage && mealDraft.mealLog.imageAssetId) {
+          setImageUrl(null);
+          try {
+            const intent = await getMealImageDownloadIntent(
+              mealDraft.mealLog.imageAssetId,
+              requestController.signal,
+            );
+            if (!isCurrent(mealLogId, generation)) return;
+            setImageUrl(intent.downloadUrl);
+          } catch (cause) {
+            if (cause instanceof Error && cause.name === 'AbortError') return;
+            if (isCurrent(mealLogId, generation)) {
+              setLoadErrorMealLogId(mealLogId);
+              setLoadError(errorMessage(cause));
+            }
+          }
+        }
+        schedule(mealDraft.mealLog.recognitionStatus);
+      } catch (cause) {
+        if (cause instanceof Error && cause.name === 'AbortError') return;
+        if (isCurrent(mealLogId, generation)) {
+          setLoadErrorMealLogId(mealLogId);
+          setLoadError(errorMessage(cause));
+          schedule();
+        }
+      } finally {
+        loading = false;
+        if (
+          refreshRequested &&
+          appActive &&
+          isCurrent(mealLogId, generation)
+        ) {
+          refreshRequested = false;
+          void refresh(false);
+        }
+      }
+    };
+
+    void refresh(true);
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      appActive = nextState === 'active';
+      if (!appActive) {
+        requestController.abort();
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      } else if (isCurrent(mealLogId, generation)) {
+        requestController = new AbortController();
+        scopeRequestController.current = requestController;
+        void refresh(false);
+      }
+    });
+    return () => {
+      visibleRef.current = false;
+      scopeRef.current.generation += 1;
+      requestController.abort();
+      scopeRequestController.current.abort();
+      if (timer) clearTimeout(timer);
+      subscription.remove();
+    };
+  }, [applyResponse, isCurrent, mealLogId, pollGeneration, visible]);
+
+  useEffect(
+    () => () => {
+      mounted.current = false;
+      scopeRef.current.generation += 1;
+    },
+    [],
+  );
+
   async function runFoodSearch() {
     const query = normalizeKoreanFoodLabel(foodQuery);
-    if (!foodSearchItemId) return;
-    if (!query) {
-      setFoodSearchState({ status: 'empty', foods: [] });
+    const itemId = foodSearchItemId;
+    const { mealLogId: scopedMealId, generation } = scopeRef.current;
+    if (!itemId || !scopedMealId || !query) {
+      if (itemId && isCurrent(scopedMealId ?? '', generation)) {
+        setFoodSearchState({ status: 'empty', foods: [] });
+      }
       return;
     }
 
     const requestId = ++foodSearchRequest.current;
     setFoodSearchState({ status: 'loading', foods: [] });
     try {
-      const { foods } = await searchFoods(query);
-      if (requestId !== foodSearchRequest.current) return;
+      const { foods } = await searchFoods(
+        query,
+        scopeRequestController.current.signal,
+      );
+      if (
+        requestId !== foodSearchRequest.current ||
+        !isCurrent(scopedMealId, generation) ||
+        !itemsRef.current.some((item) => item.id === itemId)
+      ) {
+        return;
+      }
       setFoodSearchState({
         status: foods.length === 0 ? 'empty' : 'idle',
         foods,
       });
     } catch (cause) {
-      if (requestId !== foodSearchRequest.current) return;
+      if (cause instanceof Error && cause.name === 'AbortError') return;
+      if (
+        requestId !== foodSearchRequest.current ||
+        !isCurrent(scopedMealId, generation)
+      ) {
+        return;
+      }
       setFoodSearchState({
         status: 'error',
         foods: [],
@@ -129,18 +312,47 @@ export function MealConfirmationModal({
     }
   }
 
-  function applyResponse(response: MealDraftResponse) {
-    setData(response);
-    setLoadedMealLogId(response.mealLog.id);
-    setForms(formsFromItems(response.items));
-    setMappedFoods((current) =>
-      Object.fromEntries(
-        response.items.flatMap((item) => {
-          const food = current[item.id];
-          return item.foodId === food?.id ? [[item.id, food]] : [];
-        }),
-      ),
-    );
+  function enqueueMutation(
+    savingId: string,
+    operation: (mealId: string, generation: number) => Promise<void>,
+  ) {
+    const { mealLogId: scopedMealId, generation } = scopeRef.current;
+    if (!scopedMealId || !isCurrent(scopedMealId, generation) || savingItemId) return;
+    const token = ++mutationToken.current;
+    setSavingItemId(savingId);
+    setLoadErrorMealLogId(scopedMealId);
+    setLoadError(null);
+    mutationQueue.current = mutationQueue.current
+      .catch(() => undefined)
+      .then(async () => {
+        if (!isCurrent(scopedMealId, generation)) return;
+        try {
+          await operation(scopedMealId, generation);
+        } catch (cause) {
+          if (isCurrent(scopedMealId, generation)) setLoadError(errorMessage(cause));
+        } finally {
+          if (mutationToken.current === token) setSavingItemId(null);
+        }
+      });
+  }
+
+  function retryRecognition() {
+    enqueueMutation('recognition', async (scopedMealId, generation) => {
+      const response = await retryMealDraftRecognition(scopedMealId);
+      if (!isCurrent(scopedMealId, generation)) return;
+      applyResponse(response, scopedMealId, generation);
+      setRecognitionTimedOut(false);
+      setPollGeneration((current) => current + 1);
+    });
+  }
+
+  function startManualEntry() {
+    enqueueMutation('recognition', async (scopedMealId, generation) => {
+      const response = await startManualMealDraftEntry(scopedMealId);
+      if (!isCurrent(scopedMealId, generation)) return;
+      applyResponse(response, scopedMealId, generation);
+      setRecognitionTimedOut(false);
+    });
   }
 
   function updateRecognizedLabel(item: MealDraftItem, recognizedLabel: string) {
@@ -159,19 +371,18 @@ export function MealConfirmationModal({
     });
   }
 
-  async function selectFood(item: MealDraftItem, food: CanonicalFood) {
-    if (!mealLogId) return;
-    setSavingItemId(item.id);
-    setLoadError(null);
-    try {
-      const response = await mapMealDraftItemFood(mealLogId, item.id, food.id);
+  function selectFood(item: MealDraftItem, food: CanonicalFood) {
+    if (!isEditable) return;
+    enqueueMutation(item.id, async (scopedMealId, generation) => {
+      const response = await mapMealDraftItemFood(scopedMealId, item.id, food.id);
+      if (!isCurrent(scopedMealId, generation)) return;
       setMappedFoods((current) => ({ ...current, [item.id]: food }));
       setInvalidatedMappings((current) => {
         const next = new Set(current);
         next.delete(item.id);
         return next;
       });
-      applyResponse(response);
+      applyResponse(response, scopedMealId, generation);
       setForms((current) => ({
         ...current,
         [item.id]: {
@@ -181,13 +392,8 @@ export function MealConfirmationModal({
       }));
       setFoodSearchItemId(null);
       setFoodQuery('');
-    } catch (cause) {
-      setLoadError(errorMessage(cause));
-    } finally {
-      setSavingItemId(null);
-    }
+    });
   }
-
 
   function updateForm(itemId: string, update: Partial<ItemForm>) {
     setForms((current) => ({
@@ -196,8 +402,8 @@ export function MealConfirmationModal({
     }));
   }
 
-  async function saveItem(item: MealDraftItem) {
-    if (!mealLogId) return;
+  function saveItem(item: MealDraftItem) {
+    if (!isEditable) return;
     const form = forms[item.id];
     const amountMilliunits = decimalToMilliunits(form.amount);
     if (!form.recognizedLabel.trim()) {
@@ -209,62 +415,70 @@ export function MealConfirmationModal({
       return;
     }
 
-    setSavingItemId(item.id);
-    setLoadError(null);
-    try {
+    enqueueMutation(item.id, async (scopedMealId, generation) => {
       const recognizedLabel = form.recognizedLabel.trim();
-      applyResponse(
-        await updateMealDraftItem(mealLogId, item.id, {
-          ...(recognizedLabel === item.recognizedLabel ? {} : { recognizedLabel }),
-          amountMilliunits,
-          unit: form.unit,
-        }),
-      );
-    } catch (cause) {
-      setLoadError(errorMessage(cause));
-    } finally {
-      setSavingItemId(null);
-    }
+      const response = await updateMealDraftItem(scopedMealId, item.id, {
+        ...(recognizedLabel === item.recognizedLabel ? {} : { recognizedLabel }),
+        amountMilliunits,
+        unit: form.unit,
+      });
+      applyResponse(response, scopedMealId, generation);
+    });
   }
 
-  async function removeItem(itemId: string) {
-    if (!mealLogId) return;
-    setSavingItemId(itemId);
-    setLoadError(null);
-    try {
-      applyResponse(await deleteMealDraftItem(mealLogId, itemId));
-    } catch (cause) {
-      setLoadError(errorMessage(cause));
-    } finally {
-      setSavingItemId(null);
-    }
+  function removeItem(itemId: string) {
+    if (!isEditable) return;
+    enqueueMutation(itemId, async (scopedMealId, generation) => {
+      const response = await deleteMealDraftItem(scopedMealId, itemId);
+      applyResponse(response, scopedMealId, generation);
+    });
   }
 
-  async function addManualItem() {
-    if (!mealLogId) return;
-    setSavingItemId('new');
-    setLoadError(null);
-    try {
-      applyResponse(
-        await addMealDraftItem(mealLogId, {
-          recognizedLabel: '직접 입력',
-          amountMilliunits: 1000,
-          unit: 'serving',
-        }),
-      );
-    } catch (cause) {
-      setLoadError(errorMessage(cause));
-    } finally {
-      setSavingItemId(null);
+  function addManualItem() {
+    setManualForm({ recognizedLabel: '', amount: '', unit: '' });
+  }
+
+  function saveManualItem() {
+    if (!manualForm || !isEditable) return;
+    const recognizedLabel = manualForm.recognizedLabel.trim();
+    const amountMilliunits = decimalToMilliunits(manualForm.amount);
+    const unit = manualForm.unit;
+    if (!recognizedLabel || !amountMilliunits || !unit) {
+      setLoadError('음식 이름, 양, 단위를 입력해 주세요.');
+      return;
     }
+    enqueueMutation('new', async (scopedMealId, generation) => {
+      const response = await addMealDraftItem(scopedMealId, {
+        recognizedLabel,
+        amountMilliunits,
+        unit,
+      });
+      if (!isCurrent(scopedMealId, generation)) return;
+      applyResponse(response, scopedMealId, generation);
+      setManualForm(null);
+    });
   }
   const currentData = loadedMealLogId === mealLogId ? data : null;
-  const currentError = loadedMealLogId === mealLogId ? loadError : null;
+  const currentError = loadErrorMealLogId === mealLogId ? loadError : null;
+  const isEditable =
+    currentData?.mealLog.recognitionStatus === 'ready' ||
+    currentData?.mealLog.recognitionStatus === 'manual';
+  const canRecoverRecognition =
+    currentData?.mealLog.recognitionStatus === 'failed' ||
+    recognitionTimedOut;
+  function closeModal() {
+    visibleRef.current = false;
+    scopeRef.current.generation += 1;
+    mutationToken.current += 1;
+    setSavingItemId(null);
+    setManualForm(null);
+    onClose();
+  }
 
   return (
     <Modal
       animationType="slide"
-      onRequestClose={onClose}
+      onRequestClose={closeModal}
       presentationStyle="pageSheet"
       visible={visible}
     >
@@ -276,7 +490,7 @@ export function MealConfirmationModal({
               저장된 초안은 섭취 또는 영양 기록으로 확정되지 않아요.
             </ThemedText>
           </View>
-          <ModalButton label="닫기" onPress={onClose} secondary />
+          <ModalButton label="닫기" onPress={closeModal} secondary />
         </View>
 
         {currentError && (
@@ -287,6 +501,13 @@ export function MealConfirmationModal({
           >
             {currentError}
           </ThemedText>
+        )}
+        {currentError && visible && mealLogId && (
+          <ModalButton
+            label="새로고침"
+            onPress={() => setPollGeneration((current) => current + 1)}
+            secondary
+          />
         )}
         {!currentData && !currentError && (
           <ThemedText type="small" themeColor="textSecondary">
@@ -306,14 +527,43 @@ export function MealConfirmationModal({
             <View style={styles.recognition}>
               <ThemedText type="smallBold">인식 결과</ThemedText>
               <ThemedText type="small" themeColor="textSecondary">
-                상태: {currentData.mealLog.recognitionStatus} · 엔진:{' '}
-                {currentData.mealLog.recognitionEngineVersion}
+                {currentData.mealLog.recognitionStatus === 'pending' ||
+                currentData.mealLog.recognitionStatus === 'processing'
+                  ? '사진에서 음식을 인식하고 있어요. 완료될 때까지 잠시만 기다려 주세요.'
+                  : `상태: ${currentData.mealLog.recognitionStatus} · 제공자: ${currentData.mealLog.recognitionProvider ?? '알 수 없음'} · 모델: ${currentData.mealLog.recognitionModel ?? '알 수 없음'}`}
               </ThemedText>
+              {(currentData.mealLog.recognitionStatus === 'pending' ||
+                currentData.mealLog.recognitionStatus === 'processing') &&
+                currentData.mealLog.recognitionNextAttemptAt && (
+                  <ThemedText type="small" themeColor="textSecondary">
+                    다음 확인: {currentData.mealLog.recognitionNextAttemptAt}
+                  </ThemedText>
+                )}
+              {canRecoverRecognition && (
+                <View style={styles.itemActions}>
+                  <ThemedText accessibilityRole="alert" type="small" style={styles.errorText}>
+                    {recognitionTimedOut
+                      ? '인식 시간이 초과되었습니다. 다시 시도하거나 직접 입력해 주세요.'
+                      : '음식 인식에 실패했습니다. 다시 시도하거나 직접 입력해 주세요.'}
+                  </ThemedText>
+                  <ModalButton
+                    disabled={savingItemId !== null}
+                    label={savingItemId === 'recognition' ? '처리 중' : '인식 다시 시도'}
+                    onPress={() => void retryRecognition()}
+                  />
+                  <ModalButton
+                    disabled={savingItemId !== null}
+                    label="직접 입력"
+                    onPress={() => void startManualEntry()}
+                    secondary
+                  />
+                </View>
+              )}
             </View>
-            {currentData.items.map((item) => {
+            {isEditable && currentData.items.map((item) => {
               const form = forms[item.id];
               if (!form) return null;
-              const saving = savingItemId === item.id;
+              const saving = savingItemId !== null;
               const mappedFood = mappedFoods[item.id];
               const mappingNeedsReconnect =
                 item.foodId !== null &&
@@ -495,13 +745,87 @@ export function MealConfirmationModal({
                 </View>
               );
             })}
-            <ModalButton
-              disabled={savingItemId !== null}
-              label={savingItemId === 'new' ? '추가 중' : '직접 입력 항목 추가'}
-              onPress={() => void addManualItem()}
-              secondary
-            />
-            <ModalButton label="초안 저장하고 닫기" onPress={onClose} />
+            {isEditable && manualForm && (
+              <View style={styles.itemCard}>
+                <ThemedText type="smallBold">직접 입력</ThemedText>
+                <TextInput
+                  accessibilityLabel="직접 입력 음식 이름"
+                  editable={savingItemId === null}
+                  onChangeText={(recognizedLabel) =>
+                    setManualForm((current) =>
+                      current ? { ...current, recognizedLabel } : current,
+                    )
+                  }
+                  style={styles.input}
+                  value={manualForm.recognizedLabel}
+                />
+                <TextInput
+                  accessibilityLabel="직접 입력 음식 양"
+                  editable={savingItemId === null}
+                  keyboardType="decimal-pad"
+                  onChangeText={(amount) =>
+                    setManualForm((current) =>
+                      current ? { ...current, amount } : current,
+                    )
+                  }
+                  style={styles.input}
+                  value={manualForm.amount}
+                />
+                <View style={styles.unitRow}>
+                  {units.map((unit) => (
+                    <Pressable
+                      key={unit}
+                      accessibilityLabel={`${unit} 단위 선택`}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected: manualForm.unit === unit }}
+                      disabled={savingItemId !== null}
+                      onPress={() =>
+                        setManualForm((current) =>
+                          current ? { ...current, unit } : current,
+                        )
+                      }
+                      style={[
+                        styles.unitButton,
+                        manualForm.unit === unit && styles.selectedUnitButton,
+                      ]}
+                    >
+                      <ThemedText
+                        type="smallBold"
+                        style={
+                          manualForm.unit === unit
+                            ? styles.selectedUnitText
+                            : styles.unitText
+                        }
+                      >
+                        {mealUnitLabel(unit)}
+                      </ThemedText>
+                    </Pressable>
+                  ))}
+                </View>
+                <View style={styles.itemActions}>
+                  <ModalButton
+                    disabled={savingItemId !== null}
+                    label={savingItemId === 'new' ? '저장 중' : '항목 저장'}
+                    onPress={saveManualItem}
+                  />
+                  <ModalButton
+                    disabled={savingItemId !== null}
+                    label="취소"
+                    onPress={() => setManualForm(null)}
+                    secondary
+                  />
+                </View>
+              </View>
+            )}
+            {isEditable && !manualForm && (
+              <ModalButton
+                disabled={savingItemId !== null}
+                label="직접 입력 항목 추가"
+                onPress={addManualItem}
+                secondary
+              />
+            )}
+            <ModalButton label="초안 저장하고 닫기" onPress={closeModal} />
           </ScrollView>
         )}
       </ThemedView>
@@ -522,16 +846,20 @@ function formsFromItems(items: MealDraftItem[]) {
   );
 }
 
-async function loadMappedFoods(items: MealDraftItem[]) {
+async function loadMappedFoods(
+  items: MealDraftItem[],
+  signal?: AbortSignal,
+) {
   const matches = await Promise.all(
     items
       .filter((item) => item.foodId)
       .map(async (item) => {
         try {
-          const { foods } = await searchFoods(item.recognizedLabel);
+          const { foods } = await searchFoods(item.recognizedLabel, signal);
           const food = foods.find((candidate) => candidate.id === item.foodId);
           return food ? ([item.id, food] as const) : null;
-        } catch {
+        } catch (cause) {
+          if (cause instanceof Error && cause.name === 'AbortError') throw cause;
           return null;
         }
       }),
@@ -550,10 +878,8 @@ function confidenceLabel(basisPoints: number | null) {
     : `${Math.round(basisPoints / 100)}%`;
 }
 
-function errorMessage(cause: unknown) {
-  return cause instanceof Error
-    ? cause.message
-    : '식사 초안을 처리하지 못했습니다.';
+function errorMessage(_cause: unknown) {
+  return '식사 초안을 처리하지 못했습니다.';
 }
 
 function ModalButton({

@@ -4,6 +4,7 @@ import {
   type MealType,
   type MealUnit,
 } from '@/meals/meal-draft-policy';
+import type { RecognitionStatus } from '@/meals/meal-recognition-policy';
 
 export { inferMealType };
 export type { MealType, MealUnit };
@@ -15,9 +16,16 @@ export interface MealDraft {
   localDate: string;
   mealType: MealType;
   status: 'draft';
-  imageAssetId: string;
-  recognitionStatus: 'ready';
-  recognitionEngineVersion: 'mock-recognition-v1';
+  imageAssetId: string | null;
+  recognitionStatus: RecognitionStatus;
+  recognitionProvider: string | null;
+  recognitionModel: string | null;
+  recognitionPromptVersion: string | null;
+  recognitionSchemaVersion: string | null;
+  recognitionCompletedAt: string | null;
+  recognitionLastErrorCode: string | null;
+  recognitionAttemptCount: number;
+  recognitionNextAttemptAt: string | null;
 }
 
 export interface MealDraftItem {
@@ -58,8 +66,24 @@ export function createMealDraft(input: CreateMealDraftInput) {
   });
 }
 
-export function getMealDraft(mealLogId: string) {
-  return apiRequest<MealDraftResponse>(`/api/meal-logs/${mealLogId}`);
+export function getMealDraft(mealLogId: string, signal?: AbortSignal) {
+  return apiRequest<MealDraftResponse>(`/api/meal-logs/${mealLogId}`, {
+    signal,
+  });
+}
+
+export function retryMealDraftRecognition(mealLogId: string) {
+  return apiRequest<MealDraftResponse>(
+    `/api/meal-logs/${mealLogId}/recognition/retry`,
+    { method: 'POST' },
+  );
+}
+
+export function startManualMealDraftEntry(mealLogId: string) {
+  return apiRequest<MealDraftResponse>(
+    `/api/meal-logs/${mealLogId}/recognition/manual`,
+    { method: 'POST' },
+  );
 }
 
 export function addMealDraftItem(mealLogId: string, input: MealDraftItemInput) {
@@ -108,9 +132,12 @@ export interface MealImageDownloadIntent {
   expiresAt: string;
 }
 
-export function getMealImageDownloadIntent(imageAssetId: string) {
+export function getMealImageDownloadIntent(
+  imageAssetId: string,
+  signal?: AbortSignal,
+) {
   return apiRequest<MealImageDownloadIntent>(
     `/api/image-assets/${imageAssetId}/download-intent`,
-    { method: 'POST' },
+    { method: 'POST', signal },
   );
 }

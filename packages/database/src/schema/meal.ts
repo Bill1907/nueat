@@ -9,6 +9,7 @@ import {
   jsonb,
   pgEnum,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -34,8 +35,10 @@ export const imageAssetStatusEnum = pgEnum('image_asset_status', [
 ]);
 export const recognitionStatusEnum = pgEnum('recognition_status', [
   'pending',
+  'processing',
   'ready',
   'failed',
+  'manual',
 ]);
 export const assetDeletionJobStatusEnum = pgEnum('asset_deletion_job_status', [
   'pending',
@@ -43,6 +46,20 @@ export const assetDeletionJobStatusEnum = pgEnum('asset_deletion_job_status', [
   'failed',
   'completed',
 ]);
+export const recognitionProviderEnum = pgEnum('recognition_provider', ['mock', 'openai']);
+
+export interface RecognitionResultV1 {
+  foods: Array<{
+    regionIndex: number;
+    recognizedLabel: string;
+    recognitionConfidenceBps: number;
+    amountMilliunits: number;
+    unit: 'g' | 'ml' | 'serving' | 'bowl' | 'piece';
+    portionConfidenceBps: number;
+    candidateLabels?: string[] | undefined;
+    question?: string | null | undefined;
+  }>;
+}
 
 export interface CalculationInputSnapshot {
   mealItems: Array<{
@@ -134,6 +151,22 @@ export const assetDeletionJobs = pgTable(
   ],
 );
 
+export const recognitionDailyUsages = pgTable(
+  'recognition_daily_usage',
+  {
+    userId: text('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    attemptDate: date('attempt_date').notNull(),
+    attemptCount: integer('attempt_count').default(0).notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.userId, table.attemptDate] }),
+    check('recognition_daily_usage_attempt_count_check', sql`${table.attemptCount} >= 0`),
+  ],
+);
+
 export const mealLogs = pgTable(
   'meal_log',
   {
@@ -148,8 +181,20 @@ export const mealLogs = pgTable(
     status: mealStatusEnum('status').default('draft').notNull(),
     imageAssetId: uuid('image_asset_id').references(() => imageAssets.id, { onDelete: 'set null' }),
     recognitionStatus: recognitionStatusEnum('recognition_status').default('pending').notNull(),
-    recognitionEngineVersion: text('recognition_engine_version'),
+    recognitionProvider: recognitionProviderEnum('recognition_provider'),
+    recognitionModel: text('recognition_model'),
+    recognitionPromptVersion: text('recognition_prompt_version'),
+    recognitionSchemaVersion: text('recognition_schema_version'),
+    recognitionResult: jsonb('recognition_result').$type<RecognitionResultV1>(),
     recognitionCompletedAt: timestamp('recognition_completed_at', { withTimezone: true }),
+    recognitionProviderRequestId: text('recognition_provider_request_id'),
+    recognitionAttemptCount: integer('recognition_attempt_count').default(0).notNull(),
+    recognitionLeaseToken: uuid('recognition_lease_token'),
+    recognitionLeaseExpiresAt: timestamp('recognition_lease_expires_at', { withTimezone: true }),
+    recognitionNextAttemptAt: timestamp('recognition_next_attempt_at', { withTimezone: true }).defaultNow(),
+    recognitionLastErrorCode: text('recognition_last_error_code'),
+    recognitionInputTokens: integer('recognition_input_tokens').default(0).notNull(),
+    recognitionOutputTokens: integer('recognition_output_tokens').default(0).notNull(),
     thumbnailAssetId: uuid('thumbnail_asset_id').references(() => imageAssets.id, {
       onDelete: 'set null',
     }),
@@ -168,10 +213,44 @@ export const mealLogs = pgTable(
     uniqueIndex('meal_log_image_asset_unique')
       .on(table.imageAssetId)
       .where(sql`${table.imageAssetId} is not null`),
+    index('meal_log_recognition_due_idx')
+      .on(table.recognitionStatus, table.recognitionNextAttemptAt)
+      .where(sql`${table.recognitionStatus} in ('pending', 'failed')`),
+    index('meal_log_recognition_lease_expiry_idx')
+      .on(table.recognitionStatus, table.recognitionLeaseExpiresAt)
+      .where(sql`${table.recognitionStatus} = 'processing'`),
+    check(
+      'meal_log_recognition_processing_lease_check',
+      sql`(${table.recognitionStatus} = 'processing'
+        and ${table.recognitionLeaseToken} is not null
+        and ${table.recognitionLeaseExpiresAt} is not null)
+        or (${table.recognitionStatus} <> 'processing'
+        and ${table.recognitionLeaseToken} is null
+        and ${table.recognitionLeaseExpiresAt} is null)`,
+    ),
     check(
       'meal_log_recognition_ready_check',
       sql`${table.recognitionStatus} <> 'ready'
-        or (${table.recognitionEngineVersion} is not null and ${table.recognitionCompletedAt} is not null)`,
+        or (${table.recognitionProvider} is not null
+        and ${table.recognitionModel} is not null
+        and ${table.recognitionPromptVersion} is not null
+        and ${table.recognitionSchemaVersion} is not null
+        and ${table.recognitionResult} is not null
+        and jsonb_typeof(${table.recognitionResult}) = 'object'
+        and ${table.recognitionResult} ? 'foods'
+        and jsonb_typeof(${table.recognitionResult}->'foods') = 'array'
+        and ${table.recognitionCompletedAt} is not null)`,
+    ),
+    check(
+      'meal_log_recognition_attempt_usage_check',
+      sql`${table.recognitionAttemptCount} >= 0
+        and ${table.recognitionInputTokens} >= 0
+        and ${table.recognitionOutputTokens} >= 0`,
+    ),
+    check(
+      'meal_log_recognition_retry_schedule_check',
+      sql`${table.recognitionStatus} <> 'pending'
+        or ${table.recognitionNextAttemptAt} is not null`,
     ),
     check(
       'meal_log_status_timestamps_check',
@@ -195,6 +274,7 @@ export const mealItems = pgTable(
     }),
     amountMilliunits: integer('amount_milliunits').notNull(),
     unit: servingUnitEnum('unit').notNull(),
+    recognitionRegionIndex: integer('recognition_region_index'),
     gramsMg: integer('grams_mg'),
     recognitionConfidenceBps: integer('recognition_confidence_bps'),
     mappingConfidenceBps: integer('mapping_confidence_bps'),
@@ -205,6 +285,9 @@ export const mealItems = pgTable(
   },
   (table) => [
     index('meal_item_meal_log_idx').on(table.mealLogId),
+    uniqueIndex('meal_item_recognition_region_unique')
+      .on(table.mealLogId, table.recognitionRegionIndex)
+      .where(sql`${table.recognitionRegionIndex} is not null`),
     check('meal_item_amount_check', sql`${table.amountMilliunits} > 0`),
     check('meal_item_grams_check', sql`${table.gramsMg} is null or ${table.gramsMg} > 0`),
     check(
@@ -212,6 +295,11 @@ export const mealItems = pgTable(
       sql`(${table.recognitionConfidenceBps} is null or ${table.recognitionConfidenceBps} between 0 and 10000)
         and (${table.mappingConfidenceBps} is null or ${table.mappingConfidenceBps} between 0 and 10000)
         and (${table.portionConfidenceBps} is null or ${table.portionConfidenceBps} between 0 and 10000)`,
+    ),
+    check(
+      'meal_item_recognition_region_index_check',
+      sql`${table.recognitionRegionIndex} is null
+        or ${table.recognitionRegionIndex} between 0 and 19`,
     ),
   ],
 );

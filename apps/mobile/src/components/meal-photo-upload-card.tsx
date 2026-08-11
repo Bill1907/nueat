@@ -8,6 +8,7 @@ import {
   inferMealType,
   type MealDraftResponse,
 } from '@/api/meal-drafts';
+import { authStorage } from '@/auth/storage';
 import { MealConfirmationModal } from '@/components/meal-confirmation-modal';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
@@ -33,6 +34,7 @@ type Phase =
   | 'validating'
   | 'linking'
   | 'uploaded'
+  | 'recognizing'
   | 'success'
   | 'error';
 
@@ -48,27 +50,42 @@ export function MealPhotoUploadCard() {
   const [confirmationVisible, setConfirmationVisible] = useState(false);
   const abortController = useRef<AbortController | null>(null);
   const linkingMealDraft = useRef(false);
+  const mounted = useRef(true);
+  const operationGeneration = useRef(0);
+  const isCurrentOperation = (generation: number) =>
+    mounted.current && operationGeneration.current === generation;
 
   useEffect(() => {
-    let active = true;
-    void loadLocalUploadDraft()
-      .then((restored) => {
-        if (!active) return;
+    mounted.current = true;
+    void (async () => {
+      try {
+        const restored = await loadLocalUploadDraft();
+        if (!mounted.current) return;
+        const link = await authStorage.getItem('meal-upload-link');
+        if (!mounted.current) return;
+        const recovered = link ? parseLinkedMeal(link) : null;
         setDraft(restored);
+        if (recovered) {
+          setMealLogId(recovered.mealLogId);
+          setPhase('success');
+          return;
+        }
         setPhase(
           restored?.validatedAssetId ? 'uploaded' : restored ? 'ready' : 'idle',
         );
-      })
-      .catch(() => {
-        if (active) setPhase('idle');
-      });
+      } catch {
+        if (mounted.current) setPhase('idle');
+      }
+    })();
     return () => {
-      active = false;
+      mounted.current = false;
+      operationGeneration.current += 1;
       abortController.current?.abort();
     };
   }, []);
 
   async function selectImage(source: LocalImageUploadDraft['source']) {
+    const generation = ++operationGeneration.current;
     setError(null);
     setPermissionBlocked(false);
     setValidatedAsset(null);
@@ -76,7 +93,10 @@ export function MealPhotoUploadCard() {
     setConfirmationVisible(false);
 
     try {
+      await authStorage.setItem('meal-upload-link', '');
+      if (!isCurrentOperation(generation)) return;
       const granted = await requestPermission(source);
+      if (!isCurrentOperation(generation)) return;
       if (!granted) {
         setPermissionBlocked(true);
         setError('사진을 선택하려면 설정에서 접근 권한을 허용해 주세요.');
@@ -88,6 +108,7 @@ export function MealPhotoUploadCard() {
         source === 'camera'
           ? await ImagePicker.launchCameraAsync(pickerOptions)
           : await ImagePicker.launchImageLibraryAsync(pickerOptions);
+      if (!isCurrentOperation(generation)) return;
       if (result.canceled || !result.assets[0]) {
         setPhase(draft ? 'ready' : 'idle');
         return;
@@ -95,16 +116,21 @@ export function MealPhotoUploadCard() {
 
       setPhase('preparing');
       const prepared = await prepareImageUploadDraft(result.assets[0], source);
+      if (!isCurrentOperation(generation)) return;
       setDraft(prepared);
-      await startUpload(prepared);
+      await startUpload(prepared, generation);
     } catch (cause) {
+      if (!isCurrentOperation(generation)) return;
       setError(errorMessage(cause));
       setPhase(draft ? 'ready' : 'error');
     }
   }
 
-  async function startUpload(target = draft) {
-    if (!target) return;
+  async function startUpload(
+    target = draft,
+    generation = ++operationGeneration.current,
+  ) {
+    if (!target || !isCurrentOperation(generation)) return;
     const controller = new AbortController();
     abortController.current = controller;
     setError(null);
@@ -115,17 +141,22 @@ export function MealPhotoUploadCard() {
     try {
       const result = await uploadImageDraft(target, {
         signal: controller.signal,
-        onProgress: setProgress,
-        onStage: setPhase,
+        onProgress: (nextProgress) => {
+          if (isCurrentOperation(generation)) setProgress(nextProgress);
+        },
+        onStage: (nextPhase) => {
+          if (isCurrentOperation(generation)) setPhase(nextPhase);
+        },
       });
-      const updatedDraft = markLocalUploadDraftValidated(
-        target,
-        result.assetId,
-      );
+      if (!isCurrentOperation(generation)) return;
+
+      const updatedDraft = markLocalUploadDraftValidated(target, result.assetId);
+      if (!isCurrentOperation(generation)) return;
       setDraft(updatedDraft);
       setValidatedAsset(result);
-      await linkMealDraft(result.assetId);
+      await linkMealDraft(result.assetId, generation);
     } catch (cause) {
+      if (!isCurrentOperation(generation)) return;
       if (cause instanceof Error && cause.name === 'AbortError') {
         setError('업로드를 취소했습니다. 사진은 기기에 보관되어 있어요.');
         setPhase('ready');
@@ -134,15 +165,21 @@ export function MealPhotoUploadCard() {
         setPhase('error');
       }
     } finally {
-      if (abortController.current === controller)
-        abortController.current = null;
+      if (abortController.current === controller) abortController.current = null;
     }
   }
 
   async function linkMealDraft(
     assetId = validatedAsset?.assetId ?? draft?.validatedAssetId,
+    generation = ++operationGeneration.current,
   ) {
-    if (!assetId || linkingMealDraft.current) return;
+    if (
+      !assetId ||
+      linkingMealDraft.current ||
+      !isCurrentOperation(generation)
+    ) {
+      return;
+    }
     linkingMealDraft.current = true;
     setError(null);
     setPhase('linking');
@@ -157,26 +194,38 @@ export function MealPhotoUploadCard() {
         timezone,
         mealType: inferMealType(now),
       });
-      try {
-        await removeLocalUploadDraft();
-        setDraft(null);
-      } catch {
-        // The MealLog already owns this validated image; never retry creation because cleanup failed.
-      }
+
+      await authStorage.setItem(
+        'meal-upload-link',
+        JSON.stringify({ assetId, mealLogId: response.mealLog.id }),
+      );
+      await removeLocalUploadDraft();
+      if (!isCurrentOperation(generation)) return;
+      setDraft(null);
       setMealLogId(response.mealLog.id);
+      setValidatedAsset(null);
       setConfirmationVisible(true);
-      setPhase('success');
+      setPhase(
+        response.mealLog.recognitionStatus === 'pending' ||
+          response.mealLog.recognitionStatus === 'processing'
+          ? 'recognizing'
+          : 'success',
+      );
     } catch (cause) {
+      if (!isCurrentOperation(generation)) return;
       setError(errorMessage(cause));
       setPhase('uploaded');
     } finally {
-      linkingMealDraft.current = false;
+      if (isCurrentOperation(generation)) linkingMealDraft.current = false;
     }
   }
 
   async function discardDraft() {
+    operationGeneration.current += 1;
     abortController.current?.abort();
     await removeLocalUploadDraft();
+    await authStorage.setItem('meal-upload-link', '');
+    if (!mounted.current) return;
     setDraft(null);
     setValidatedAsset(null);
     setMealLogId(null);
@@ -260,6 +309,16 @@ export function MealPhotoUploadCard() {
           </ThemedText>
         </View>
       )}
+      {phase === 'recognizing' && mealLogId && (
+        <View style={styles.successCopy}>
+          <ThemedText type="smallBold" style={styles.successText}>
+            음식 인식을 진행하고 있어요
+          </ThemedText>
+          <ThemedText type="small" themeColor="textSecondary">
+            완료되면 결과를 확인하거나 직접 입력할 수 있어요.
+          </ThemedText>
+        </View>
+      )}
       {phase === 'success' && mealLogId && (
         <View style={styles.successCopy}>
           <ThemedText type="smallBold" style={styles.successText}>
@@ -315,7 +374,7 @@ export function MealPhotoUploadCard() {
               onPress={() => void linkMealDraft()}
             />
           )}
-        {!busy && phase === 'success' && mealLogId && (
+        {!busy && (phase === 'success' || phase === 'recognizing') && mealLogId && (
           <ActionButton
             label="음식 확인"
             onPress={() => setConfirmationVisible(true)}
@@ -423,10 +482,22 @@ function ActionButton({
   );
 }
 
-function errorMessage(cause: unknown) {
-  return cause instanceof Error
-    ? cause.message
-    : '사진 업로드를 완료하지 못했습니다.';
+function parseLinkedMeal(value: string) {
+  try {
+    const candidate = JSON.parse(value) as {
+      assetId?: unknown;
+      mealLogId?: unknown;
+    };
+    return typeof candidate.assetId === 'string' &&
+      typeof candidate.mealLogId === 'string'
+      ? { assetId: candidate.assetId, mealLogId: candidate.mealLogId }
+      : null;
+  } catch {
+    return null;
+  }
+}
+function errorMessage(_cause: unknown) {
+  return '사진 업로드를 완료하지 못했습니다.';
 }
 
 const styles = StyleSheet.create({

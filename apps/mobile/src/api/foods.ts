@@ -42,8 +42,9 @@ export interface FoodSearchResponse {
   foods: CanonicalFood[];
 }
 
-export function searchFoods(query: string) {
+export function searchFoods(query: string, signal?: AbortSignal) {
   return apiRequest<FoodSearchResponse>(
     `/api/foods/search?q=${encodeURIComponent(query)}&limit=10`,
+    { signal },
   );
 }

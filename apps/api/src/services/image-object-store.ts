@@ -27,6 +27,7 @@ export interface ImageObjectStore {
   readObject(input: {
     objectKey: string;
     maxBytes: number;
+    signal?: AbortSignal;
   }): Promise<ImageObject>;
   deleteObject(objectKey: string): Promise<void>;
 }
@@ -91,8 +92,10 @@ export function createS3ImageObjectStore(
             Bucket: config.bucket,
             Key: input.objectKey,
           }),
+          input.signal ? { abortSignal: input.signal } : undefined,
         );
       } catch (error) {
+        if (input.signal?.aborted) throw new ImageObjectReadAbortedError();
         if (isNotFound(error)) throw new ImageObjectNotFoundError();
         throw new ImageObjectStoreError();
       }
@@ -106,15 +109,39 @@ export function createS3ImageObjectStore(
       try {
         response = await client.send(
           new GetObjectCommand({ Bucket: config.bucket, Key: input.objectKey }),
+          input.signal ? { abortSignal: input.signal } : undefined,
         );
       } catch (error) {
+        if (input.signal?.aborted) throw new ImageObjectReadAbortedError();
         if (isNotFound(error)) throw new ImageObjectNotFoundError();
         throw new ImageObjectStoreError();
       }
       if (!response.Body) throw new ImageObjectNotFoundError();
-      const bytes = await response.Body.transformToByteArray();
-      if (bytes.byteLength !== byteSize)
-        throw new Error('Image object length changed during read');
+      const chunks: Uint8Array[] = [];
+      let receivedBytes = 0;
+      try {
+        for await (const chunk of response.Body as AsyncIterable<Uint8Array>) {
+          if (input.signal?.aborted) throw new ImageObjectReadAbortedError();
+          receivedBytes += chunk.byteLength;
+          if (receivedBytes > input.maxBytes) throw new ImageObjectTooLargeError();
+          chunks.push(chunk);
+        }
+      } catch (error) {
+        if (
+          error instanceof ImageObjectTooLargeError ||
+          error instanceof ImageObjectReadAbortedError
+        )
+          throw error;
+        if (input.signal?.aborted) throw new ImageObjectReadAbortedError();
+        throw new ImageObjectStoreError();
+      }
+      if (receivedBytes !== byteSize) throw new ImageObjectStoreError();
+      const bytes = new Uint8Array(receivedBytes);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
 
       return { bytes, contentType: head.ContentType, byteSize };
     },
@@ -134,6 +161,7 @@ export function createS3ImageObjectStore(
 export class ImageObjectNotFoundError extends Error {}
 export class ImageObjectTooLargeError extends Error {}
 export class ImageObjectStoreError extends Error {}
+export class ImageObjectReadAbortedError extends Error {}
 
 function isNotFound(error: unknown) {
   if (typeof error !== 'object' || error === null) return false;

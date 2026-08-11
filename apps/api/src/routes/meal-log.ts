@@ -13,8 +13,8 @@ import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
 import type { Auth } from '../auth/auth';
+import type { MealRecognitionRunner } from '../services/meal-recognition-coordinator';
 
-const RECOGNITION_ENGINE_VERSION = 'mock-recognition-v1';
 const mealTypeSchema = z.enum(['breakfast', 'lunch', 'dinner', 'snack']);
 const servingUnitSchema = z.enum(['g', 'ml', 'serving', 'bowl', 'piece']);
 const dateTimeSchema = z.iso
@@ -61,6 +61,7 @@ const mapFoodSchema = z.object({ foodId: z.uuid() }).strict();
 interface MealLogRouteOptions {
   auth: Auth;
   database: Database;
+  recognitionCoordinator: MealRecognitionRunner;
 }
 
 export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
@@ -83,10 +84,20 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       userId,
     );
     if (existing) {
-      const items = await findMealItems(options.database, existing.id);
-      return mealLogResponse(existing, items);
+      const outcome = await options.recognitionCoordinator.recognize(
+        existing.id,
+        userId,
+      );
+      const current = await findOwnedMealLog(options.database, existing.id, userId);
+      if (!current) return mealLogNotFound(reply, request);
+      return recognitionResponse(
+        reply,
+        current,
+        await findMealItems(options.database, current.id),
+        outcome,
+      );
     }
-    const result = await options.database.transaction(async (tx) => {
+    const mealLog = await options.database.transaction(async (tx) => {
       const [claimedAsset] = await tx
         .update(imageAssets)
         .set({ status: 'processing' })
@@ -99,8 +110,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         )
         .returning({ id: imageAssets.id });
       if (!claimedAsset) return null;
-
-      const [mealLog] = await tx
+      const [created] = await tx
         .insert(mealLogs)
         .values({
           userId,
@@ -110,42 +120,37 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
           eatenLocalDate,
           mealType: input.mealType,
           status: 'draft',
-          recognitionStatus: 'ready',
-          recognitionEngineVersion: RECOGNITION_ENGINE_VERSION,
-          recognitionCompletedAt: now,
+          recognitionStatus: 'pending',
+          recognitionNextAttemptAt: now,
         })
         .returning(mealLogSelection);
-      if (!mealLog) throw new Error('MealLog insert did not return a row');
-      const items = await tx
-        .insert(mealItems)
-        .values(mockItems(mealLog.id))
-        .returning(mealItemSelection);
-      await tx
-        .update(imageAssets)
-        .set({ status: 'processed', processingCompletedAt: now })
-        .where(
-          and(
-            eq(imageAssets.id, input.imageAssetId),
-            eq(imageAssets.status, 'processing'),
-          ),
-        );
-      return { mealLog, items };
+      if (!created) throw new Error('MealLog insert did not return a row');
+      return created;
     });
-    if (!result) {
+    if (!mealLog) {
       const concurrent = await findOwnedDraftMealLogByImage(
         options.database,
         input.imageAssetId,
         userId,
       );
-      if (concurrent) {
-        const items = await findMealItems(options.database, concurrent.id);
-        return mealLogResponse(concurrent, items);
-      }
-      return imageUnavailable(reply, request);
+      if (!concurrent) return imageUnavailable(reply, request);
+      const outcome = await options.recognitionCoordinator.recognize(
+        concurrent.id,
+        userId,
+      );
+      const current = await findOwnedMealLog(options.database, concurrent.id, userId);
+      if (!current) return mealLogNotFound(reply, request);
+      return recognitionResponse(
+        reply,
+        current,
+        await findMealItems(options.database, current.id),
+        outcome,
+      );
     }
-    return reply
-      .status(201)
-      .send(mealLogResponse(result.mealLog, result.items));
+    const outcome = await options.recognitionCoordinator.recognize(mealLog.id, userId);
+    const current = await findOwnedMealLog(options.database, mealLog.id, userId);
+    if (!current) return mealLogNotFound(reply, request);
+    return recognitionResponse(reply, current, await findMealItems(options.database, current.id), outcome, 201);
   });
 
   app.get('/api/meal-logs/:mealLogId', async (request, reply) => {
@@ -452,7 +457,137 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     if (!deleted) return invalidMealLogState(reply, request);
     return reply.status(204).send();
   });
+  app.post('/api/meal-logs/:mealLogId/recognition/retry', async (request, reply) => {
+    const userId = await requireUserId(request, reply, options.auth);
+    if (!userId) return;
+    const params = mealLogIdParamsSchema.safeParse(request.params);
+    if (!params.success) return invalidRequest(reply, request);
+    const existing = await findOwnedMealLog(options.database, params.data.mealLogId, userId);
+    if (!existing) return mealLogNotFound(reply, request);
+    if (
+      existing.status !== 'draft' ||
+      existing.recognitionStatus === 'ready' ||
+      existing.recognitionStatus === 'manual' ||
+      existing.recognitionStatus === 'processing' ||
+      (existing.recognitionStatus === 'failed' && !existing.recognitionNextAttemptAt)
+    )
+      return invalidMealLogState(reply, request);
+    if (existing.recognitionStatus === 'failed') {
+      const [advanced] = await options.database
+        .update(mealLogs)
+        .set({ recognitionNextAttemptAt: new Date(), updatedAt: new Date() })
+        .where(
+          and(
+            eq(mealLogs.id, existing.id),
+            eq(mealLogs.userId, userId),
+            eq(mealLogs.status, 'draft'),
+            eq(mealLogs.recognitionStatus, 'failed'),
+          ),
+        )
+        .returning({ id: mealLogs.id });
+      if (!advanced) return invalidMealLogState(reply, request);
+    }
+    const outcome = await options.recognitionCoordinator.recognize(existing.id, userId);
+    const mealLog = await findOwnedMealLog(options.database, existing.id, userId);
+    if (!mealLog) return mealLogNotFound(reply, request);
+    return recognitionResponse(reply, mealLog, await findMealItems(options.database, mealLog.id), outcome);
+  });
+
+  app.post('/api/meal-logs/:mealLogId/recognition/manual', async (request, reply) => {
+    const userId = await requireUserId(request, reply, options.auth);
+    if (!userId) return;
+    const params = mealLogIdParamsSchema.safeParse(request.params);
+    if (!params.success) return invalidRequest(reply, request);
+    const now = new Date();
+    const changed = await options.database.transaction(async (tx) => {
+      const [existing] = await tx
+        .select(mealLogSelection)
+        .from(mealLogs)
+        .where(
+          and(
+            eq(mealLogs.id, params.data.mealLogId),
+            eq(mealLogs.userId, userId),
+            eq(mealLogs.status, 'draft'),
+          ),
+        )
+        .limit(1);
+      if (!existing) return null;
+      if (existing.recognitionStatus === 'manual') return existing;
+      if (existing.recognitionStatus === 'ready') return null;
+      const [mealLog] = await tx
+        .update(mealLogs)
+        .set({
+          recognitionStatus: 'manual',
+          recognitionProvider: null,
+          recognitionModel: null,
+          recognitionPromptVersion: null,
+          recognitionSchemaVersion: null,
+          recognitionResult: null,
+          recognitionCompletedAt: null,
+          recognitionProviderRequestId: null,
+          recognitionInputTokens: 0,
+          recognitionOutputTokens: 0,
+          recognitionLeaseToken: null,
+          recognitionLeaseExpiresAt: null,
+          recognitionNextAttemptAt: null,
+          recognitionLastErrorCode: null,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(mealLogs.id, params.data.mealLogId),
+          eq(mealLogs.userId, userId),
+          eq(mealLogs.status, 'draft'),
+          or(
+            eq(mealLogs.recognitionStatus, 'pending'),
+            eq(mealLogs.recognitionStatus, 'processing'),
+            eq(mealLogs.recognitionStatus, 'failed'),
+          ),
+        ))
+        .returning(mealLogSelection);
+      if (!mealLog) return null;
+      if (mealLog.imageAssetId) {
+        await tx.update(imageAssets).set({
+          status: 'processed',
+          processingCompletedAt: now,
+        }).where(and(
+          eq(imageAssets.id, mealLog.imageAssetId),
+          eq(imageAssets.status, 'processing'),
+        ));
+      }
+      return mealLog;
+    });
+    if (!changed)
+      return mealLogStateOrNotFound(
+        options.database,
+        params.data.mealLogId,
+        userId,
+        reply,
+        request,
+      );
+    return mealLogResponse(changed, await findMealItems(options.database, changed.id));
+  });
 };
+function recognitionResponse(
+  reply: FastifyReply,
+  mealLog: NonNullable<Awaited<ReturnType<typeof findOwnedMealLog>>>,
+  items: Awaited<ReturnType<typeof findMealItems>>,
+  outcome: { status: 'ready' | 'active' | 'unavailable'; retryAfterSeconds?: number; code?: string; retryable?: boolean },
+  createdStatus?: number,
+) {
+  const recognitionOutcome = {
+    status: outcome.status,
+    ...(outcome.status === 'active'
+      ? { retryAfterSeconds: outcome.retryAfterSeconds ?? 1 }
+      : outcome.status === 'unavailable'
+        ? { code: outcome.code ?? 'RECOGNITION_UNAVAILABLE', retryable: outcome.retryable ?? false }
+        : {}),
+  };
+  if (outcome.status === 'active') {
+    reply.header('Retry-After', String(outcome.retryAfterSeconds ?? 1));
+    return reply.status(202).send({ ...mealLogResponse(mealLog, items), recognitionOutcome });
+  }
+  return reply.status(createdStatus ?? 200).send({ ...mealLogResponse(mealLog, items), recognitionOutcome });
+}
 
 const mealLogSelection = {
   id: mealLogs.id,
@@ -463,13 +598,21 @@ const mealLogSelection = {
   status: mealLogs.status,
   imageAssetId: mealLogs.imageAssetId,
   recognitionStatus: mealLogs.recognitionStatus,
-  recognitionEngineVersion: mealLogs.recognitionEngineVersion,
+  recognitionProvider: mealLogs.recognitionProvider,
+  recognitionModel: mealLogs.recognitionModel,
+  recognitionPromptVersion: mealLogs.recognitionPromptVersion,
+  recognitionSchemaVersion: mealLogs.recognitionSchemaVersion,
+  recognitionCompletedAt: mealLogs.recognitionCompletedAt,
+  recognitionLastErrorCode: mealLogs.recognitionLastErrorCode,
+  recognitionAttemptCount: mealLogs.recognitionAttemptCount,
+  recognitionNextAttemptAt: mealLogs.recognitionNextAttemptAt,
 };
 const mealItemSelection = {
   id: mealItems.id,
   recognizedLabel: mealItems.recognizedLabel,
   amountMilliunits: mealItems.amountMilliunits,
   unit: mealItems.unit,
+  recognitionRegionIndex: mealItems.recognitionRegionIndex,
   recognitionConfidenceBps: mealItems.recognitionConfidenceBps,
   portionConfidenceBps: mealItems.portionConfidenceBps,
   userCorrected: mealItems.userCorrected,
@@ -478,34 +621,6 @@ const mealItemSelection = {
   mappingConfidenceBps: mealItems.mappingConfidenceBps,
 };
 
-function mockItems(mealLogId: string) {
-  return [
-    {
-      mealLogId,
-      recognizedLabel: '흰쌀밥',
-      amountMilliunits: 1000,
-      unit: 'bowl' as const,
-      recognitionConfidenceBps: 9500,
-      portionConfidenceBps: 9200,
-    },
-    {
-      mealLogId,
-      recognizedLabel: '김치찌개',
-      amountMilliunits: 1000,
-      unit: 'serving' as const,
-      recognitionConfidenceBps: 9300,
-      portionConfidenceBps: 9000,
-    },
-    {
-      mealLogId,
-      recognizedLabel: '배추김치',
-      amountMilliunits: 500,
-      unit: 'serving' as const,
-      recognitionConfidenceBps: 9100,
-      portionConfidenceBps: 8800,
-    },
-  ];
-}
 
 async function findOwnedMealLog(
   database: Database,
@@ -533,6 +648,10 @@ async function findOwnedDraftMealLog(
         eq(mealLogs.id, mealLogId),
         eq(mealLogs.userId, userId),
         eq(mealLogs.status, 'draft'),
+        or(
+          eq(mealLogs.recognitionStatus, 'ready'),
+          eq(mealLogs.recognitionStatus, 'manual'),
+        ),
       ),
     )
     .limit(1);
