@@ -10,7 +10,8 @@ import {
 } from '@/components/nutrition-target-display';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { Spacing } from '@/constants/theme';
+import { Radius, Spacing } from '@/constants/theme';
+import { useTheme } from '@/hooks/use-theme';
 
 type TargetResponse =
   | { status: 'pending' }
@@ -36,6 +37,7 @@ type LoadState =
 export function ActiveNutritionTargetCard() {
   const [loadState, setLoadState] = useState<LoadState>({ status: 'loading' });
   const [reload, setReload] = useState(0);
+  const theme = useTheme();
 
   useEffect(() => {
     let active = true;
@@ -59,7 +61,7 @@ export function ActiveNutritionTargetCard() {
     return (
       <Card badge="불러오는 중">
         <View style={styles.loadingRow}>
-          <ActivityIndicator color="#16794A" />
+          <ActivityIndicator color={theme.primary} />
           <ThemedText type="small" themeColor="textSecondary">
             저장된 영양 목표를 확인하고 있어요.
           </ThemedText>
@@ -81,8 +83,16 @@ export function ActiveNutritionTargetCard() {
             setLoadState({ status: 'loading' });
             setReload((value) => value + 1);
           }}
-          style={styles.retryButton}>
-          <ThemedText type="smallBold" style={styles.retryText}>
+          style={({ pressed }) => [
+            styles.retryButton,
+            {
+              backgroundColor: theme.surfaceInset,
+              borderColor: theme.primary,
+              shadowColor: theme.shadow,
+            },
+            pressed && styles.pressed,
+          ]}>
+          <ThemedText type="smallBold" style={{ color: theme.primary }}>
             다시 시도
           </ThemedText>
         </Pressable>
@@ -141,14 +151,24 @@ function Card({
   badgeTone?: 'success' | 'warning';
   children: React.ReactNode;
 }) {
+  const theme = useTheme();
+  const isWarning = badgeTone === 'warning';
+
   return (
-    <ThemedView type="backgroundElement" style={styles.card}>
+    <ThemedView surface="raised" style={styles.card}>
       <View style={styles.header}>
         <ThemedText type="smallBold">내 영양 목표</ThemedText>
-        <View style={[styles.badge, badgeTone === 'warning' && styles.warningBadge]}>
+        <View
+          style={[
+            styles.badge,
+            {
+              backgroundColor: isWarning ? theme.warningSurface : theme.successSurface,
+              borderColor: isWarning ? theme.warning : theme.primary,
+            },
+          ]}>
           <ThemedText
             type="smallBold"
-            style={badgeTone === 'warning' ? styles.warningText : styles.successText}>
+            style={{ color: isWarning ? theme.warning : theme.primary }}>
             {badge}
           </ThemedText>
         </View>
@@ -172,7 +192,7 @@ function TargetValue({ label, value }: { label: string; value: string }) {
 const styles = StyleSheet.create({
   card: {
     padding: Spacing.four,
-    borderRadius: 20,
+    borderRadius: Radius.surface,
     gap: Spacing.three,
   },
   header: {
@@ -181,19 +201,10 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   badge: {
-    borderRadius: 999,
+    borderRadius: Radius.pill,
+    borderWidth: 1,
     paddingHorizontal: 10,
     paddingVertical: 4,
-    backgroundColor: '#E7F4EC',
-  },
-  warningBadge: {
-    backgroundColor: '#FFF1D6',
-  },
-  successText: {
-    color: '#16794A',
-  },
-  warningText: {
-    color: '#8A5A00',
   },
   title: {
     fontSize: 20,
@@ -223,8 +234,15 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-start',
     justifyContent: 'center',
     paddingHorizontal: Spacing.three,
+    borderRadius: Radius.control,
+    borderWidth: 1,
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.12,
+    shadowRadius: 6,
+    elevation: 2,
   },
-  retryText: {
-    color: '#16794A',
+  pressed: {
+    transform: [{ translateY: 1 }],
+    opacity: 0.82,
   },
 });

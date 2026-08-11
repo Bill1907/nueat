@@ -8,6 +8,7 @@ import {
   mealLogs,
   nutrientProfiles,
   sourceRegistries,
+  userProfiles,
   type Database,
 } from '@nueat/database';
 import type { FastifyInstance } from 'fastify';
@@ -81,6 +82,24 @@ describe('meal log routes', () => {
     ]);
     expect(state.asset.status).toBe('processed');
   });
+  test('derives meal date and type from the persisted profile timezone', async () => {
+    const { server } = await createServer(true, {
+      profileTimezone: 'Pacific/Honolulu',
+    });
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/meal-logs',
+      payload: createPayload(),
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(JSON.parse(response.body).mealLog).toMatchObject({
+      timezone: 'Pacific/Honolulu',
+      localDate: '2026-08-09',
+      mealType: 'dinner',
+    });
+  });
+
   test('includes an additive recognition outcome without changing mealLog/items', async () => {
     const { server } = await createServer(true);
     const response = await server.inject({
@@ -437,7 +456,7 @@ function draftMeal() {
 
 async function createServer(
   authenticated: boolean,
-  overrides: { assetStatus?: string; mealUserId?: string } = {},
+  overrides: { assetStatus?: string; mealUserId?: string; profileTimezone?: string } = {},
 ) {
   const state: {
     asset: Record<string, unknown>;
@@ -449,6 +468,7 @@ async function createServer(
     registries: Record<string, unknown>[];
     snapshots: Record<string, unknown>[];
     deletionJob?: Record<string, unknown>;
+    profileTimezone: string | null;
   } = {
     asset: {
       id: imageId,
@@ -461,6 +481,7 @@ async function createServer(
     servings: [],
     registries: [],
     snapshots: [],
+    profileTimezone: overrides.profileTimezone ?? null,
   };
   if (overrides.mealUserId)
     state.meal = { ...draftMeal(), userId: overrides.mealUserId };
@@ -583,6 +604,7 @@ function databaseMock(state: {
   registries: Record<string, unknown>[];
   snapshots: Record<string, unknown>[];
   deletionJob?: Record<string, unknown>;
+  profileTimezone: string | null;
 }) {
   const canClaimImage = state.asset.status === 'validated';
   const query = (value: unknown) => ({
@@ -604,21 +626,25 @@ function databaseMock(state: {
       from: (table: unknown) => ({
         where: () =>
           query(
-            table === mealLogs && state.meal?.userId === 'user-id'
-              ? state.meal
-              : table === mealItems
-                ? state.items
-                : table === foods
-                  ? state.foods
-                  : table === nutrientProfiles
-                    ? state.profiles
-                    : table === foodServings
-                      ? state.servings
-                      : table === sourceRegistries
-                        ? state.registries
-                        : table === calculationSnapshots
-                          ? state.snapshots
-                          : undefined,
+            table === userProfiles
+              ? state.profileTimezone
+                ? { timezone: state.profileTimezone }
+                : undefined
+              : table === mealLogs && state.meal?.userId === 'user-id'
+                ? state.meal
+                : table === mealItems
+                  ? state.items
+                  : table === foods
+                    ? state.foods
+                    : table === nutrientProfiles
+                      ? state.profiles
+                      : table === foodServings
+                        ? state.servings
+                        : table === sourceRegistries
+                          ? state.registries
+                          : table === calculationSnapshots
+                            ? state.snapshots
+                            : undefined,
           ),
       }),
     }),

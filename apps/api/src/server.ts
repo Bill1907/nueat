@@ -16,6 +16,7 @@ import {
   type OpenAIResponsesClient,
 } from './services/openai-meal-recognizer';
 import { authRoutes } from './routes/auth';
+import { dailyDashboardRoutes } from './routes/daily-dashboard';
 import { foodRoutes } from './routes/food';
 import { healthRoutes } from './routes/health';
 import { imageAssetRoutes } from './routes/image-asset';
@@ -134,6 +135,10 @@ export async function buildServer(dependencies: ServerDependencies) {
     auth: dependencies.auth,
     database: dependencies.database,
     recognitionCoordinator,
+  });
+  await app.register(dailyDashboardRoutes, {
+    auth: dependencies.auth,
+    database: dependencies.database,
   });
   await app.register(foodRoutes, {
     auth: dependencies.auth,

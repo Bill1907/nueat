@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import {
   Platform,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   View,
@@ -9,7 +10,7 @@ import {
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { authClient, useAuthSession } from '@/auth/client';
-import { ActiveNutritionTargetCard } from '@/components/active-nutrition-target-card';
+import { DailyNutritionDashboard } from '@/components/daily-nutrition-dashboard';
 import { MealPhotoUploadCard } from '@/components/meal-photo-upload-card';
 
 import { NutritionStandardCard } from '@/components/nutrition-standard-card';
@@ -23,6 +24,8 @@ export default function HomeScreen() {
   const theme = useTheme();
   const session = useAuthSession();
   const [isSigningOut, setIsSigningOut] = useState(false);
+  const [refreshGeneration, setRefreshGeneration] = useState(0);
+  const [refreshing, setRefreshing] = useState(false);
 
   async function signOut() {
     setIsSigningOut(true);
@@ -32,10 +35,25 @@ export default function HomeScreen() {
       setIsSigningOut(false);
     }
   }
+  function refreshHome() {
+    setRefreshing(true);
+    setRefreshGeneration((generation) => generation + 1);
+  }
+  const handleDashboardLoadComplete = useCallback(() => {
+    setRefreshing(false);
+  }, []);
+
 
   return (
     <ScrollView
       style={[styles.scrollView, { backgroundColor: theme.background }]}
+      refreshControl={
+        <RefreshControl
+          refreshing={refreshing}
+          onRefresh={() => void refreshHome()}
+          tintColor={theme.primary}
+        />
+      }
       contentContainerStyle={[
         styles.content,
         {
@@ -46,16 +64,22 @@ export default function HomeScreen() {
     >
       <ThemedView style={styles.container}>
         <View style={styles.header}>
-          <ThemedText style={styles.brand}>NUEAT</ThemedText>
+          <ThemedText style={[styles.brand, { color: theme.primary }]}>NUEAT</ThemedText>
           <ThemedText type="subtitle">오늘, 무엇을 먹을까요?</ThemedText>
           <ThemedText themeColor="textSecondary">
             기록을 시작하면 오늘의 영양 격차와 다음 식사 선택지를 알려드려요.
           </ThemedText>
         </View>
 
-        <MealPhotoUploadCard />
-
-        <ActiveNutritionTargetCard />
+        <DailyNutritionDashboard
+          refreshGeneration={refreshGeneration}
+          onLoadComplete={handleDashboardLoadComplete}
+        />
+        <MealPhotoUploadCard
+          onMealConfirmed={() =>
+            setRefreshGeneration((generation) => generation + 1)
+          }
+        />
 
         <View style={styles.sectionHeader}>
           <ThemedText type="smallBold">목표 계산 기준</ThemedText>
@@ -82,7 +106,7 @@ export default function HomeScreen() {
               pressed && styles.pressed,
             ]}
           >
-            <ThemedText type="smallBold" style={styles.signOutText}>
+            <ThemedText type="smallBold" style={{ color: theme.danger }}>
               {isSigningOut ? '로그아웃 중…' : '로그아웃'}
             </ThemedText>
           </Pressable>
@@ -111,7 +135,6 @@ const styles = StyleSheet.create({
     paddingBottom: Spacing.two,
   },
   brand: {
-    color: '#16794A',
     fontSize: 15,
     lineHeight: 20,
     fontWeight: '800',
@@ -137,9 +160,6 @@ const styles = StyleSheet.create({
     minHeight: 44,
     justifyContent: 'center',
     paddingHorizontal: Spacing.three,
-  },
-  signOutText: {
-    color: '#C43D3D',
   },
   pressed: {
     opacity: 0.7,

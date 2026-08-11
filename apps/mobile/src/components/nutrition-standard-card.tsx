@@ -4,17 +4,24 @@ import { Pressable, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { Spacing } from '@/constants/theme';
+import { Radius, Spacing } from '@/constants/theme';
+import { useTheme } from '@/hooks/use-theme';
 
 export function NutritionStandardCard() {
+  const theme = useTheme();
+
   return (
     <ThemedView
-      type="backgroundElement"
+      surface="raised"
       style={styles.card}
       accessibilityLabel={`${NUTRITION_STANDARD.nameKo} 적용됨`}>
       <View style={styles.header}>
-        <View style={styles.badge}>
-          <ThemedText style={styles.badgeCheck}>✓</ThemedText>
+        <View
+          style={[
+            styles.badge,
+            { backgroundColor: theme.successSurface, borderColor: theme.primary },
+          ]}>
+          <ThemedText style={[styles.badgeCheck, { color: theme.primary }]}>✓</ThemedText>
         </View>
         <View style={styles.headerCopy}>
           <ThemedText type="smallBold">공식 기준 적용</ThemedText>
@@ -40,8 +47,16 @@ export function NutritionStandardCard() {
         accessibilityRole="link"
         accessibilityLabel="보건복지부 공식 기준 문서 열기"
         onPress={() => void Linking.openURL(NUTRITION_STANDARD.sourceUrl)}
-        style={({ pressed }) => [styles.sourceLink, pressed && styles.pressed]}>
-        <ThemedText type="smallBold" style={styles.sourceText}>
+        style={({ pressed }) => [
+          styles.sourceLink,
+          {
+            backgroundColor: theme.surfaceInset,
+            borderColor: theme.border,
+            shadowColor: theme.shadow,
+          },
+          pressed && styles.pressed,
+        ]}>
+        <ThemedText type="smallBold" style={{ color: theme.primary }}>
           공식 출처 보기 ↗
         </ThemedText>
       </Pressable>
@@ -52,17 +67,17 @@ export function NutritionStandardCard() {
 function Metadata({ label, value }: { label: string; value: string }) {
   return (
     <View style={styles.metadataRow}>
-      <ThemedText type="small" themeColor="textSecondary">
+      <ThemedText type="small" themeColor="textSecondary" style={styles.metadataLabel}>
         {label}
       </ThemedText>
-      <ThemedText type="smallBold">{value}</ThemedText>
+      <ThemedText type="smallBold" style={styles.metadataValue}>{value}</ThemedText>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   card: {
-    borderRadius: 20,
+    borderRadius: Radius.surface,
     padding: Spacing.four,
     gap: Spacing.three,
   },
@@ -77,13 +92,12 @@ const styles = StyleSheet.create({
   badge: {
     width: 32,
     height: 32,
-    borderRadius: 16,
+    borderRadius: Radius.pill,
+    borderWidth: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#DDF7E8',
   },
   badgeCheck: {
-    color: '#16794A',
     fontWeight: '800',
   },
   standardName: {
@@ -97,20 +111,30 @@ const styles = StyleSheet.create({
   },
   metadataRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     justifyContent: 'space-between',
-    gap: Spacing.three,
+    gap: Spacing.two,
+  },
+  metadataLabel: {
+    flexShrink: 0,
+  },
+  metadataValue: {
+    flexShrink: 1,
+    textAlign: 'right',
   },
   sourceLink: {
     minHeight: 44,
     justifyContent: 'center',
     alignItems: 'center',
-    borderRadius: 12,
-    backgroundColor: '#DDEBFF',
-  },
-  sourceText: {
-    color: '#123A63',
+    borderRadius: Radius.control,
+    borderWidth: 1,
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.12,
+    shadowRadius: 6,
+    elevation: 2,
   },
   pressed: {
-    opacity: 0.7,
+    transform: [{ translateY: 1 }],
+    opacity: 0.82,
   },
 });

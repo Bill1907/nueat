@@ -13,6 +13,7 @@ import { MealConfirmationModal } from '@/components/meal-confirmation-modal';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
+import { useTheme } from '@/hooks/use-theme';
 import {
   loadLocalUploadDraft,
   markLocalUploadDraftValidated,
@@ -38,8 +39,17 @@ type Phase =
   | 'success'
   | 'error';
 
-export function MealPhotoUploadCard() {
+type MealPhotoUploadCardProps = {
+  onMealConfirmed?: () => void;
+  onConfirmationClose?: () => void;
+};
+
+export function MealPhotoUploadCard({
+  onMealConfirmed,
+  onConfirmationClose,
+}: MealPhotoUploadCardProps) {
   const [phase, setPhase] = useState<Phase>('restoring');
+  const theme = useTheme();
   const [draft, setDraft] = useState<LocalImageUploadDraft | null>(null);
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -235,6 +245,11 @@ export function MealPhotoUploadCard() {
     setPermissionBlocked(false);
     setPhase('idle');
   }
+  function handleConfirmationClose() {
+    setConfirmationVisible(false);
+    onConfirmationClose?.();
+  }
+
 
   const busy =
     phase === 'preparing' ||
@@ -243,7 +258,7 @@ export function MealPhotoUploadCard() {
     phase === 'linking';
 
   return (
-    <ThemedView type="backgroundElement" style={styles.card}>
+    <ThemedView surface="raised" style={styles.card}>
       <View style={styles.header}>
         <View style={styles.copy}>
           <ThemedText type="smallBold">식사 사진 업로드</ThemedText>
@@ -257,7 +272,7 @@ export function MealPhotoUploadCard() {
       {draft && phase !== 'success' && (
         <Image
           source={{ uri: draft.fileUri }}
-          style={styles.preview}
+          style={[styles.preview, { backgroundColor: theme.surfaceInset }]}
           contentFit="cover"
         />
       )}
@@ -283,11 +298,11 @@ export function MealPhotoUploadCard() {
                 ? '이미지 검증 중'
                 : '식사 초안을 만들고 있어요'}
           </ThemedText>
-          <View style={styles.progressTrack}>
+          <View style={[styles.progressTrack, { backgroundColor: theme.surfaceInset }]}>
             <View
               style={[
                 styles.progressFill,
-                { width: `${Math.round(progress * 100)}%` },
+                { width: `${Math.round(progress * 100)}%`, backgroundColor: theme.primary },
               ]}
             />
           </View>
@@ -301,7 +316,7 @@ export function MealPhotoUploadCard() {
       )}
       {phase === 'uploaded' && (validatedAsset || draft?.validatedAssetId) && (
         <View style={styles.successCopy}>
-          <ThemedText type="smallBold" style={styles.successText}>
+          <ThemedText type="smallBold" style={{ color: theme.primary }}>
             사진 업로드를 완료했어요
           </ThemedText>
           <ThemedText type="small" themeColor="textSecondary">
@@ -311,7 +326,7 @@ export function MealPhotoUploadCard() {
       )}
       {phase === 'recognizing' && mealLogId && (
         <View style={styles.successCopy}>
-          <ThemedText type="smallBold" style={styles.successText}>
+          <ThemedText type="smallBold" style={{ color: theme.primary }}>
             음식 인식을 진행하고 있어요
           </ThemedText>
           <ThemedText type="small" themeColor="textSecondary">
@@ -321,7 +336,7 @@ export function MealPhotoUploadCard() {
       )}
       {phase === 'success' && mealLogId && (
         <View style={styles.successCopy}>
-          <ThemedText type="smallBold" style={styles.successText}>
+          <ThemedText type="smallBold" style={{ color: theme.primary }}>
             식사 초안을 만들었어요
           </ThemedText>
           <ThemedText type="small" themeColor="textSecondary">
@@ -333,7 +348,7 @@ export function MealPhotoUploadCard() {
         <ThemedText
           accessibilityRole="alert"
           type="small"
-          style={styles.errorText}
+          style={{ color: theme.danger }}
         >
           {error}
         </ThemedText>
@@ -397,7 +412,8 @@ export function MealPhotoUploadCard() {
       </View>
       <MealConfirmationModal
         mealLogId={mealLogId}
-        onClose={() => setConfirmationVisible(false)}
+        onClose={handleConfirmationClose}
+        onConfirmed={onMealConfirmed}
         visible={confirmationVisible}
       />
     </ThemedView>
@@ -422,6 +438,7 @@ async function requestPermission(source: LocalImageUploadDraft['source']) {
 }
 
 function StatusBadge({ phase }: { phase: Phase }) {
+  const theme = useTheme();
   const label =
     phase === 'success'
       ? '초안 저장'
@@ -437,10 +454,10 @@ function StatusBadge({ phase }: { phase: Phase }) {
             : '확정 전';
   const success = phase === 'success' || phase === 'uploaded';
   return (
-    <View style={[styles.badge, success && styles.successBadge]}>
+    <View style={[styles.badge, { backgroundColor: success ? theme.successSurface : theme.warningSurface }]}>
       <ThemedText
         type="smallBold"
-        style={success ? styles.successText : styles.badgeText}
+        style={{ color: success ? theme.primary : theme.warning }}
       >
         {label}
       </ThemedText>
@@ -459,6 +476,7 @@ function ActionButton({
   secondary?: boolean;
   disabled?: boolean;
 }) {
+  const theme = useTheme();
   return (
     <Pressable
       accessibilityRole="button"
@@ -468,13 +486,17 @@ function ActionButton({
       onPress={onPress}
       style={({ pressed }) => [
         styles.button,
+        {
+          backgroundColor: secondary ? 'transparent' : theme.primary,
+          borderColor: theme.primary,
+        },
         secondary && styles.secondaryButton,
         (pressed || disabled) && styles.pressed,
       ]}
     >
       <ThemedText
         type="smallBold"
-        style={secondary ? styles.secondaryText : styles.buttonText}
+        style={{ color: secondary ? theme.primary : theme.onPrimary }}
       >
         {label}
       </ThemedText>
@@ -519,22 +541,11 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     paddingHorizontal: 10,
     paddingVertical: 4,
-    backgroundColor: '#FFF1D6',
-  },
-  successBadge: {
-    backgroundColor: '#E7F4EC',
-  },
-  badgeText: {
-    color: '#8A5A00',
-  },
-  successText: {
-    color: '#16794A',
   },
   preview: {
     width: '100%',
     aspectRatio: 4 / 3,
     borderRadius: 14,
-    backgroundColor: '#DDE5E0',
   },
   progressSection: {
     gap: Spacing.two,
@@ -543,18 +554,13 @@ const styles = StyleSheet.create({
     height: 8,
     overflow: 'hidden',
     borderRadius: 999,
-    backgroundColor: '#DDE5E0',
   },
   progressFill: {
     height: '100%',
     borderRadius: 999,
-    backgroundColor: '#16794A',
   },
   successCopy: {
     gap: Spacing.one,
-  },
-  errorText: {
-    color: '#B42318',
   },
   actions: {
     flexDirection: 'row',
@@ -568,18 +574,10 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     borderRadius: 12,
     paddingHorizontal: Spacing.three,
-    backgroundColor: '#16794A',
   },
   secondaryButton: {
     borderWidth: 1,
-    borderColor: '#16794A',
     backgroundColor: 'transparent',
-  },
-  buttonText: {
-    color: '#FFFFFF',
-  },
-  secondaryText: {
-    color: '#16794A',
   },
   pressed: {
     opacity: 0.6,

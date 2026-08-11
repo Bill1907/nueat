@@ -8,6 +8,7 @@ import {
   mealLogs,
   nutrientProfiles,
   sourceRegistries,
+  userProfiles,
   type Database,
 } from '@nueat/database';
 import {
@@ -86,7 +87,12 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     const input = parsed.data;
     const now = new Date();
     const eatenAt = new Date(input.eatenAt);
-    const eatenLocalDate = localDate(eatenAt, input.timezone);
+    const profileTimezone = await findUserTimezone(options.database, userId);
+    const timezone = profileTimezone ?? input.timezone;
+    const eatenLocalDate = localDate(eatenAt, timezone);
+    const mealType = profileTimezone
+      ? inferMealType(eatenAt, profileTimezone)
+      : input.mealType;
     const existing = await findOwnedDraftMealLogByImage(
       options.database,
       input.imageAssetId,
@@ -125,9 +131,9 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
           userId,
           imageAssetId: input.imageAssetId,
           eatenAt,
-          eatenTimezone: input.timezone,
+          eatenTimezone: timezone,
           eatenLocalDate,
-          mealType: input.mealType,
+          mealType,
           status: 'draft',
           recognitionStatus: 'pending',
           recognitionNextAttemptAt: now,
@@ -194,14 +200,21 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     const eatenAt = body.data.eatenAt
       ? new Date(body.data.eatenAt)
       : existing.eatenAt;
-    const timezone = body.data.timezone ?? existing.timezone;
+    const profileTimezone = await findUserTimezone(options.database, userId);
+    const timezone =
+      profileTimezone ??
+      body.data.timezone ??
+      existing.timezone;
+    const mealType = profileTimezone
+      ? inferMealType(eatenAt, profileTimezone)
+      : body.data.mealType ?? existing.mealType;
     const [mealLog] = await options.database
       .update(mealLogs)
       .set({
         eatenAt,
         eatenTimezone: timezone,
         eatenLocalDate: localDate(eatenAt, timezone),
-        mealType: body.data.mealType ?? existing.mealType,
+        mealType,
         updatedAt: new Date(),
       })
       .where(
@@ -1224,6 +1237,14 @@ function mealLogResponse<TMeal, TItem>(mealLog: TMeal, items: TItem[]) {
   return { mealLog, items };
 }
 
+async function findUserTimezone(database: Database, userId: string) {
+  const [profile] = await database
+    .select({ timezone: userProfiles.timezone })
+    .from(userProfiles)
+    .where(eq(userProfiles.userId, userId))
+    .limit(1);
+  return profile?.timezone ?? null;
+}
 function localDate(value: Date, timezone: string) {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: timezone,
@@ -1234,6 +1255,21 @@ function localDate(value: Date, timezone: string) {
   const get = (type: Intl.DateTimeFormatPartTypes) =>
     parts.find((part) => part.type === type)?.value;
   return `${get('year')}-${get('month')}-${get('day')}`;
+}
+function inferMealType(value: Date, timezone: string) {
+  const hourPart = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hour: '2-digit',
+    hourCycle: 'h23',
+  })
+    .formatToParts(value)
+    .find((part) => part.type === 'hour')?.value;
+  const hour = Number(hourPart);
+  if (!Number.isInteger(hour)) throw new Error('Unable to infer meal type');
+  if (hour >= 5 && hour <= 10) return 'breakfast' as const;
+  if (hour >= 11 && hour <= 15) return 'lunch' as const;
+  if (hour >= 16 && hour <= 21) return 'dinner' as const;
+  return 'snack' as const;
 }
 
 function isIanaTimezone(value: string) {

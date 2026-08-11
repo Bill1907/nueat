@@ -64,10 +64,12 @@ export function MealConfirmationModal({
   mealLogId,
   visible,
   onClose,
+  onConfirmed,
 }: {
   mealLogId: string | null;
   visible: boolean;
   onClose: () => void;
+  onConfirmed?: () => void;
 }) {
   const [data, setData] = useState<MealDraftResponse | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
@@ -587,6 +589,11 @@ export function MealConfirmationModal({
           errors: [],
         });
         applyResponse(response, scopedMealId, generation);
+        try {
+          onConfirmed?.();
+        } catch {
+          // A consumer refresh failure must not rewrite a successful confirmation.
+        }
       })
       .catch((cause) => {
         if (!isCurrent(scopedMealId, generation)) return;
