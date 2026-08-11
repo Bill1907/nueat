@@ -162,6 +162,8 @@ describe('next recommendation route', () => {
     expect(first.candidates).toHaveLength(3);
     expect(first.candidates.map((candidate: { rank: number }) => candidate.rank)).toEqual([1, 2, 3]);
     expect(first.candidates).toEqual(second.candidates);
+    expect(first.candidates[0]?.nutrition).toBeDefined();
+    expect(first.candidates[0]).not.toHaveProperty('nutrients');
     expect(first.candidates.every((candidate: { components: Array<{ foodId: string }> }) =>
       candidate.components.every((component) => component.foodId !== 'unpreferred-food'))).toBe(true);
     expect(first.candidates.some((candidate: { rationaleFacts: Array<{ code: string; hasRecentFood?: boolean }> }) =>
@@ -184,17 +186,7 @@ describe('next recommendation route', () => {
           }),
         ]),
       },
-      candidateItems: first.candidates.map((candidate: Record<string, unknown>) => ({
-        rank: candidate.rank,
-        templateId: candidate.templateId,
-        titleKo: candidate.titleKo,
-        scoreBps: candidate.scoreBps,
-        components: candidate.components,
-        nutrition: candidate.nutrients,
-        projectedTotals: candidate.projectedTotals,
-        rationaleFacts: candidate.rationaleFacts,
-        warnings: candidate.warnings,
-      })),
+      candidateItems: first.candidates,
     });
   });
 

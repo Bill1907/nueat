@@ -238,7 +238,7 @@ export const recommendationRoutes: FastifyPluginAsync<RecommendationRouteOptions
       safetyFlags,
     }).returning({ id: recommendations.id, createdAt: recommendations.createdAt });
     if (!saved) throw new Error('Recommendation insert did not return a row');
-    return { recommendationId: saved.id, generatedAt: saved.createdAt.toISOString(), date, timezone, engineVersion: MEAL_RECOMMENDATION_ENGINE_VERSION, gaps, safetyFlags, candidates };
+    return { recommendationId: saved.id, generatedAt: saved.createdAt.toISOString(), date, timezone, engineVersion: MEAL_RECOMMENDATION_ENGINE_VERSION, gaps, safetyFlags, candidates: candidateItems };
   });
   app.post('/api/recommendations/:recommendationId/meal-draft', async (request, reply) => {
     const userId = await requireUserId(request, reply, options.auth);

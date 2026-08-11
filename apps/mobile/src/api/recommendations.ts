@@ -1,4 +1,4 @@
-import { apiRequest } from '@/api/client';
+import { apiRequest, ApiError } from '@/api/client';
 import type { MealDraftResponse } from '@/api/meal-drafts';
 
 export type RecommendationNutrition = {
@@ -52,11 +52,18 @@ export type NextMealRecommendation = {
   candidates: NextMealCandidate[];
 };
 
-export function getNextMealRecommendation(signal?: AbortSignal) {
-  return apiRequest<NextMealRecommendation>('/api/recommendations/next', {
+export async function getNextMealRecommendation(signal?: AbortSignal) {
+  const response = await apiRequest<NextMealRecommendation>('/api/recommendations/next', {
     method: 'POST',
     signal,
   });
+  if (!hasValidRecommendationCandidates(response)) {
+    throw new ApiError(
+      '추천 영양 정보를 확인하지 못했습니다.',
+      'INVALID_RECOMMENDATION_RESPONSE',
+    );
+  }
+  return response;
 }
 export function createRecommendationMealDraft(
   recommendationId: string,
@@ -71,4 +78,29 @@ export function createRecommendationMealDraft(
       signal,
     },
   );
+}
+
+function hasValidRecommendationCandidates(response: NextMealRecommendation) {
+  return (
+    Array.isArray(response.candidates) &&
+    response.candidates.every((candidate) => {
+      const nutrition = candidate?.nutrition;
+      return (
+        nutrition !== null &&
+        typeof nutrition === 'object' &&
+        isNullableNumber(nutrition.energyMillicalories) &&
+        isNullableNumber(nutrition.carbohydrateMg) &&
+        isNullableNumber(nutrition.proteinMg) &&
+        isNullableNumber(nutrition.fatMg) &&
+        isNullableNumber(nutrition.fiberMg) &&
+        Array.isArray(candidate.components) &&
+        Array.isArray(candidate.rationaleFacts) &&
+        Array.isArray(candidate.warnings)
+      );
+    })
+  );
+}
+
+function isNullableNumber(value: unknown): value is number | null {
+  return value === null || (typeof value === 'number' && Number.isFinite(value));
 }
