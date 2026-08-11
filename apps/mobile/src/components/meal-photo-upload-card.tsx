@@ -40,11 +40,13 @@ type Phase =
   | 'error';
 
 type MealPhotoUploadCardProps = {
+  compact?: boolean;
   onMealConfirmed?: () => void;
   onConfirmationClose?: () => void;
 };
 
 export function MealPhotoUploadCard({
+  compact = false,
   onMealConfirmed,
   onConfirmationClose,
 }: MealPhotoUploadCardProps) {
@@ -58,6 +60,7 @@ export function MealPhotoUploadCard({
     useState<ValidatedImageAsset | null>(null);
   const [mealLogId, setMealLogId] = useState<string | null>(null);
   const [confirmationVisible, setConfirmationVisible] = useState(false);
+  const confirmedMealLogId = useRef<string | null>(null);
   const abortController = useRef<AbortController | null>(null);
   const linkingMealDraft = useRef(false);
   const mounted = useRef(true);
@@ -247,7 +250,34 @@ export function MealPhotoUploadCard({
   }
   function handleConfirmationClose() {
     setConfirmationVisible(false);
+    if (confirmedMealLogId.current === mealLogId) {
+      confirmedMealLogId.current = null;
+      setMealLogId(null);
+    }
     onConfirmationClose?.();
+  }
+
+  function handleMealConfirmed() {
+    confirmedMealLogId.current = mealLogId;
+    void (async () => {
+      try {
+        await removeLocalUploadDraft();
+        await authStorage.setItem('meal-upload-link', '');
+        if (!mounted.current) return;
+        setDraft(null);
+        setValidatedAsset(null);
+        setError(null);
+        setProgress(0);
+        setPermissionBlocked(false);
+        setPhase('idle');
+      } catch {
+        if (mounted.current) {
+          setError('식사는 확정했지만 기기의 업로드 상태를 정리하지 못했어요.');
+        }
+      } finally {
+        onMealConfirmed?.();
+      }
+    })();
   }
 
 
@@ -258,15 +288,17 @@ export function MealPhotoUploadCard({
     phase === 'linking';
 
   return (
-    <ThemedView surface="raised" style={styles.card}>
+    <ThemedView surface="raised" style={[styles.card, compact && phase === 'idle' && styles.compactCard]}>
       <View style={styles.header}>
         <View style={styles.copy}>
-          <ThemedText type="smallBold">식사 사진 업로드</ThemedText>
-          <ThemedText type="small" themeColor="textSecondary">
-            확인 전에는 식사 기록이나 영양 섭취로 확정되지 않아요.
-          </ThemedText>
+          <ThemedText type="smallBold">{compact ? '식사 기록' : '식사 사진 업로드'}</ThemedText>
+          {(!compact || phase !== 'idle') && (
+            <ThemedText type="small" themeColor="textSecondary">
+              확인 전에는 식사 기록이나 영양 섭취로 확정되지 않아요.
+            </ThemedText>
+          )}
         </View>
-        <StatusBadge phase={phase} />
+        {(!compact || phase !== 'idle') && <StatusBadge phase={phase} />}
       </View>
 
       {draft && phase !== 'success' && (
@@ -278,27 +310,31 @@ export function MealPhotoUploadCard({
       )}
 
       {phase === 'restoring' && (
-        <ThemedText type="small" themeColor="textSecondary">
+        <ThemedText accessibilityLiveRegion="polite" type="small" themeColor="textSecondary">
           저장된 업로드 초안을 확인하고 있어요.
         </ThemedText>
       )}
       {phase === 'preparing' && (
-        <ThemedText type="small" themeColor="textSecondary">
+        <ThemedText accessibilityLiveRegion="polite" type="small" themeColor="textSecondary">
           위치정보를 제거하고 사진 크기를 조정하고 있어요.
         </ThemedText>
       )}
       {(phase === 'uploading' ||
         phase === 'validating' ||
         phase === 'linking') && (
-        <View style={styles.progressSection}>
-          <ThemedText type="smallBold">
+        <View accessibilityLiveRegion="polite" style={styles.progressSection}>
+          <ThemedText accessibilityLiveRegion="polite" type="smallBold">
             {phase === 'uploading'
               ? `업로드 ${Math.round(progress * 100)}%`
               : phase === 'validating'
                 ? '이미지 검증 중'
                 : '식사 초안을 만들고 있어요'}
           </ThemedText>
-          <View style={[styles.progressTrack, { backgroundColor: theme.surfaceInset }]}>
+          <View
+            accessibilityRole="progressbar"
+            accessibilityValue={{ min: 0, max: 100, now: Math.round(progress * 100) }}
+            style={[styles.progressTrack, { backgroundColor: theme.surfaceInset }]}
+          >
             <View
               style={[
                 styles.progressFill,
@@ -309,13 +345,13 @@ export function MealPhotoUploadCard({
         </View>
       )}
       {phase === 'ready' && draft && (
-        <ThemedText type="small" themeColor="textSecondary">
+        <ThemedText accessibilityLiveRegion="polite" type="small" themeColor="textSecondary">
           중단된 사진이 기기에 보관되어 있습니다. 다시 업로드하거나 삭제할 수
           있어요.
         </ThemedText>
       )}
       {phase === 'uploaded' && (validatedAsset || draft?.validatedAssetId) && (
-        <View style={styles.successCopy}>
+        <View accessible accessibilityLiveRegion="polite" accessibilityLabel="사진 업로드를 완료했어요. 식사 초안을 만들면 음식을 확인할 수 있어요." style={styles.successCopy}>
           <ThemedText type="smallBold" style={{ color: theme.primary }}>
             사진 업로드를 완료했어요
           </ThemedText>
@@ -325,7 +361,7 @@ export function MealPhotoUploadCard({
         </View>
       )}
       {phase === 'recognizing' && mealLogId && (
-        <View style={styles.successCopy}>
+        <View accessible accessibilityLiveRegion="polite" accessibilityLabel="음식 인식을 진행하고 있어요. 완료되면 결과를 확인하거나 직접 입력할 수 있어요." style={styles.successCopy}>
           <ThemedText type="smallBold" style={{ color: theme.primary }}>
             음식 인식을 진행하고 있어요
           </ThemedText>
@@ -335,7 +371,7 @@ export function MealPhotoUploadCard({
         </View>
       )}
       {phase === 'success' && mealLogId && (
-        <View style={styles.successCopy}>
+        <View accessible accessibilityLiveRegion="polite" accessibilityLabel="식사 초안을 만들었어요. 음식을 확인하고 초안으로 저장할 수 있어요." style={styles.successCopy}>
           <ThemedText type="smallBold" style={{ color: theme.primary }}>
             식사 초안을 만들었어요
           </ThemedText>
@@ -413,7 +449,7 @@ export function MealPhotoUploadCard({
       <MealConfirmationModal
         mealLogId={mealLogId}
         onClose={handleConfirmationClose}
-        onConfirmed={onMealConfirmed}
+        onConfirmed={handleMealConfirmed}
         visible={confirmationVisible}
       />
     </ThemedView>
@@ -527,6 +563,10 @@ const styles = StyleSheet.create({
     padding: Spacing.four,
     borderRadius: 20,
     gap: Spacing.three,
+  },
+  compactCard: {
+    padding: Spacing.three,
+    gap: Spacing.two,
   },
   header: {
     flexDirection: 'row',

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { AppState, Pressable, StyleSheet, View } from 'react-native';
 
 import {
@@ -12,11 +12,12 @@ import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 
 type Props = {
+  recommendations?: ReactNode;
   refreshGeneration: number;
   onLoadComplete?: () => void;
 };
 
-export function DailyNutritionDashboard({ refreshGeneration, onLoadComplete }: Props) {
+export function DailyNutritionDashboard({ recommendations, refreshGeneration, onLoadComplete }: Props) {
   const theme = useTheme();
   const [dashboard, setDashboard] = useState<DailyDashboard | null>(null);
   const [loading, setLoading] = useState(true);
@@ -103,60 +104,59 @@ export function DailyNutritionDashboard({ refreshGeneration, onLoadComplete }: P
         </Pressable>
       </View>
 
-      {target === null ? (
-        <DashboardShell>
-          <ThemedText type="smallBold">{targetStatusCopy(dashboard).title}</ThemedText>
-          <ThemedText type="small" themeColor="textSecondary">
-            {targetStatusCopy(dashboard).description}
-          </ThemedText>
-          <ConsumedSummary totals={totals} />
-          <MealTimeline meals={meals} timezone={dashboard.timezone} />
-        </DashboardShell>
-      ) : (
-        <>
-          <View style={[styles.hero, { backgroundColor: theme.surfaceRaised, borderColor: theme.highlight, shadowColor: theme.shadow }]}>
-            <View style={[styles.highlightEdge, { backgroundColor: theme.highlight }]} />
-            <ThemedText type="smallBold" style={{ color: theme.primary }}>열량</ThemedText>
-            <View style={styles.energyRow}>
-              <ThemedText style={styles.energyValue}>{formatKcal(consumedEnergy)}</ThemedText>
-              <ThemedText type="small" themeColor="textSecondary">/ {formatKcal(target.energyMillicalories)}</ThemedText>
-            </View>
-            <ProgressBar value={consumedEnergy} target={target.energyMillicalories} />
+      <DashboardShell>
+        {target === null ? (
+          <>
+            <ThemedText type="smallBold">{targetStatusCopy(dashboard).title}</ThemedText>
             <ThemedText type="small" themeColor="textSecondary">
-              {remainingEnergy === null ? '' : remainingEnergy >= 0 ? `${formatKcal(remainingEnergy)} 남음` : `${formatKcal(-remainingEnergy)} 초과`}
+              {targetStatusCopy(dashboard).description}
             </ThemedText>
-            <ThemedText type="smallBold" style={{ color: theme.text }}>{gapCopy(target, totals)}</ThemedText>
-          </View>
-
-          <View style={styles.compactRow}>
-            <NutrientCard label="단백질" value={totals.proteinMg} target={target.proteinMg} />
-            <NutrientCard
+            <ConsumedSummary totals={totals} />
+          </>
+        ) : (
+          <>
+            <View style={styles.summaryHeader}>
+              <ThemedText type="smallBold" style={styles.rowPrimary}>오늘의 섭취</ThemedText>
+              <ThemedText type="small" themeColor="textSecondary" style={styles.rowSecondary}>
+                {remainingEnergy === null ? '' : remainingEnergy >= 0 ? `${formatKcal(remainingEnergy)} 남음` : `${formatKcal(-remainingEnergy)} 초과`}
+              </ThemedText>
+            </View>
+            <NutrientSummaryRow label="열량" value={consumedEnergy} target={target.energyMillicalories} unit="kcal" />
+            <NutrientSummaryRow label="단백질" value={totals.proteinMg} target={target.proteinMg} />
+            <NutrientSummaryRow
               label="식이섬유"
               value={totals.fiberKnownMg}
               target={target.fiberMg}
               detail={totals.fiberComplete ? undefined : '일부 항목의 식이섬유 정보가 없어 확인 가능한 값만 표시해요.'}
               knownOnly={!totals.fiberComplete}
             />
-          </View>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={expanded ? '탄수화물과 지방 접기' : '탄수화물과 지방 펼치기'}
-            accessibilityState={{ expanded }}
-            onPress={() => setExpanded((current) => !current)}
-            style={({ pressed }) => [styles.expandControl, { backgroundColor: theme.surfaceInset, borderColor: theme.border }, pressed && styles.pressed]}
-          >
-            <ThemedText type="smallBold">탄수화물 · 지방</ThemedText>
-            <ThemedText type="small" style={{ color: theme.primary }}>{expanded ? '접기' : '보기'}</ThemedText>
-          </Pressable>
-          {expanded && (
-            <View style={styles.compactRow}>
-              <NutrientCard label="탄수화물" value={totals.carbohydrateMg} target={target.carbohydrateMg} />
-              <NutrientCard label="지방" value={totals.fatMg} target={target.fatMg} />
-            </View>
-          )}
-          <MealTimeline meals={meals} timezone={dashboard.timezone} />
-        </>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={expanded ? '탄수화물과 지방 접기' : '탄수화물과 지방 펼치기'}
+              accessibilityState={{ expanded }}
+              onPress={() => setExpanded((current) => !current)}
+              style={({ pressed }) => [styles.expandControl, { backgroundColor: theme.surfaceInset, borderColor: theme.border }, pressed && styles.pressed]}
+            >
+              <ThemedText type="smallBold" style={styles.rowPrimary}>탄수화물 · 지방</ThemedText>
+              <ThemedText type="small" style={[styles.rowSecondary, { color: theme.primary }]}>{expanded ? '접기' : '보기'}</ThemedText>
+            </Pressable>
+            {expanded && (
+              <View style={styles.optionalNutrients}>
+                <NutrientSummaryRow label="탄수화물" value={totals.carbohydrateMg} target={target.carbohydrateMg} />
+                <NutrientSummaryRow label="지방" value={totals.fatMg} target={target.fatMg} />
+              </View>
+            )}
+          </>
+        )}
+      </DashboardShell>
+      {target !== null && (
+        <View style={[styles.gapSection, { borderColor: theme.border }]}>
+          <ThemedText type="smallBold">다음 식사에서 채울 점</ThemedText>
+          <ThemedText type="small" themeColor="textSecondary">{gapCopy(target, totals)}</ThemedText>
+        </View>
       )}
+      {target !== null ? recommendations : null}
+      <MealTimeline meals={meals} timezone={dashboard.timezone} />
       {error && <ThemedText accessibilityRole="alert" type="small" style={{ color: theme.danger }}>{error}</ThemedText>}
     </View>
   );
@@ -167,36 +167,54 @@ function DashboardShell({ children }: { children: React.ReactNode }) {
   return <View style={[styles.shell, { backgroundColor: theme.surfaceRaised, borderColor: theme.border }]}>{children}</View>;
 }
 
-function NutrientCard({
+function NutrientSummaryRow({
   label,
   value,
   target,
   detail,
   knownOnly = false,
+  unit,
 }: {
   label: string;
   value: number;
   target: number;
   detail?: string;
   knownOnly?: boolean;
+  unit?: 'kcal';
 }) {
-  const theme = useTheme();
+  const displayValue = unit === 'kcal' ? formatKcal(value) : formatGrams(value);
+  const displayTarget = unit === 'kcal' ? formatKcal(target) : formatGrams(target);
   return (
-    <View style={[styles.nutrientCard, { backgroundColor: theme.surfaceRaised, borderColor: theme.border, shadowColor: theme.shadow }]}>
-      <ThemedText type="smallBold">{label}</ThemedText>
-      <ThemedText style={styles.nutrientValue}>
-        {knownOnly ? `확인 ${formatGrams(value)}` : formatGrams(value)}
-      </ThemedText>
+    <View style={styles.nutrientRow}>
+      <View style={styles.nutrientHeading}>
+        <ThemedText type="smallBold" style={styles.rowPrimary}>{label}</ThemedText>
+        <ThemedText type="small" themeColor="textSecondary" style={styles.rowSecondary}>
+          {knownOnly ? `확인 ${displayValue}` : `${displayValue} / ${displayTarget}`}
+        </ThemedText>
+      </View>
       {!knownOnly && <ProgressBar value={value} target={target} />}
-      <ThemedText type="small" themeColor="textSecondary">{detail ?? `${formatGrams(Math.max(target - value, 0))} 남음`}</ThemedText>
+      <ThemedText type="small" themeColor="textSecondary">
+        {detail ?? `${unit === 'kcal' ? formatKcal(Math.max(target - value, 0)) : formatGrams(Math.max(target - value, 0))} 남음`}
+      </ThemedText>
     </View>
   );
 }
 
 function ProgressBar({ value, target }: { value: number; target: number }) {
   const theme = useTheme();
+  const percentage = Math.round(target > 0 ? (value / target) * 100 : 0);
+  const maximum = Math.max(target, 1);
   const width: `${number}%` = target > 0 ? `${Math.min((value / target) * 100, 100)}%` : '0%';
-  return <View accessibilityLabel={`${Math.round(target > 0 ? (value / target) * 100 : 0)}퍼센트 달성`} style={[styles.track, { backgroundColor: theme.surfaceInset }]}><View style={[styles.fill, { width, backgroundColor: theme.primaryAccent }]} /></View>;
+  return (
+    <View
+      accessibilityRole="progressbar"
+      accessibilityLabel={`${percentage}퍼센트 달성`}
+      accessibilityValue={{ min: 0, max: maximum, now: Math.min(value, maximum), text: `${percentage}퍼센트` }}
+      style={[styles.track, { backgroundColor: theme.surfaceInset }]}
+    >
+      <View style={[styles.fill, { width, backgroundColor: theme.primaryAccent }]} />
+    </View>
+  );
 }
 
 function MealTimeline({ meals, timezone }: { meals: DailyMeal[]; timezone: string }) {
@@ -206,16 +224,25 @@ function MealTimeline({ meals, timezone }: { meals: DailyMeal[]; timezone: strin
       <ThemedText type="smallBold">확정한 식사</ThemedText>
       {meals.length === 0 ? (
         <ThemedText type="small" themeColor="textSecondary">아직 확정한 식사가 없어요. 사진에서 음식을 확인해 기록해 보세요.</ThemedText>
-      ) : meals.map((meal) => (
-        <View key={meal.id} style={[styles.meal, { borderColor: theme.border }]} accessibilityLabel={`${mealTypeLabel(meal.mealType)} ${meal.itemLabels.join(', ')}`}>
-          <View style={[styles.mealDot, { backgroundColor: theme.primary }]} />
-          <View style={styles.mealCopy}>
-            <ThemedText type="smallBold">{mealTypeLabel(meal.mealType)} · {formatTime(meal.eatenAt, timezone)}</ThemedText>
-            <ThemedText numberOfLines={2} type="small" themeColor="textSecondary">{meal.itemLabels.join(', ') || '음식 항목'}</ThemedText>
+      ) : meals.map((meal, index) => (
+        <View
+          key={meal.id}
+          style={styles.timelineEntry}
+          accessibilityLabel={`${mealTypeLabel(meal.mealType)} ${formatTime(meal.eatenAt, timezone)}. ${meal.itemLabels.join(', ') || '음식 항목'}. ${meal.qualityGrade === 'verified' ? '확인됨' : '추정 기록'}`}
+        >
+          <View style={styles.timelineRail}>
+            <View style={[styles.mealDot, { backgroundColor: theme.primary }]} />
+            {index < meals.length - 1 && <View style={[styles.mealConnector, { backgroundColor: theme.border }]} />}
           </View>
-          <View style={styles.mealValue}>
-            <ThemedText type="smallBold">{formatKcal(meal.totals.energyMillicalories)}</ThemedText>
-            <ThemedText type="small" style={{ color: meal.qualityGrade === 'verified' ? theme.primary : theme.warning }}>{meal.qualityGrade === 'verified' ? '확인됨' : '추정'}</ThemedText>
+          <View style={styles.mealCopy}>
+            <View style={styles.mealMeta}>
+              <ThemedText type="smallBold" style={styles.mealTitle}>{mealTypeLabel(meal.mealType)} · {formatTime(meal.eatenAt, timezone)}</ThemedText>
+              <View style={[styles.qualityBadge, { backgroundColor: theme.surfaceInset, borderColor: theme.border }]}>
+                <ThemedText type="small" themeColor="textSecondary">{meal.qualityGrade === 'verified' ? '확인됨' : '추정'}</ThemedText>
+              </View>
+            </View>
+            <ThemedText numberOfLines={2} type="small" themeColor="textSecondary">{meal.itemLabels.join(', ') || '음식 항목'}</ThemedText>
+            <ThemedText type="small">{mealDiffCopy(meal)}</ThemedText>
           </View>
         </View>
       ))}
@@ -276,7 +303,7 @@ function gapCopy(target: NonNullable<DailyDashboard['target']>, totals: DailyNut
   const fiber = target.fiberMg - totals.fiberKnownMg;
   if (fiber > 0) return `식이섬유 ${formatGrams(fiber)}을 더 채워 보세요.`;
   const energy = target.energyMillicalories - totals.energyMillicalories;
-  return energy >= 0 ? '핵심 영양 목표를 잘 채우고 있어요.' : '다음 식사는 가볍게 선택해 보세요.';
+  return energy >= 0 ? '남은 목표를 고려해 다음 식사를 선택해 보세요.' : '현재 섭취량과 남은 목표를 함께 확인해 보세요.';
 }
 
 function formatKcal(value: number) { return `${new Intl.NumberFormat('ko-KR', { maximumFractionDigits: 0 }).format(value / 1000)} kcal`; }
@@ -284,9 +311,39 @@ function formatGrams(value: number) { return `${new Intl.NumberFormat('ko-KR', {
 function formatDate(value: string) { return value.replace(/^(\d{4})-(\d{2})-(\d{2})$/, '$2월 $3일'); }
 function formatTime(value: string, timezone: string) { return new Intl.DateTimeFormat('ko-KR', { hour: 'numeric', minute: '2-digit', timeZone: timezone }).format(new Date(value)); }
 function mealTypeLabel(value: string) { return ({ breakfast: '아침', lunch: '점심', dinner: '저녁', snack: '간식' } as Record<string, string>)[value] ?? '식사'; }
+function mealDiffCopy(meal: DailyMeal) {
+  return `+${formatKcal(meal.totals.energyMillicalories)} · +${formatCompactGrams(meal.totals.proteinMg)} 단백질`;
+}
+function formatCompactGrams(value: number) { return `${new Intl.NumberFormat('ko-KR', { maximumFractionDigits: 1 }).format(value / 1000)}g`; }
+
 
 const styles = StyleSheet.create({
-  section: { gap: Spacing.three }, titleRow: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two }, titleCopy: { flex: 1, gap: Spacing.half }, refreshButton: { minHeight: 44, justifyContent: 'center', paddingHorizontal: Spacing.three, borderWidth: 1, borderRadius: 14 }, shell: { gap: Spacing.two, borderWidth: 1, borderRadius: 20, padding: Spacing.three }, hero: { overflow: 'hidden', gap: Spacing.two, borderWidth: 1, borderRadius: 24, padding: Spacing.four, shadowOffset: { width: 0, height: 5 }, shadowOpacity: 0.18, shadowRadius: 8, elevation: 4 }, highlightEdge: { position: 'absolute', top: 0, left: 18, right: 18, height: 2, borderBottomLeftRadius: 999, borderBottomRightRadius: 999 }, energyRow: { flexDirection: 'row', alignItems: 'baseline', gap: Spacing.one }, energyValue: { fontSize: 30, lineHeight: 38, fontWeight: '800' }, track: { height: 10, overflow: 'hidden', borderRadius: 999 }, fill: { height: '100%', borderRadius: 999 }, compactRow: { flexDirection: 'row', gap: Spacing.two }, nutrientCard: { flex: 1, gap: Spacing.one, borderWidth: 1, borderRadius: 18, padding: Spacing.three, shadowOffset: { width: 0, height: 3 }, shadowOpacity: 0.12, shadowRadius: 5, elevation: 2 }, nutrientValue: { fontSize: 20, lineHeight: 27, fontWeight: '800' }, expandControl: { minHeight: 44, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', borderWidth: 1, borderRadius: 16, paddingHorizontal: Spacing.three }, timeline: { gap: Spacing.two, paddingTop: Spacing.one }, meal: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, borderTopWidth: 1, paddingTop: Spacing.two }, mealDot: { width: 9, height: 9, borderRadius: 999 }, mealCopy: { flex: 1, gap: Spacing.half }, mealValue: { alignItems: 'flex-end', gap: Spacing.half }, retry: { alignSelf: 'flex-start', minHeight: 44, justifyContent: 'center', borderRadius: 14, paddingHorizontal: Spacing.three }, retryText: { color: '#FFFFFF' }, pressed: { opacity: 0.7 },
+  section: { gap: Spacing.three },
+  titleRow: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: Spacing.two },
+  titleCopy: { flex: 1, gap: Spacing.half },
+  refreshButton: { minHeight: 44, justifyContent: 'center', paddingHorizontal: Spacing.three, borderWidth: 1, borderRadius: 14 },
+  shell: { gap: Spacing.two, borderWidth: 1, borderRadius: 20, padding: Spacing.three },
+  summaryHeader: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'baseline', justifyContent: 'space-between', gap: Spacing.two },
+  nutrientRow: { gap: Spacing.half },
+  nutrientHeading: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'baseline', justifyContent: 'space-between', gap: Spacing.two },
+  track: { height: 6, overflow: 'hidden', borderRadius: 999 },
+  fill: { height: '100%', borderRadius: 999 },
+  expandControl: { minHeight: 44, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', borderWidth: 1, borderRadius: 14, paddingHorizontal: Spacing.three, paddingVertical: Spacing.one },
+  optionalNutrients: { gap: Spacing.two },
+  gapSection: { gap: Spacing.half, borderLeftWidth: 2, paddingLeft: Spacing.three },
+  timeline: { gap: 0, paddingTop: Spacing.one },
+  timelineEntry: { flexDirection: 'row', gap: Spacing.two },
+  timelineRail: { width: 12, alignItems: 'center' },
+  mealDot: { width: 9, height: 9, borderRadius: 999 },
+  mealConnector: { width: 1, flex: 1, minHeight: Spacing.four, marginTop: Spacing.one },
+  mealCopy: { flex: 1, gap: Spacing.half, paddingBottom: Spacing.three },
+  mealMeta: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'space-between', gap: Spacing.two },
+  mealTitle: { flexShrink: 1 },
+  qualityBadge: { flexShrink: 0, borderWidth: 1, borderRadius: 999, paddingHorizontal: Spacing.two, paddingVertical: Spacing.half },
+  retry: { alignSelf: 'flex-start', minHeight: 44, justifyContent: 'center', borderRadius: 14, paddingHorizontal: Spacing.three },
+  pressed: { opacity: 0.7 },
   summaryGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.two, paddingTop: Spacing.one },
   summaryValue: { minWidth: 96, flexGrow: 1, gap: Spacing.half },
+  rowPrimary: { flexGrow: 1, flexShrink: 1, minWidth: 120 },
+  rowSecondary: { flexShrink: 1 },
 });

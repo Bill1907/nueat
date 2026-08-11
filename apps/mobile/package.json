@@ -11,6 +11,7 @@
     "expo": "~57.0.12",
     "expo-constants": "~57.0.10",
     "expo-crypto": "~57.0.1",
+    "expo-dev-client": "~57.0.11",
     "expo-device": "~57.0.1",
     "expo-file-system": "~57.0.2",
     "expo-font": "~57.0.1",
@@ -46,10 +47,16 @@
   },
   "scripts": {
     "start": "expo start",
+    "start:dev-client": "expo start --dev-client",
     "reset-project": "bun ./scripts/reset-project.js",
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
+    "eas:whoami": "bunx eas-cli@latest whoami",
+    "eas:project": "bunx eas-cli@latest project:info",
+    "device:register": "bunx eas-cli@latest device:create",
+    "build:ios:device": "bunx eas-cli@latest build --platform ios --profile development",
+    "build:ios:preview": "bunx eas-cli@latest build --platform ios --profile preview",
     "lint": "expo lint",
     "typecheck": "tsc --noEmit"
   }

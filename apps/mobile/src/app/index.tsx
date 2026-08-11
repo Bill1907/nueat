@@ -12,9 +12,10 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { authClient, useAuthSession } from '@/auth/client';
 import { DailyNutritionDashboard } from '@/components/daily-nutrition-dashboard';
 import { NextMealRecommendations } from '@/components/next-meal-recommendations';
+
 import { MealPhotoUploadCard } from '@/components/meal-photo-upload-card';
 
-import { NutritionStandardCard } from '@/components/nutrition-standard-card';
+
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
@@ -76,26 +77,19 @@ export default function HomeScreen() {
         </View>
 
         <DailyNutritionDashboard
+          recommendations={session.data?.user.id ? (
+            <NextMealRecommendations
+              key={session.data.user.id}
+              refreshGeneration={refreshGeneration}
+              onMealConfirmed={handleMealConfirmed}
+              userId={session.data.user.id}
+            />
+          ) : null}
           refreshGeneration={refreshGeneration}
           onLoadComplete={handleDashboardLoadComplete}
         />
-        {session.data?.user.id ? (
-          <NextMealRecommendations
-            key={session.data.user.id}
-            refreshGeneration={refreshGeneration}
-            onMealConfirmed={handleMealConfirmed}
-            userId={session.data.user.id}
-          />
-        ) : null}
-        <MealPhotoUploadCard onMealConfirmed={handleMealConfirmed} />
+        <MealPhotoUploadCard compact onMealConfirmed={handleMealConfirmed} />
 
-        <View style={styles.sectionHeader}>
-          <ThemedText type="smallBold">목표 계산 기준</ThemedText>
-          <ThemedText type="small" themeColor="textSecondary">
-            언제든 적용 기준과 버전을 확인할 수 있어요.
-          </ThemedText>
-        </View>
-        <NutritionStandardCard />
 
         <ThemedView type="backgroundElement" style={styles.accountCard}>
           <View style={styles.accountCopy}>
@@ -147,10 +141,6 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     fontWeight: '800',
     letterSpacing: 1.5,
-  },
-  sectionHeader: {
-    gap: Spacing.one,
-    paddingTop: Spacing.two,
   },
   accountCard: {
     minHeight: 72,

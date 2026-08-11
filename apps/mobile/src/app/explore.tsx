@@ -1,5 +1,5 @@
-import type { ReactNode } from 'react';
-import { Platform, ScrollView, StyleSheet, View } from 'react-native';
+import { useState, type ReactNode } from 'react';
+import { Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { NutritionStandardCard } from '@/components/nutrition-standard-card';
@@ -37,15 +37,15 @@ export default function NutritionBasisScreen() {
       ]}>
       <ThemedView style={styles.container}>
         <View style={styles.header}>
-          <ThemedText type="subtitle">목표 계산 기준</ThemedText>
-          <ThemedText themeColor="textSecondary">
-            NUEAT이 목표를 어떻게 계산하고 언제 자동 계산을 제한하는지 확인할 수 있어요.
+          <ThemedText type="subtitle">계산 기준</ThemedText>
+          <ThemedText type="small" themeColor="textSecondary">
+            목표의 계산식, 적용 기준과 자동 계산 제한을 확인합니다.
           </ThemedText>
         </View>
 
         <NutritionStandardCard />
 
-        <PolicySection title="에너지 필요추정량">
+        <PolicySection title="에너지 산출식 · 활동계수">
           <ThemedText type="small" themeColor="textSecondary">
             나이, 계산상 성별, 신장, 체중과 활동계수를 2025 KDRI 성인 산출식에 적용합니다.
             계산상 성별은 공식 산출식 선택에만 사용합니다.
@@ -55,7 +55,7 @@ export default function NutritionBasisScreen() {
           ))}
         </PolicySection>
 
-        <PolicySection title="목표별 조정">
+        <PolicySection title="목표별 에너지 조정">
           {GOAL_ADJUSTMENTS.map(([label, value]) => (
             <PolicyRow key={label} label={label} value={value} />
           ))}
@@ -64,22 +64,23 @@ export default function NutritionBasisScreen() {
           </ThemedText>
         </PolicySection>
 
-        <PolicySection title="매크로와 식이섬유">
-          <PolicyRow label="균형·유지·근육 증가" value="탄 55% · 단 20% · 지 25%" />
-          <PolicyRow label="체중 감량" value="탄 50% · 단 20% · 지 30%" />
+        <PolicySection title="매크로 · 식이섬유 정책">
+          <PolicyRow label="균형·유지·근육 증가" value="탄수화물 55% · 단백질 20% · 지방 25%" />
+          <PolicyRow label="체중 감량" value="탄수화물 50% · 단백질 20% · 지방 30%" />
           <PolicyRow label="식이섬유" value="KDRI 연령·성별 충분섭취량" />
         </PolicySection>
 
         <PolicySection title="자동 계산 제한">
           <ThemedText type="small" themeColor="textSecondary">
-            미성년자, 임신·수유, 섭식장애 위험, 임상 영양 관리, 저체중 감량, 75세 이상
-            체중 변경 목표는 자동 코칭 대신 제한 모드와 전문가 안내를 제공합니다.
+            미성년자, 임신·수유, 섭식장애 위험, 임상 영양 관리, 계산상 성별 또는 유효한
+            신체 정보 미입력, 매우 높은 활동량, 저체중 감량, 75세 이상 체중 변경 목표는
+            자동 코칭 대신 제한 모드와 전문가 안내를 제공합니다.
           </ThemedText>
         </PolicySection>
 
         <ThemedText type="small" themeColor="textSecondary" style={styles.disclaimer}>
-          이 목표는 일반 웰니스를 위한 추정치이며 의료 진단이나 처방이 아닙니다. 프로필을
-          변경하면 이후 목표만 새 버전으로 계산되고 과거 기록은 유지됩니다.
+          일반 웰니스를 위한 추정치이며 의료 진단이나 처방이 아닙니다. 프로필을 변경하면
+          이후 목표만 새 버전으로 계산되고 과거 기록은 유지됩니다.
         </ThemedText>
       </ThemedView>
     </ScrollView>
@@ -93,10 +94,24 @@ function PolicySection({
   title: string;
   children: ReactNode;
 }) {
+  const [expanded, setExpanded] = useState(false);
+
   return (
-    <ThemedView type="backgroundElement" style={styles.section}>
-      <ThemedText style={styles.sectionTitle}>{title}</ThemedText>
-      {children}
+    <ThemedView surface="inset" style={styles.section}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${title} ${expanded ? '접기' : '펼치기'}`}
+        accessibilityState={{ expanded }}
+        onPress={() => setExpanded((current) => !current)}
+        style={({ pressed }) => [styles.sectionControl, pressed && styles.pressed]}>
+        <ThemedText type="smallBold" style={styles.sectionTitle}>
+          {title}
+        </ThemedText>
+        <ThemedText type="small" themeColor="textSecondary">
+          {expanded ? '접기' : '보기'}
+        </ThemedText>
+      </Pressable>
+      {expanded ? <View style={styles.sectionContent}>{children}</View> : null}
     </ThemedView>
   );
 }
@@ -131,20 +146,31 @@ const styles = StyleSheet.create({
     paddingBottom: Spacing.two,
   },
   section: {
-    padding: Spacing.four,
-    borderRadius: 20,
-    gap: Spacing.three,
+    gap: Spacing.two,
+    overflow: 'hidden',
+  },
+  sectionControl: {
+    minHeight: 44,
+    paddingHorizontal: Spacing.three,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.two,
   },
   sectionTitle: {
-    fontSize: 18,
-    lineHeight: 26,
-    fontWeight: '700',
+    flex: 1,
+  },
+  sectionContent: {
+    gap: Spacing.three,
+    paddingHorizontal: Spacing.three,
+    paddingBottom: Spacing.three,
   },
   row: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     alignItems: 'flex-start',
     justifyContent: 'space-between',
-    gap: Spacing.three,
+    gap: Spacing.two,
   },
   rowValue: {
     flexShrink: 1,
@@ -152,5 +178,8 @@ const styles = StyleSheet.create({
   },
   disclaimer: {
     paddingHorizontal: Spacing.two,
+  },
+  pressed: {
+    opacity: 0.72,
   },
 });
