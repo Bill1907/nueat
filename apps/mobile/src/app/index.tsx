@@ -43,6 +43,9 @@ export default function HomeScreen() {
   const handleDashboardLoadComplete = useCallback(() => {
     setRefreshing(false);
   }, []);
+  const handleMealConfirmed = useCallback(() => {
+    setRefreshGeneration((generation) => generation + 1);
+  }, []);
 
 
   return (
@@ -76,12 +79,15 @@ export default function HomeScreen() {
           refreshGeneration={refreshGeneration}
           onLoadComplete={handleDashboardLoadComplete}
         />
-        <NextMealRecommendations refreshGeneration={refreshGeneration} />
-        <MealPhotoUploadCard
-          onMealConfirmed={() =>
-            setRefreshGeneration((generation) => generation + 1)
-          }
-        />
+        {session.data?.user.id ? (
+          <NextMealRecommendations
+            key={session.data.user.id}
+            refreshGeneration={refreshGeneration}
+            onMealConfirmed={handleMealConfirmed}
+            userId={session.data.user.id}
+          />
+        ) : null}
+        <MealPhotoUploadCard onMealConfirmed={handleMealConfirmed} />
 
         <View style={styles.sectionHeader}>
           <ThemedText type="smallBold">목표 계산 기준</ThemedText>

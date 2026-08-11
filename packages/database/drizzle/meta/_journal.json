@@ -71,6 +71,13 @@
       "when": 1786450200000,
       "tag": "0009_petite_nico_minoru",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1786433022312,
+      "tag": "0010_odd_jack_flag",
+      "breakpoints": true
     }
   ]
 }

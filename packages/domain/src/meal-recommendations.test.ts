@@ -29,8 +29,8 @@ function candidate(templateId: string, overrides: Partial<RankMealRecommendation
     templateId,
     titleKo: templateId,
     components: [
-      { foodId: `${templateId}-a`, nameKo: '음식 A', gramsMg: 100_000 },
-      { foodId: `${templateId}-b`, nameKo: '음식 B', gramsMg: 100_000 },
+      { foodId: `${templateId}-a`, nutrientProfileId: `${templateId}-profile-a`, nameKo: '음식 A', gramsMg: 100_000 },
+      { foodId: `${templateId}-b`, nutrientProfileId: `${templateId}-profile-b`, nameKo: '음식 B', gramsMg: 100_000 },
     ],
     nutrients: {
       energyMillicalories: 500_000,
@@ -75,7 +75,7 @@ describe('curated meal recommendation templates', () => {
 
 describe('rankMealRecommendations', () => {
   test('hard-blocks candidates containing an excluded food', () => {
-    const blocked = candidate('blocked', { components: [{ foodId: 'allergen', nameKo: '알레르겐', gramsMg: 100_000 }, { foodId: 'safe', nameKo: '안전식품', gramsMg: 100_000 }] });
+    const blocked = candidate('blocked', { components: [{ foodId: 'allergen', nutrientProfileId: 'allergen-profile', nameKo: '알레르겐', gramsMg: 100_000 }, { foodId: 'safe', nutrientProfileId: 'safe-profile', nameKo: '안전식품', gramsMg: 100_000 }] });
     expect(rankMealRecommendations(input({ candidates: [blocked, candidate('safe')], blockedFoodIds: ['allergen'] })).map((item) => item.templateId)).toEqual(['safe']);
   });
 
@@ -119,7 +119,7 @@ describe('rankMealRecommendations', () => {
 
   test('applies a 500 basis-point penalty to a recent food', () => {
     const fresh = candidate('fresh');
-    const recent = candidate('recent', { components: [{ foodId: 'recent-food', nameKo: '최근 음식', gramsMg: 100_000 }, { foodId: 'recent-b', nameKo: '최근 음식 B', gramsMg: 100_000 }] });
+    const recent = candidate('recent', { components: [{ foodId: 'recent-food', nutrientProfileId: 'recent-profile', nameKo: '최근 음식', gramsMg: 100_000 }, { foodId: 'recent-b', nutrientProfileId: 'recent-b-profile', nameKo: '최근 음식 B', gramsMg: 100_000 }] });
     const ranked = rankMealRecommendations(input({ candidates: [recent, fresh], recentFoodIds: ['recent-food'] }));
     expect(ranked.map((item) => item.templateId)).toEqual(['fresh', 'recent']);
     expect(ranked[0]!.scoreBps - ranked[1]!.scoreBps).toBe(500);

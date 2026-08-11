@@ -21,6 +21,7 @@ export interface MealRecommendationTemplate {
 
 export interface ResolvedMealRecommendationComponent {
   foodId: string;
+  nutrientProfileId: string;
   nameKo: string;
   gramsMg: number;
 }

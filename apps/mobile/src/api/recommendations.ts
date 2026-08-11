@@ -1,4 +1,5 @@
 import { apiRequest } from '@/api/client';
+import type { MealDraftResponse } from '@/api/meal-drafts';
 
 export type RecommendationNutrition = {
   energyMillicalories: number | null;
@@ -10,6 +11,7 @@ export type RecommendationNutrition = {
 
 export type RecommendationComponent = {
   foodId: string;
+  nutrientProfileId: string;
   nameKo: string;
   gramsMg: number;
 };
@@ -55,4 +57,18 @@ export function getNextMealRecommendation(signal?: AbortSignal) {
     method: 'POST',
     signal,
   });
+}
+export function createRecommendationMealDraft(
+  recommendationId: string,
+  candidateRank: 1 | 2 | 3,
+  signal?: AbortSignal,
+) {
+  return apiRequest<MealDraftResponse>(
+    `/api/recommendations/${recommendationId}/meal-draft`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ candidateRank }),
+      signal,
+    },
+  );
 }

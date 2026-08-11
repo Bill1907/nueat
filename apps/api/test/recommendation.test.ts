@@ -8,6 +8,7 @@ import {
   nutrientProfiles,
   nutritionProfiles,
   recommendations,
+  recommendationMealDrafts,
   userProfiles,
   type Database,
 } from '@nueat/database';
@@ -212,6 +213,107 @@ describe('next recommendation route', () => {
     });
   });
 });
+describe('recommendation meal draft route', () => {
+  const recommendationId = '00000000-0000-4000-8000-000000000100';
+
+  test('requires authentication and validates the exact rank body', async () => {
+    const { server } = await createDraftServer(false);
+    expect((await server.inject({ method: 'POST', url: `/api/recommendations/${recommendationId}/meal-draft`, payload: { candidateRank: 1 } })).statusCode).toBe(401);
+
+    const authenticated = await createDraftServer(true);
+    for (const payload of [{}, { candidateRank: 0 }, { candidateRank: 4 }, { candidateRank: 1.5 }, { candidateRank: 1, extra: true }]) {
+      const response = await authenticated.server.inject({ method: 'POST', url: `/api/recommendations/${recommendationId}/meal-draft`, payload });
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body).error.code).toBe('INVALID_REQUEST');
+    }
+  });
+
+  test('fails closed for an unowned recommendation and persisted safety flags', async () => {
+    const unowned = await createDraftServer(true, { recommendation: { ...draftRecommendation(), userId: 'another-user' } });
+    const notFound = await unowned.server.inject({ method: 'POST', url: `/api/recommendations/${recommendationId}/meal-draft`, payload: { candidateRank: 1 } });
+    expect(notFound.statusCode).toBe(404);
+    expect(JSON.parse(notFound.body).error.code).toBe('RECOMMENDATION_NOT_FOUND');
+
+    const unsafe = await createDraftServer(true, { recommendation: { ...draftRecommendation(), safetyFlags: ['UNRESOLVED_DIETARY_CONSTRAINT'] } });
+    const response = await unsafe.server.inject({ method: 'POST', url: `/api/recommendations/${recommendationId}/meal-draft`, payload: { candidateRank: 1 } });
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error.code).toBe('RECOMMENDATION_SAFETY_UNAVAILABLE');
+    expect(unsafe.database.mealLogInserts).toHaveLength(0);
+  });
+
+  test.each([
+    ['mismatched', { foodId: '00000000-0000-4000-8000-000000000999' }],
+    ['untrusted', { sourceKind: 'untrusted' }],
+    ['deprecated', { foodDeprecated: true }],
+    ['unverified', { qualityGrade: 'unverified' }],
+  ])('fails closed for %s persisted provenance', async (_name, profilePatch) => {
+    const { server, database } = await createDraftServer(true, { profilePatch });
+    const response = await server.inject({ method: 'POST', url: `/api/recommendations/${recommendationId}/meal-draft`, payload: { candidateRank: 1 } });
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error.code).toBe('RECOMMENDATION_PROVENANCE_UNAVAILABLE');
+    expect(database.mealLogInserts).toHaveLength(0);
+  });
+
+  test('allows an estimated profile from a trusted source', async () => {
+    const { server } = await createDraftServer(true, {
+      profilePatch: { qualityGrade: 'estimated' },
+    });
+    const response = await server.inject({
+      method: 'POST',
+      url: `/api/recommendations/${recommendationId}/meal-draft`,
+      payload: { candidateRank: 1 },
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(JSON.parse(response.body).items[0]).toMatchObject({
+      nutrientProfileId: '00000000-0000-4000-8000-000000000301',
+    });
+  });
+
+  test('creates exactly the persisted candidate as a manual image-less draft and replays its rank', async () => {
+    const { server, database } = await createDraftServer(true);
+    const first = await server.inject({ method: 'POST', url: `/api/recommendations/${recommendationId}/meal-draft`, payload: { candidateRank: 1 } });
+    const body = JSON.parse(first.body);
+    expect(first.statusCode).toBe(201);
+    expect(body.mealLog).toMatchObject({ status: 'draft', recognitionStatus: 'manual', recognitionNextAttemptAt: null, imageAssetId: null });
+    expect(body.items).toEqual([expect.objectContaining({
+      recognizedLabel: '저장된 음식',
+      foodId: '00000000-0000-4000-8000-000000000201',
+      nutrientProfileId: '00000000-0000-4000-8000-000000000301',
+      unit: 'g',
+      amountMilliunits: 125_000,
+      gramsMg: 125_000,
+    })]);
+    expect(database.draftLinks).toEqual([expect.objectContaining({ recommendationId, candidateRank: 1, mealLogId: body.mealLog.id })]);
+
+    const replay = await server.inject({ method: 'POST', url: `/api/recommendations/${recommendationId}/meal-draft`, payload: { candidateRank: 1 } });
+    expect(replay.statusCode).toBe(200);
+    expect(JSON.parse(replay.body)).toEqual(body);
+    const conflict = await server.inject({ method: 'POST', url: `/api/recommendations/${recommendationId}/meal-draft`, payload: { candidateRank: 2 } });
+    expect(conflict.statusCode).toBe(409);
+    expect(JSON.parse(conflict.body).error.code).toBe('RECOMMENDATION_ALREADY_ACTIONED');
+    expect(database.transactions).toBe(3);
+  });
+
+  test.each(['confirmed', 'deleted'] as const)('does not replay a linked %s meal as a draft', async (status) => {
+    const { server, database } = await createDraftServer(true);
+    const created = await server.inject({
+      method: 'POST',
+      url: `/api/recommendations/${recommendationId}/meal-draft`,
+      payload: { candidateRank: 1 },
+    });
+    expect(created.statusCode).toBe(201);
+    database.mealLogInserts[0]!.status = status;
+
+    const replay = await server.inject({
+      method: 'POST',
+      url: `/api/recommendations/${recommendationId}/meal-draft`,
+      payload: { candidateRank: 1 },
+    });
+    expect(replay.statusCode).toBe(409);
+    expect(JSON.parse(replay.body).error.code).toBe('RECOMMENDATION_ALREADY_ACTIONED');
+  });
+});
 
 type Fixture = {
   userProfile?: { timezone: string; onboardingStatus: string } | undefined;
@@ -304,6 +406,124 @@ function snapshot(mealLogId: string, sequence: number, energyMillicalories: numb
 async function createServer(authenticated: boolean, fixture: Fixture = {}) {
   const auth = { api: { getSession: async () => authenticated ? { user: { id: 'user-id', email: 'user@example.com' }, session: {} } : null } } as unknown as Auth;
   const database = new RecommendationDatabaseFake(fixture);
+  const server = await buildServer({ environment, database: database as unknown as Database, auth });
+  servers.push(server);
+  return { server, database };
+}
+type DraftFixture = {
+  recommendation?: Record<string, unknown>;
+  profilePatch?: Record<string, unknown>;
+};
+
+class DraftDatabaseFake {
+  readonly mealLogInserts: Array<Record<string, unknown>> = [];
+  readonly draftLinks: Array<Record<string, unknown>> = [];
+  readonly itemInserts: Array<Record<string, unknown>> = [];
+  transactions = 0;
+  private readonly fixture: DraftFixture;
+
+  constructor(fixture: DraftFixture) { this.fixture = fixture; }
+  async transaction<T>(callback: (tx: this) => Promise<T>) { this.transactions++; return callback(this); }
+  async execute() {}
+  select() { return { from: (table: unknown) => new DraftQueryFake(() => this.rows(table)) }; }
+  insert(table: unknown) {
+    return {
+      values: (value: Record<string, unknown> | Array<Record<string, unknown>>) => {
+        const returning = async () => {
+          const values = Array.isArray(value) ? value : [value];
+          if (table === mealLogs) {
+            const rows = values.map((row, index) => ({ id: `draft-${this.mealLogInserts.length + index + 1}`, ...row }));
+            this.mealLogInserts.push(...rows);
+            return rows;
+          }
+          if (table === mealItems) {
+            const rows = values.map((row, index) => ({ id: `item-${this.itemInserts.length + index + 1}`, ...row }));
+            this.itemInserts.push(...rows);
+            return rows;
+          }
+          return [];
+        };
+        return {
+          returning,
+          then: (resolve: (value: unknown) => void) => {
+            if (table === recommendationMealDrafts) this.draftLinks.push(value as Record<string, unknown>);
+            resolve(undefined);
+          },
+        };
+      },
+    };
+  }
+  private rows(table: unknown): unknown[] {
+    if (table === recommendationMealDrafts) {
+      return this.draftLinks.map((link) => ({
+        candidateRank: link.candidateRank,
+        mealLog: this.mealLogInserts.find((meal) => meal.id === link.mealLogId),
+      }));
+    }
+    if (table === recommendations) {
+      const recommendation = this.fixture.recommendation ?? draftRecommendation();
+      return recommendation.userId === 'user-id' ? [recommendation] : [];
+    }
+    if (table === userProfiles) return [{ timezone: 'Asia/Seoul', onboardingStatus: 'completed' }];
+    if (table === nutrientProfiles) return [{ ...draftProfile(), ...this.fixture.profilePatch }];
+    if (table === mealItems) return this.itemInserts;
+    return [];
+  }
+}
+
+class DraftQueryFake {
+  constructor(private readonly result: () => unknown[]) {}
+  innerJoin() { return this; }
+  where() { return this; }
+  limit() { return this; }
+  then<TResult1 = unknown[], TResult2 = never>(
+    onfulfilled?: ((value: unknown[]) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ) { return Promise.resolve(this.result()).then(onfulfilled, onrejected); }
+}
+
+function draftRecommendation() {
+  return {
+    id: '00000000-0000-4000-8000-000000000100',
+    userId: 'user-id',
+    safetyFlags: [],
+    contextSnapshot: {
+      selectedNutrientProfiles: [{
+        id: '00000000-0000-4000-8000-000000000301',
+        foodId: '00000000-0000-4000-8000-000000000201',
+        sourceRegistryId: '00000000-0000-4000-8000-000000000401',
+        sourceItemId: 'stored-food',
+        datasetVersion: '2026-01',
+      }],
+    },
+    candidateItems: [{
+      rank: 1,
+      components: [{
+        foodId: '00000000-0000-4000-8000-000000000201',
+        nutrientProfileId: '00000000-0000-4000-8000-000000000301',
+        nameKo: '저장된 음식',
+        gramsMg: 125_000,
+      }],
+    }],
+  };
+}
+
+function draftProfile() {
+  return {
+    id: '00000000-0000-4000-8000-000000000301',
+    foodId: '00000000-0000-4000-8000-000000000201',
+    sourceRegistryId: '00000000-0000-4000-8000-000000000401',
+    sourceItemId: 'stored-food',
+    datasetVersion: '2026-01',
+    qualityGrade: 'verified',
+    foodDeprecated: false,
+    sourceKind: 'public_dataset',
+  };
+}
+
+async function createDraftServer(authenticated: boolean, fixture: DraftFixture = {}) {
+  const auth = { api: { getSession: async () => authenticated ? { user: { id: 'user-id', email: 'user@example.com' }, session: {} } : null } } as unknown as Auth;
+  const database = new DraftDatabaseFake(fixture);
   const server = await buildServer({ environment, database: database as unknown as Database, auth });
   servers.push(server);
   return { server, database };

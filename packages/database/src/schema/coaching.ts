@@ -1,6 +1,8 @@
-import { index, jsonb, pgEnum, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
+import { check, index, integer, jsonb, pgEnum, pgTable, text, timestamp, uuid } from 'drizzle-orm/pg-core';
 
 import { users } from './auth';
+import { mealLogs } from './meal';
 
 export const feedbackTargetTypeEnum = pgEnum('feedback_target_type', [
   'recognition',
@@ -44,7 +46,7 @@ export interface RecommendationCandidateSnapshot {
   templateId: string;
   titleKo: string;
   scoreBps: number;
-  components: Array<{ foodId: string; nameKo: string; gramsMg: number }>;
+  components: Array<{ foodId: string; nutrientProfileId: string; nameKo: string; gramsMg: number }>;
   nutrition: RecommendationNutrientSnapshot;
   projectedTotals: RecommendationNutrientSnapshot;
   rationaleFacts: RecommendationRationaleSnapshot[];
@@ -69,6 +71,26 @@ export const recommendations = pgTable(
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [index('recommendation_user_created_idx').on(table.userId, table.createdAt)],
+);
+export const recommendationMealDrafts = pgTable(
+  'recommendation_meal_draft',
+  {
+    recommendationId: uuid('recommendation_id')
+      .primaryKey()
+      .references(() => recommendations.id, { onDelete: 'cascade' }),
+    mealLogId: uuid('meal_log_id')
+      .notNull()
+      .unique()
+      .references(() => mealLogs.id, { onDelete: 'restrict' }),
+    candidateRank: integer('candidate_rank').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    check(
+      'recommendation_meal_draft_candidate_rank_check',
+      sql`${table.candidateRank} between 1 and 3`,
+    ),
+  ],
 );
 
 export const feedback = pgTable(
