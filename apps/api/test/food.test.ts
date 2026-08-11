@@ -41,12 +41,13 @@ describe('canonical food routes', () => {
     expect(JSON.parse(response.body).error.code).toBe('UNAUTHORIZED');
   });
 
-  test('normalizes exact aliases, orders deterministically, and limits results', async () => {
+  test('normalizes exact aliases, orders deterministically, deduplicates foods, and limits results', async () => {
     const server = await createServer(true, {
       aliases: [
-        foodAlias('김치나', '00000000-0000-4000-8000-000000000005'),
         foodAlias('김치', foodId),
-        foodAlias('김치다', '00000000-0000-4000-8000-000000000006'),
+        foodAlias('김치가', foodId),
+        foodAlias('김치나', '00000000-0000-4000-8000-000000000005'),
+        foodAlias('백김치', '00000000-0000-4000-8000-000000000006'),
       ],
       profiles: [
         { id: profileId, foodId, qualityGrade: 'verified', datasetVersion: '2026-01' },
@@ -74,6 +75,27 @@ describe('canonical food routes', () => {
       foodId,
       '00000000-0000-4000-8000-000000000005',
     ]);
+  });
+
+  test('bounds the distinct eligible food query to the requested result limit', async () => {
+    const searchCandidateLimits: number[] = [];
+    const server = await createServer(true, {
+      aliases: Array.from({ length: 150 }, (_, index) =>
+        foodAlias(
+          `김치${index}`,
+          `00000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`,
+        ),
+      ),
+      searchCandidateLimits,
+    });
+
+    const response = await server.inject({
+      method: 'GET',
+      url: '/api/foods/search?q=김치&limit=20',
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(searchCandidateLimits).toEqual([20]);
   });
 
   test('returns no results and rejects malformed queries', async () => {
@@ -252,6 +274,7 @@ async function createServer(
     mealStatus?: string;
     profiles?: Record<string, unknown>[];
     food?: Record<string, unknown> | null;
+    searchCandidateLimits?: number[];
   } = {},
 ) {
   const state = {
@@ -304,6 +327,7 @@ async function createServer(
         qualityGrade: 'verified',
       },
     ],
+    searchCandidateLimits: overrides.searchCandidateLimits,
     servings: [],
   };
   const auth = {
@@ -328,18 +352,28 @@ function databaseMock(state: Record<string, any>) {
     if (table === mealItems) return [state.item];
     return [];
   };
-  const query = (rows: any[]) => ({
-    for: () => query(rows),
-    limit: async () => rows.slice(0, 1),
-    orderBy: () => query(rows),
+  const query = (rows: any[], table?: unknown) => ({
+    for: () => query(rows, table),
+    groupBy: () =>
+      query(
+        table === foodAliases
+          ? [...new Map(rows.map((row) => [row.foodId, row])).values()]
+          : rows,
+        table,
+      ),
+    limit: async (limit: number) => {
+      if (table === foodAliases) state.searchCandidateLimits?.push(limit);
+      return rows.slice(0, limit);
+    },
+    orderBy: () => query(rows, table),
     then: (resolve: (value: any[]) => unknown) => Promise.resolve(rows).then(resolve),
   });
   const database = {
     transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(database),
     select: () => ({
       from: (table: unknown) => ({
-        innerJoin: () => ({ where: () => query(resultFor(table)) }),
-        where: () => query(resultFor(table)),
+        innerJoin: () => ({ where: () => query(resultFor(table), table) }),
+        where: () => query(resultFor(table), table),
       }),
     }),
     update: (table: unknown) => ({

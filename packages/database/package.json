@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "db:check": "drizzle-kit check"
+    "db:check": "drizzle-kit check",
+    "db:import:data-go-foods": "bun run src/fixtures/import-data-go-foods.ts"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

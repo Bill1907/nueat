@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { describe, expect, test } from 'bun:test';
-import { imageAssets, recognitionDailyUsages } from '@nueat/database';
+import { foodAliases, imageAssets, nutrientProfiles, recognitionDailyUsages } from '@nueat/database';
 
 import { MealRecognitionCoordinator } from '../src/services/meal-recognition-coordinator';
 import {
@@ -13,6 +13,7 @@ import {
   MEAL_RECOGNITION_SCHEMA_VERSION,
   MealRecognitionFailure,
   type MealRecognizer,
+  type RecognitionResultV1,
 } from '../src/services/meal-recognizer';
 
 const bytes = new Uint8Array([1, 2, 3]);
@@ -44,6 +45,9 @@ type State = {
   assetStatus: 'processing' | 'processed';
   transactions: number;
   transactionOpen: boolean;
+  aliasQueries: { foodId: string; isDeprecated: boolean; isComposite?: boolean }[][];
+  profiles: { id: string; qualityGrade: string; datasetVersion: string }[];
+  mappingLookupFails: boolean;
 };
 
 function state(overrides: Partial<State> = {}): State {
@@ -61,6 +65,9 @@ function state(overrides: Partial<State> = {}): State {
     assetStatus: 'processing',
     transactions: 0,
     transactionOpen: false,
+    aliasQueries: [],
+    profiles: [],
+    mappingLookupFails: false,
     ...overrides,
   };
 }
@@ -68,30 +75,45 @@ function state(overrides: Partial<State> = {}): State {
 function fakeDatabase(s: State) {
   const select = (fields: Record<string, unknown>) => ({
     from(table: unknown) {
+      const applyWhere = () => {
+        const rows = async () => {
+          if (table === foodAliases) {
+            if (s.mappingLookupFails) throw new Error('mapping lookup failed');
+            return s.aliasQueries.shift() ?? [];
+          }
+          if (table === nutrientProfiles) {
+            if (s.mappingLookupFails) throw new Error('mapping lookup failed');
+            return s.profiles;
+          }
+          if (table === imageAssets) {
+            return s.assetStatus === 'processing'
+              ? [{ id: 'asset', objectKey: 'private/key', byteSize: bytes.byteLength, contentType: 'image/png', sha256 }]
+              : [];
+          }
+          if (table === recognitionDailyUsages) return [];
+          if (s.deleted) return [];
+          return [{
+            id: 'meal', recognitionStatus: s.status,
+            recognitionLeaseExpiresAt: s.leaseExpiresAt,
+            recognitionNextAttemptAt: s.nextAttemptAt,
+            recognitionAttemptCount: s.attempts,
+            imageAssetId: 'asset', eatenLocalDate: '2026-08-11',
+          }];
+        };
+        return {
+          limit: rows,
+          then(
+            resolve: (value: Awaited<ReturnType<typeof rows>>) => void,
+            reject: (reason: unknown) => void,
+          ) {
+            return rows().then(resolve, reject);
+          },
+        };
+      };
       return {
-        where() {
-          const rows = async () => {
-            if (table === imageAssets) {
-              return s.assetStatus === 'processing'
-                ? [{ id: 'asset', objectKey: 'private/key', byteSize: bytes.byteLength, contentType: 'image/png', sha256 }]
-                : [];
-            }
-            if (table === recognitionDailyUsages) return [];
-            if (s.deleted) return [];
-            return [{
-              id: 'meal', recognitionStatus: s.status,
-              recognitionLeaseExpiresAt: s.leaseExpiresAt,
-              recognitionNextAttemptAt: s.nextAttemptAt,
-              recognitionAttemptCount: s.attempts,
-              imageAssetId: 'asset', eatenLocalDate: '2026-08-11',
-            }];
-          };
-          return {
-            limit: rows,
-            then(resolve: (value: Awaited<ReturnType<typeof rows>>) => void) {
-              return rows().then(resolve);
-            },
-          };
+        where: applyWhere,
+        innerJoin() {
+          return { where: applyWhere };
         },
       };
     },
@@ -209,6 +231,7 @@ function makeCoordinator(s: State, options: {
   object?: Partial<{ bytes: Uint8Array; contentType: string; byteSize: number; error: Error }>;
   onRead?: () => void;
   recognize?: (input: Parameters<MealRecognizer['recognize']>[0]) => ReturnType<MealRecognizer['recognize']>;
+  result?: RecognitionResultV1;
 } = {}) {
   const objectStore: ImageObjectStore = {
     createUploadUrl: async () => '', createDownloadUrl: async () => '', deleteObject: async () => {},
@@ -225,7 +248,7 @@ function makeCoordinator(s: State, options: {
   const recognizer: MealRecognizer = {
     recognize: options.recognize ?? (async () => ({
       provider: 'mock', model: 'test', promptVersion: MEAL_RECOGNITION_PROMPT_VERSION,
-      schemaVersion: MEAL_RECOGNITION_SCHEMA_VERSION, inputTokens: 1, outputTokens: 1, result,
+      schemaVersion: MEAL_RECOGNITION_SCHEMA_VERSION, inputTokens: 1, outputTokens: 1, result: options.result ?? result,
     })),
   };
   return new MealRecognitionCoordinator({
@@ -249,6 +272,96 @@ describe('MealRecognitionCoordinator', () => {
     expect(s.assetStatus).toBe('processed');
     expect(s.items).toHaveLength(1);
     expect(s.items[0]).toMatchObject({ foodId: null, nutrientProfileId: null, gramsMg: null, mappingConfidenceBps: null });
+  });
+  test('maps a unique primary exact alias to its deterministically selected profile', async () => {
+    const s = state({
+      aliasQueries: [[{ foodId: 'food-a', isDeprecated: false }]],
+      profiles: [
+        { id: 'estimated-new', qualityGrade: 'estimated', datasetVersion: '2025-01' },
+        { id: 'verified-old', qualityGrade: 'verified', datasetVersion: '2024-01' },
+        { id: 'verified-new-b', qualityGrade: 'verified', datasetVersion: '2025-01' },
+        { id: 'verified-new-a', qualityGrade: 'verified', datasetVersion: '2025-01' },
+      ],
+    });
+
+    await expect(makeCoordinator(s).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
+    expect(s.items[0]).toMatchObject({
+      foodId: 'food-a',
+      nutrientProfileId: 'verified-new-a',
+      mappingConfidenceBps: 10_000,
+      gramsMg: null,
+    });
+  });
+
+  test('uses exact normalized candidate aliases only when the primary label has no aliases', async () => {
+    const candidateResult: RecognitionResultV1 = {
+      foods: [{ ...result.foods[0]!, recognizedLabel: 'unmapped', candidateLabels: [' 김 밥!! '] }],
+    };
+    const s = state({
+      aliasQueries: [[], [{ foodId: 'food-kimbap', isDeprecated: false }]],
+      profiles: [{ id: 'profile', qualityGrade: 'verified', datasetVersion: '2025' }],
+    });
+
+    await expect(makeCoordinator(s, { result: candidateResult }).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
+    expect(s.items[0]).toMatchObject({
+      foodId: 'food-kimbap',
+      nutrientProfileId: 'profile',
+      mappingConfidenceBps: 10_000,
+    });
+  });
+
+  test('leaves ambiguous and deprecated exact aliases unmapped', async () => {
+    const ambiguous = state({
+      aliasQueries: [[
+        { foodId: 'food-a', isDeprecated: false },
+        { foodId: 'food-b', isDeprecated: false },
+      ]],
+      profiles: [{ id: 'profile', qualityGrade: 'verified', datasetVersion: '2025' }],
+    });
+    const deprecated = state({
+      aliasQueries: [[{ foodId: 'old-food', isDeprecated: true }]],
+      profiles: [{ id: 'profile', qualityGrade: 'verified', datasetVersion: '2025' }],
+    });
+
+    await expect(makeCoordinator(ambiguous).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
+    await expect(makeCoordinator(deprecated).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
+    expect(ambiguous.items[0]).toMatchObject({ foodId: null, nutrientProfileId: null, mappingConfidenceBps: null });
+    expect(deprecated.items[0]).toMatchObject({ foodId: null, nutrientProfileId: null, mappingConfidenceBps: null });
+  });
+  test('prefers one curated composite Food when expanded data has duplicate exact aliases', async () => {
+    const s = state({
+      aliasQueries: [[
+        { foodId: 'food-generic', isDeprecated: false, isComposite: true },
+        { foodId: 'food-duplicate', isDeprecated: false, isComposite: false },
+      ]],
+      profiles: [{ id: 'profile', qualityGrade: 'verified', datasetVersion: '2026' }],
+    });
+
+    await expect(makeCoordinator(s).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
+    expect(s.items[0]).toMatchObject({
+      foodId: 'food-generic',
+      nutrientProfileId: 'profile',
+      mappingConfidenceBps: 10_000,
+    });
+  });
+
+  test('leaves a food without a trusted complete eligible profile unmapped', async () => {
+    const s = state({ aliasQueries: [[{ foodId: 'food-a', isDeprecated: false }]] });
+
+    await expect(makeCoordinator(s).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
+    expect(s.items[0]).toMatchObject({ foodId: null, nutrientProfileId: null, mappingConfidenceBps: null });
+  });
+
+  test('keeps canonical mapping infrastructure failures retryable instead of finalizing unmapped', async () => {
+    const s = state({ mappingLookupFails: true });
+
+    await expect(makeCoordinator(s).recognize('meal', 'user')).resolves.toMatchObject({
+      status: 'unavailable',
+      code: 'CATALOG_UNAVAILABLE',
+      retryable: true,
+    });
+    expect(s.status).toBe('failed');
+    expect(s.items).toHaveLength(0);
   });
 
   test('returns active with a retry interval for a live lease', async () => {

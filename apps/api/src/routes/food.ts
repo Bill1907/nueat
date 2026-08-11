@@ -6,7 +6,7 @@ import {
   sourceRegistries,
   type Database,
 } from '@nueat/database';
-import { and, asc, eq, inArray, like, or } from 'drizzle-orm';
+import { and, asc, eq, exists, inArray, like, or, sql } from 'drizzle-orm';
 import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
@@ -53,13 +53,43 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
     const normalizedQuery = normalizeFoodQuery(parsed.data.q);
     if (!normalizedQuery) return invalidRequest(reply, request);
 
-    const matches = await options.database
+    const aliasMatchRank = sql<number>`
+      case
+        when ${foodAliases.normalizedAliasKo} = ${normalizedQuery} then 0
+        when ${foodAliases.normalizedAliasKo} like ${`${normalizedQuery}%`} then 1
+        else 2
+      end
+    `;
+    const bestAliasRank = sql<number>`min(${aliasMatchRank})`;
+    const bestAlias = sql<string>`min(${foodAliases.normalizedAliasKo})`;
+    const eligibleProfile = options.database
+      .select({ one: sql`1` })
+      .from(nutrientProfiles)
+      .innerJoin(
+        sourceRegistries,
+        eq(nutrientProfiles.sourceRegistryId, sourceRegistries.id),
+      )
+      .where(
+        and(
+          eq(nutrientProfiles.foodId, foods.id),
+          or(
+            eq(nutrientProfiles.qualityGrade, 'verified'),
+            eq(nutrientProfiles.qualityGrade, 'estimated'),
+          ),
+          inArray(sourceRegistries.kind, [...trustedNutritionSourceKinds]),
+          sql`${nutrientProfiles.energyMillicalories} is not null`,
+          sql`${nutrientProfiles.carbohydrateMg} is not null`,
+          sql`${nutrientProfiles.proteinMg} is not null`,
+          sql`${nutrientProfiles.fatMg} is not null`,
+        ),
+      );
+    const foodMatches = await options.database
       .select({
         foodId: foods.id,
         canonicalNameKo: foods.canonicalNameKo,
         category: foods.category,
         preparation: foods.preparation,
-        alias: foodAliases.normalizedAliasKo,
+        alias: bestAlias,
       })
       .from(foodAliases)
       .innerJoin(foods, eq(foodAliases.foodId, foods.id))
@@ -70,24 +100,22 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
             eq(foodAliases.normalizedAliasKo, normalizedQuery),
             like(foodAliases.normalizedAliasKo, `%${normalizedQuery}%`),
           ),
+          exists(eligibleProfile),
         ),
-      );
-
-    const foodMatches = [...matches]
-      .sort((left, right) => {
-        const leftRank = matchRank(left.alias, normalizedQuery);
-        const rightRank = matchRank(right.alias, normalizedQuery);
-        return (
-          leftRank - rightRank ||
-          left.alias.localeCompare(right.alias, 'ko') ||
-          left.canonicalNameKo.localeCompare(right.canonicalNameKo, 'ko') ||
-          left.foodId.localeCompare(right.foodId)
-        );
-      })
-      .filter((match, index, all) =>
-        all.slice(0, index).every((candidate) => candidate.foodId !== match.foodId),
       )
-      .slice(0, parsed.data.limit);
+      .groupBy(
+        foods.id,
+        foods.canonicalNameKo,
+        foods.category,
+        foods.preparation,
+      )
+      .orderBy(
+        bestAliasRank,
+        bestAlias,
+        asc(foods.canonicalNameKo),
+        asc(foods.id),
+      )
+      .limit(parsed.data.limit);
 
     if (!foodMatches.length) return { foods: [] };
 
@@ -320,12 +348,6 @@ export function normalizeFoodQuery(value: string) {
     .normalize('NFC')
     .toLowerCase()
     .replace(/[\s\p{P}\p{S}]+/gu, '');
-}
-
-function matchRank(alias: string, query: string) {
-  if (alias === query) return 0;
-  if (alias.startsWith(query)) return 1;
-  return 2;
 }
 
 function compareProfiles(
