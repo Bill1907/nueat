@@ -204,7 +204,7 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
       const [updated] = await tx.update(mealLogs).set({
         recognitionStatus: 'ready', recognitionProvider: output.provider, recognitionModel: output.model,
         recognitionPromptVersion: output.promptVersion, recognitionSchemaVersion: output.schemaVersion,
-        recognitionResult: result, recognitionCompletedAt: now, recognitionProviderRequestId: output.providerRequestId ?? null,
+        recognitionResult: jsonbSql(result), recognitionCompletedAt: now, recognitionProviderRequestId: output.providerRequestId ?? null,
         recognitionInputTokens: output.inputTokens, recognitionOutputTokens: output.outputTokens,
         recognitionLeaseToken: null, recognitionLeaseExpiresAt: null, recognitionNextAttemptAt: null, recognitionLastErrorCode: null, updatedAt: now,
       }).where(and(eq(mealLogs.id, claim.mealLogId), eq(mealLogs.userId, claim.userId), eq(mealLogs.status, 'draft'), eq(mealLogs.recognitionStatus, 'processing'), eq(mealLogs.recognitionLeaseToken, claim.leaseToken))).returning({ id: mealLogs.id });
@@ -285,4 +285,9 @@ function nextRetryAt(code: string, now: Date, retryable: boolean) {
   return new Date(now.getTime() + 60_000);
 }
 function recognitionErrorCode(error: unknown, timedOut: boolean) { if (timedOut || error instanceof ImageObjectReadAbortedError) return 'DEADLINE_EXCEEDED'; if (error instanceof ImageObjectNotFoundError) return 'ASSET_NOT_FOUND'; if (error instanceof ImageObjectTooLargeError) return 'ASSET_TOO_LARGE'; if (error instanceof ImageObjectStoreError) return 'ASSET_UNAVAILABLE'; if (error instanceof MealRecognitionFailure) return error.code; return 'PROVIDER_UNAVAILABLE'; }
+function jsonbSql(value: unknown) {
+  const json = JSON.stringify(value);
+  if (json === undefined) throw new Error('Recognition result is not JSON serializable');
+  return sql.raw(`'${json.replaceAll("'", "''")}'::jsonb`);
+}
 class DailyQuotaExceededError extends Error {}
