@@ -19,6 +19,21 @@ const searchQuerySchema = z
     limit: z.coerce.number().int().min(1).max(20).default(10),
   })
   .strict();
+const foodParamsSchema = z
+  .object({
+    foodId: z.string().uuid(),
+  })
+  .strict();
+const foodQuerySchema = z
+  .object({
+    nutrientProfileId: z.string().uuid().optional(),
+  })
+  .strict();
+const trustedNutritionSourceKinds = [
+  'public_dataset',
+  'manufacturer',
+  'commercial_dataset',
+] as const;
 
 interface FoodRouteOptions {
   auth: Auth;
@@ -107,6 +122,7 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
               eq(nutrientProfiles.qualityGrade, 'verified'),
               eq(nutrientProfiles.qualityGrade, 'estimated'),
             ),
+            inArray(sourceRegistries.kind, [...trustedNutritionSourceKinds]),
           ),
         ),
       options.database
@@ -120,7 +136,20 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
           qualityGrade: foodServings.qualityGrade,
         })
         .from(foodServings)
-        .where(inArray(foodServings.foodId, foodIds))
+        .innerJoin(
+          sourceRegistries,
+          eq(foodServings.sourceRegistryId, sourceRegistries.id),
+        )
+        .where(
+          and(
+            inArray(foodServings.foodId, foodIds),
+            or(
+              eq(foodServings.qualityGrade, 'verified'),
+              eq(foodServings.qualityGrade, 'estimated'),
+            ),
+            inArray(sourceRegistries.kind, [...trustedNutritionSourceKinds]),
+          ),
+        )
         .orderBy(asc(foodServings.labelKo), asc(foodServings.id)),
     ]);
 
@@ -165,6 +194,123 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
             servings: servingsByFood.get(food.foodId) ?? [],
           };
         }),
+    };
+  });
+  app.get('/api/foods/:foodId', async (request, reply) => {
+    const userId = await requireUserId(request, reply, options.auth);
+    if (!userId) return;
+    const parsed = foodParamsSchema.safeParse(request.params);
+    if (!parsed.success) return invalidRequest(reply, request);
+    const parsedQuery = foodQuerySchema.safeParse(request.query);
+    if (!parsedQuery.success) return invalidRequest(reply, request);
+
+    const [food] = await options.database
+      .select({
+        id: foods.id,
+        canonicalNameKo: foods.canonicalNameKo,
+        category: foods.category,
+        preparation: foods.preparation,
+      })
+      .from(foods)
+      .where(and(eq(foods.id, parsed.data.foodId), eq(foods.isDeprecated, false)))
+      .limit(1);
+    if (!food) return foodNotFound(reply, request);
+
+    const [profiles, servings] = await Promise.all([
+      options.database
+        .select({
+          id: nutrientProfiles.id,
+          foodId: nutrientProfiles.foodId,
+          sourceRegistryId: nutrientProfiles.sourceRegistryId,
+          sourceCode: sourceRegistries.code,
+          sourceDisplayName: sourceRegistries.displayName,
+          sourceItemId: nutrientProfiles.sourceItemId,
+          datasetVersion: nutrientProfiles.datasetVersion,
+          basisAmountMg: nutrientProfiles.basisAmountMg,
+          energyMillicalories: nutrientProfiles.energyMillicalories,
+          carbohydrateMg: nutrientProfiles.carbohydrateMg,
+          proteinMg: nutrientProfiles.proteinMg,
+          fatMg: nutrientProfiles.fatMg,
+          fiberMg: nutrientProfiles.fiberMg,
+          qualityGrade: nutrientProfiles.qualityGrade,
+        })
+        .from(nutrientProfiles)
+        .innerJoin(
+          sourceRegistries,
+          eq(nutrientProfiles.sourceRegistryId, sourceRegistries.id),
+        )
+        .where(
+          and(
+            eq(nutrientProfiles.foodId, food.id),
+            ...(parsedQuery.data.nutrientProfileId
+              ? [eq(nutrientProfiles.id, parsedQuery.data.nutrientProfileId)]
+              : []),
+            or(
+              eq(nutrientProfiles.qualityGrade, 'verified'),
+              eq(nutrientProfiles.qualityGrade, 'estimated'),
+            ),
+            inArray(sourceRegistries.kind, [...trustedNutritionSourceKinds]),
+          ),
+        ),
+      options.database
+        .select({
+          id: foodServings.id,
+          foodId: foodServings.foodId,
+          unit: foodServings.unit,
+          labelKo: foodServings.labelKo,
+          amountMilliunits: foodServings.amountMilliunits,
+          gramsMg: foodServings.gramsMg,
+          qualityGrade: foodServings.qualityGrade,
+        })
+        .from(foodServings)
+        .innerJoin(
+          sourceRegistries,
+          eq(foodServings.sourceRegistryId, sourceRegistries.id),
+        )
+        .where(
+          and(
+            eq(foodServings.foodId, food.id),
+            or(
+              eq(foodServings.qualityGrade, 'verified'),
+              eq(foodServings.qualityGrade, 'estimated'),
+            ),
+            inArray(sourceRegistries.kind, [...trustedNutritionSourceKinds]),
+          ),
+        )
+        .orderBy(asc(foodServings.labelKo), asc(foodServings.id)),
+    ]);
+    const profile = parsedQuery.data.nutrientProfileId
+      ? profiles.find(
+          (candidate) =>
+            candidate.id === parsedQuery.data.nutrientProfileId &&
+            candidate.foodId === food.id &&
+            (candidate.qualityGrade === 'verified' ||
+              candidate.qualityGrade === 'estimated'),
+        )
+      : [...profiles].sort(compareProfiles)[0];
+    if (!profile) return foodNotFound(reply, request);
+
+    return {
+      id: food.id,
+      canonicalNameKo: food.canonicalNameKo,
+      category: food.category,
+      preparation: food.preparation,
+      nutrientProfile: {
+        id: profile.id,
+        sourceRegistryId: profile.sourceRegistryId,
+        sourceCode: profile.sourceCode,
+        sourceDisplayName: profile.sourceDisplayName,
+        sourceItemId: profile.sourceItemId,
+        datasetVersion: profile.datasetVersion,
+        basisAmountMg: profile.basisAmountMg,
+        energyMillicalories: profile.energyMillicalories,
+        carbohydrateMg: profile.carbohydrateMg,
+        proteinMg: profile.proteinMg,
+        fatMg: profile.fatMg,
+        fiberMg: profile.fiberMg,
+        qualityGrade: profile.qualityGrade,
+      },
+      servings,
     };
   });
 };
@@ -219,6 +365,15 @@ function invalidRequest(reply: FastifyReply, request: FastifyRequest) {
     error: {
       code: 'INVALID_REQUEST',
       message: '요청 형식이 올바르지 않습니다.',
+      requestId: request.id,
+    },
+  });
+}
+function foodNotFound(reply: FastifyReply, request: FastifyRequest) {
+  return reply.status(404).send({
+    error: {
+      code: 'FOOD_NOT_FOUND',
+      message: '음식을 찾을 수 없습니다.',
       requestId: request.id,
     },
   });

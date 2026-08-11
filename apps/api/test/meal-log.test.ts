@@ -1,8 +1,13 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import {
+  calculationSnapshots,
+  foods,
+  foodServings,
   imageAssets,
   mealItems,
   mealLogs,
+  nutrientProfiles,
+  sourceRegistries,
   type Database,
 } from '@nueat/database';
 import type { FastifyInstance } from 'fastify';
@@ -23,6 +28,9 @@ const environment = parseEnvironment({
 const mealId = '00000000-0000-4000-8000-000000000001';
 const imageId = '00000000-0000-4000-8000-000000000002';
 const itemId = '00000000-0000-4000-8000-000000000003';
+const foodId = '00000000-0000-4000-8000-000000000010';
+const nutrientProfileId = '00000000-0000-4000-8000-000000000011';
+const sourceRegistryId = '00000000-0000-4000-8000-000000000013';
 const servers: FastifyInstance[] = [];
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => server.close()));
@@ -216,6 +224,185 @@ describe('meal log routes', () => {
     expect(state.meal.recognitionStatus).toBe('ready');
     expect(state.meal.recognitionProvider).toBe('mock');
   });
+  test('confirms mapped gram items with persisted profile values', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+    const response = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+    });
+    const body = JSON.parse(response.body);
+    expect(response.statusCode).toBe(200);
+    expect(body).toMatchObject({
+      mealLog: { status: 'confirmed' },
+      items: [{ gramsMg: 1_500 }],
+      nutrition: {
+        calculationVersion: 'meal-nutrition-v1',
+        items: [{
+          source: {
+            nutrientProfileId,
+            qualityGrade: 'verified',
+            servingId: null,
+            servingSourceRegistryId: null,
+            servingQualityGrade: null,
+          },
+        }],
+        totals: { energyMillicalories: { value: 300, completeness: 'complete' } },
+      },
+    });
+    expect(state.snapshots).toHaveLength(1);
+    expect(state.snapshots[0]!.inputSnapshot).toEqual({
+      mealItems: [{
+        mealItemId: itemId,
+        foodId,
+        nutrientProfileId,
+        amountMilliunits: 1_500,
+        unit: 'g',
+        gramsMg: 1_500,
+        sourceRegistryId,
+        sourceItemId: 'test-source-item',
+        datasetVersion: '2026-08',
+        nutrientProfileQualityGrade: 'verified',
+        nutrientProfile: {
+          basisAmountMg: 100_000,
+          energyMillicalories: 20_000,
+          carbohydrateMg: 3_000,
+          proteinMg: 1_000,
+          fatMg: 500,
+          fiberMg: null,
+        },
+        serving: null,
+        nutrients: {
+          energyMillicalories: 300,
+          carbohydrateMg: 45,
+          proteinMg: 15,
+          fatMg: 8,
+          fiberMg: null,
+        },
+      }],
+    });
+  });
+
+  test('converts non-gram items through their sole matching serving', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'serving');
+    state.servings.push({
+      id: '00000000-0000-4000-8000-000000000012',
+      foodId: foodId,
+      unit: 'serving',
+      amountMilliunits: 1_000,
+      gramsMg: 200_000,
+      sourceRegistryId: sourceRegistryId,
+      qualityGrade: 'verified',
+    });
+    const response = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+    });
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.items[0].gramsMg).toBe(300_000);
+    expect(body.nutrition.items[0].source).toMatchObject({
+      servingId: '00000000-0000-4000-8000-000000000012',
+      servingSourceRegistryId: sourceRegistryId,
+      servingQualityGrade: 'verified',
+    });
+  });
+
+  test('rejects missing mappings, profiles, and serving conversions without mutation', async () => {
+    for (const invalid of ['mapping', 'profile', 'serving'] as const) {
+      const { server, state } = await createServer(true);
+      configureConfirmableDraft(state, invalid === 'serving' ? 'serving' : 'g');
+      if (invalid === 'mapping') {
+        delete state.items[0]!.foodId;
+        delete state.items[0]!.nutrientProfileId;
+      }
+      if (invalid === 'profile') state.profiles = [];
+      const response = await server.inject({
+        method: 'POST',
+        url: `/api/meal-logs/${mealId}/confirm`,
+      });
+      expect(response.statusCode).toBe(409);
+      expect(JSON.parse(response.body).error.details.items[0].code).toBe(
+        invalid === 'mapping'
+          ? 'MISSING_MAPPING'
+          : invalid === 'profile'
+            ? 'MISSING_PROFILE'
+            : 'MISSING_SERVING_CONVERSION',
+      );
+      expect(state.meal?.status).toBe('draft');
+      expect(state.items[0]!.gramsMg).toBeUndefined();
+      expect(state.snapshots).toHaveLength(0);
+    }
+  });
+
+  test('rejects mismatched food/profile ownership without mutation', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+    state.profiles[0]!.foodId = '00000000-0000-4000-8000-000000000099';
+    const response = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+    });
+    expect(response.statusCode).toBe(409);
+    expect(JSON.parse(response.body).error.details.items[0].code).toBe('MISMATCHED_PROFILE');
+    expect(state.meal?.status).toBe('draft');
+    expect(state.snapshots).toHaveLength(0);
+  });
+
+  test('rejects deprecated foods and untrusted profile or serving sources', async () => {
+    for (const invalid of ['food', 'profile', 'serving'] as const) {
+      const { server, state } = await createServer(true);
+      configureConfirmableDraft(state, invalid === 'serving' ? 'serving' : 'g');
+      if (invalid === 'food') state.foods[0]!.isDeprecated = true;
+      if (invalid === 'profile')
+        state.registries[0]!.kind = 'recipe_estimate';
+      if (invalid === 'serving') {
+        state.servings.push({
+          id: '00000000-0000-4000-8000-000000000012',
+          foodId,
+          unit: 'serving',
+          amountMilliunits: 1_000,
+          gramsMg: 200_000,
+          sourceRegistryId: '00000000-0000-4000-8000-000000000015',
+          qualityGrade: 'verified',
+        });
+        state.registries.push({
+          id: '00000000-0000-4000-8000-000000000015',
+          kind: 'user_entered',
+        });
+      }
+      const response = await server.inject({
+        method: 'POST',
+        url: `/api/meal-logs/${mealId}/confirm`,
+      });
+      expect(response.statusCode).toBe(409);
+      expect(JSON.parse(response.body).error.details.items[0].code).toBe(
+        invalid === 'food'
+          ? 'DEPRECATED_FOOD'
+          : invalid === 'profile'
+            ? 'UNTRUSTED_PROFILE_SOURCE'
+            : 'UNTRUSTED_SERVING_SOURCE',
+      );
+      expect(state.meal?.status).toBe('draft');
+      expect(state.snapshots).toHaveLength(0);
+    }
+  });
+  test('replays the latest confirmation snapshot without creating another', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+    const first = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+    });
+    const replay = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+    });
+    expect(replay.statusCode).toBe(200);
+    expect(JSON.parse(replay.body).nutrition.id).toBe(JSON.parse(first.body).nutrition.id);
+    expect(state.snapshots).toHaveLength(1);
+  });
 });
 
 function createPayload() {
@@ -256,6 +443,11 @@ async function createServer(
     asset: Record<string, unknown>;
     meal?: Record<string, unknown>;
     items: Record<string, unknown>[];
+    foods: Record<string, unknown>[];
+    profiles: Record<string, unknown>[];
+    servings: Record<string, unknown>[];
+    registries: Record<string, unknown>[];
+    snapshots: Record<string, unknown>[];
     deletionJob?: Record<string, unknown>;
   } = {
     asset: {
@@ -264,6 +456,11 @@ async function createServer(
       status: overrides.assetStatus ?? 'validated',
     },
     items: [],
+    foods: [],
+    profiles: [],
+    servings: [],
+    registries: [],
+    snapshots: [],
   };
   if (overrides.mealUserId)
     state.meal = { ...draftMeal(), userId: overrides.mealUserId };
@@ -337,16 +534,62 @@ async function createServer(
   servers.push(server);
   return { server, state };
 }
+function configureConfirmableDraft(
+  state: {
+    meal?: Record<string, unknown>;
+    items: Record<string, unknown>[];
+    foods: Record<string, unknown>[];
+    profiles: Record<string, unknown>[];
+    registries: Record<string, unknown>[];
+  },
+  unit: 'g' | 'serving',
+) {
+  state.meal = draftMeal();
+  state.items = [{
+    id: itemId,
+    mealLogId: mealId,
+    recognizedLabel: '테스트 음식',
+    foodId,
+    nutrientProfileId,
+    amountMilliunits: 1_500,
+    unit,
+    userCorrected: true,
+  }];
+  state.foods = [{ id: foodId, isDeprecated: false }];
+  state.profiles = [{
+    id: nutrientProfileId,
+    foodId,
+    sourceRegistryId,
+    sourceItemId: 'test-source-item',
+    datasetVersion: '2026-08',
+    basisAmountMg: 100_000,
+    energyMillicalories: 20_000,
+    carbohydrateMg: 3_000,
+    proteinMg: 1_000,
+    fatMg: 500,
+    qualityGrade: 'verified',
+    fiberMg: null,
+  }];
+  state.registries = [{ id: sourceRegistryId, kind: 'public_dataset' }];
+}
 
 function databaseMock(state: {
   asset: Record<string, unknown>;
   meal?: Record<string, unknown>;
   items: Record<string, unknown>[];
+  foods: Record<string, unknown>[];
+  profiles: Record<string, unknown>[];
+  servings: Record<string, unknown>[];
+  registries: Record<string, unknown>[];
+  snapshots: Record<string, unknown>[];
   deletionJob?: Record<string, unknown>;
 }) {
   const canClaimImage = state.asset.status === 'validated';
   const query = (value: unknown) => ({
-    limit: async () => (value === undefined ? [] : [value]),
+    for: () => query(value),
+    orderBy: () => query(value),
+    limit: async () =>
+      value === undefined ? [] : Array.isArray(value) ? value.slice(0, 1) : [value],
     then<TResult1 = unknown, TResult2 = never>(
       ok?: ((result: unknown) => TResult1 | PromiseLike<TResult1>) | null,
       fail?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
@@ -365,7 +608,17 @@ function databaseMock(state: {
               ? state.meal
               : table === mealItems
                 ? state.items
-                : undefined,
+                : table === foods
+                  ? state.foods
+                  : table === nutrientProfiles
+                    ? state.profiles
+                    : table === foodServings
+                      ? state.servings
+                      : table === sourceRegistries
+                        ? state.registries
+                        : table === calculationSnapshots
+                          ? state.snapshots
+                          : undefined,
           ),
       }),
     }),
@@ -434,6 +687,14 @@ function databaseMock(state: {
             }));
             state.items.push(...inserted);
             return inserted;
+          }
+          if (table === calculationSnapshots) {
+            const snapshot = {
+              ...firstRow,
+              id: '00000000-0000-4000-8000-000000000014',
+            };
+            state.snapshots.push(snapshot);
+            return [snapshot];
           }
           return [];
         };

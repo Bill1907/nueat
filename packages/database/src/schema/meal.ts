@@ -66,10 +66,36 @@ export interface CalculationInputSnapshot {
     mealItemId: string;
     foodId: string;
     nutrientProfileId: string;
+    amountMilliunits: number;
+    unit: 'g' | 'ml' | 'serving' | 'bowl' | 'piece';
     gramsMg: number;
     sourceRegistryId: string;
     sourceItemId: string;
     datasetVersion: string;
+    nutrientProfileQualityGrade: 'verified' | 'estimated' | 'unverified';
+    nutrientProfile: {
+      basisAmountMg: number;
+      energyMillicalories: number;
+      carbohydrateMg: number;
+      proteinMg: number;
+      fatMg: number;
+      fiberMg: number | null;
+    };
+    serving: {
+      id: string;
+      unit: 'ml' | 'serving' | 'bowl' | 'piece';
+      amountMilliunits: number;
+      gramsMg: number;
+      sourceRegistryId: string;
+      qualityGrade: 'verified' | 'estimated' | 'unverified';
+    } | null;
+    nutrients: {
+      energyMillicalories: number;
+      carbohydrateMg: number;
+      proteinMg: number;
+      fatMg: number;
+      fiberMg: number | null;
+    };
   }>;
 }
 

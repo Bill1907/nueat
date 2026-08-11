@@ -15,7 +15,7 @@ export interface MealDraft {
   timezone: string;
   localDate: string;
   mealType: MealType;
-  status: 'draft';
+  status: 'draft' | 'confirmed';
   imageAssetId: string | null;
   recognitionStatus: RecognitionStatus;
   recognitionProvider: string | null;
@@ -44,6 +44,52 @@ export interface MealDraftItem {
 export interface MealDraftResponse {
   mealLog: MealDraft;
   items: MealDraftItem[];
+}
+export interface ConfirmedNutrientValue {
+  value: number | null;
+  knownValue: number;
+  missingItemCount: number;
+  completeness: 'complete' | 'partial';
+}
+
+export interface ConfirmedMealNutritionItem {
+  mealItemId: string;
+  gramsMg: number;
+  nutrients: {
+    energyMillicalories: number | null;
+    carbohydrateMg: number | null;
+    proteinMg: number | null;
+    fatMg: number | null;
+    fiberMg: number | null;
+  };
+  source: {
+    foodId: string;
+    nutrientProfileId: string;
+    sourceRegistryId: string;
+    sourceItemId: string;
+    datasetVersion: string;
+    qualityGrade: string;
+    servingId: string | null;
+    servingSourceRegistryId: string | null;
+    servingQualityGrade: string | null;
+  };
+}
+
+export interface ConfirmedMealNutrition {
+  id: string;
+  calculationVersion: string;
+  calculatedAt: string;
+  items: ConfirmedMealNutritionItem[];
+  totals: Record<
+    'energyMillicalories' | 'carbohydrateMg' | 'proteinMg' | 'fatMg' | 'fiberMg',
+    ConfirmedNutrientValue
+  >;
+}
+
+export interface ConfirmMealDraftResponse {
+  mealLog: MealDraft;
+  items: MealDraftItem[];
+  nutrition: ConfirmedMealNutrition;
 }
 
 export interface CreateMealDraftInput {
@@ -124,6 +170,12 @@ export function mapMealDraftItemFood(
       method: 'PUT',
       body: JSON.stringify({ foodId }),
     },
+  );
+}
+export function confirmMealDraft(mealLogId: string) {
+  return apiRequest<ConfirmMealDraftResponse>(
+    `/api/meal-logs/${mealLogId}/confirm`,
+    { method: 'POST' },
   );
 }
 

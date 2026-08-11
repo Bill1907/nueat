@@ -48,3 +48,13 @@ export function searchFoods(query: string, signal?: AbortSignal) {
     { signal },
   );
 }
+export function getFood(
+  foodId: string,
+  nutrientProfileId: string,
+  signal?: AbortSignal,
+) {
+  return apiRequest<CanonicalFood>(
+    `/api/foods/${foodId}?nutrientProfileId=${encodeURIComponent(nutrientProfileId)}`,
+    { signal },
+  );
+}

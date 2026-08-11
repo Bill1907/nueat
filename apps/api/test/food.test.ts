@@ -118,6 +118,118 @@ describe('canonical food routes', () => {
       userCorrected: true,
     });
   });
+  test('hydrates a stable food ID with its preferred trusted profile', async () => {
+    const server = await createServer(true, {
+      profiles: [
+        {
+          id: '00000000-0000-4000-8000-000000000010',
+          foodId,
+          qualityGrade: 'estimated',
+          datasetVersion: '2027-01',
+        },
+        {
+          id: profileId,
+          foodId,
+          qualityGrade: 'verified',
+          datasetVersion: '2026-01',
+        },
+      ],
+    });
+    const response = await server.inject({
+      method: 'GET',
+      url: `/api/foods/${foodId}`,
+    });
+    const body = JSON.parse(response.body);
+
+    expect(response.statusCode).toBe(200);
+    expect(body).toMatchObject({
+      id: foodId,
+      canonicalNameKo: '김치',
+      nutrientProfile: { id: profileId, qualityGrade: 'verified' },
+      servings: [],
+    });
+  });
+  test('pins stable hydration to the requested trusted persisted profile', async () => {
+    const persistedProfileId = '00000000-0000-4000-8000-000000000010';
+    const server = await createServer(true, {
+      profiles: [
+        { id: profileId, foodId, qualityGrade: 'verified', datasetVersion: '2026-01' },
+        {
+          id: persistedProfileId,
+          foodId,
+          qualityGrade: 'estimated',
+          datasetVersion: '2027-01',
+        },
+      ],
+    });
+    const response = await server.inject({
+      method: 'GET',
+      url: `/api/foods/${foodId}?nutrientProfileId=${persistedProfileId}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body).nutrientProfile).toMatchObject({
+      id: persistedProfileId,
+      qualityGrade: 'estimated',
+    });
+  });
+
+  test('returns 404 for a mismatched or untrusted requested profile', async () => {
+    const mismatchedProfileId = '00000000-0000-4000-8000-000000000011';
+    const untrustedProfileId = '00000000-0000-4000-8000-000000000012';
+    const server = await createServer(true, {
+      profiles: [
+        {
+          id: mismatchedProfileId,
+          foodId: '00000000-0000-4000-8000-000000000013',
+          qualityGrade: 'verified',
+          datasetVersion: '2026-01',
+        },
+        {
+          id: untrustedProfileId,
+          foodId,
+          qualityGrade: 'unverified',
+          datasetVersion: '2026-01',
+        },
+      ],
+    });
+
+    for (const nutrientProfileId of [mismatchedProfileId, untrustedProfileId]) {
+      const response = await server.inject({
+        method: 'GET',
+        url: `/api/foods/${foodId}?nutrientProfileId=${nutrientProfileId}`,
+      });
+      expect(response.statusCode).toBe(404);
+      expect(JSON.parse(response.body).error.code).toBe('FOOD_NOT_FOUND');
+    }
+  });
+
+  test('returns 404 when stable food hydration has no eligible profile', async () => {
+    const server = await createServer(true, { profiles: [] });
+    const response = await server.inject({
+      method: 'GET',
+      url: `/api/foods/${foodId}`,
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(JSON.parse(response.body).error.code).toBe('FOOD_NOT_FOUND');
+  });
+  test('returns 404 when the stable food is missing or deprecated', async () => {
+    const missing = await createServer(true, { food: null });
+    const deprecated = await createServer(true, {
+      food: { id: foodId, canonicalNameKo: '김치', isDeprecated: true },
+    });
+
+    for (const server of [missing, deprecated]) {
+      const response = await server.inject({
+        method: 'GET',
+        url: `/api/foods/${foodId}`,
+      });
+      expect(response.statusCode).toBe(404);
+      expect(JSON.parse(response.body).error.code).toBe('FOOD_NOT_FOUND');
+    }
+  });
+
 });
 
 async function mapFood(server: FastifyInstance) {
@@ -139,6 +251,7 @@ async function createServer(
     mealUserId?: string;
     mealStatus?: string;
     profiles?: Record<string, unknown>[];
+    food?: Record<string, unknown> | null;
   } = {},
 ) {
   const state = {
@@ -169,7 +282,10 @@ async function createServer(
       nutrientProfileId: null,
       mappingConfidenceBps: null,
     },
-    food: { id: foodId, canonicalNameKo: '김치', isDeprecated: false },
+    food:
+      overrides.food === undefined
+        ? { id: foodId, canonicalNameKo: '김치', isDeprecated: false }
+        : overrides.food,
     profiles: overrides.profiles ?? [
       {
         id: profileId,
@@ -203,18 +319,17 @@ function databaseMock(state: Record<string, any>) {
     if (table === foodAliases) return state.aliases;
     if (table === nutrientProfiles) return state.profiles;
     if (table === foodServings) return state.servings;
-    if (table === foods) return state.food ? [state.food] : [];
+    if (table === foods)
+      return state.food && !state.food.isDeprecated ? [state.food] : [];
     if (table === mealLogs) {
       state.mealLogQueries += 1;
-      if (state.meal.userId !== 'user-id') return [];
-      return state.meal.status === 'draft' || state.mealLogQueries > 1
-        ? [state.meal]
-        : [];
+      return state.meal.userId === 'user-id' ? [state.meal] : [];
     }
     if (table === mealItems) return [state.item];
     return [];
   };
   const query = (rows: any[]) => ({
+    for: () => query(rows),
     limit: async () => rows.slice(0, 1),
     orderBy: () => query(rows),
     then: (resolve: (value: any[]) => unknown) => Promise.resolve(rows).then(resolve),

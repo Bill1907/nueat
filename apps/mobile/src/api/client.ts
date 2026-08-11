@@ -6,6 +6,9 @@ import { API_URL } from '@/config/environment';
 export class ApiError extends Error {
   constructor(
     message = '요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.',
+    readonly code: string | null = null,
+    readonly details: unknown = null,
+    readonly requestId: string | null = null,
   ) {
     super(message);
     this.name = 'ApiError';
@@ -46,10 +49,22 @@ export async function apiRequest<T>(
       throw new ApiError('로그인 상태를 확인해 주세요.');
     try {
       const payload = (await response.json()) as {
-        error?: { message?: unknown };
+        error?: {
+          code?: unknown;
+          message?: unknown;
+          details?: unknown;
+          requestId?: unknown;
+        };
       };
       if (typeof payload.error?.message === 'string') {
-        throw new ApiError(payload.error.message);
+        throw new ApiError(
+          payload.error.message,
+          typeof payload.error.code === 'string' ? payload.error.code : null,
+          payload.error.details ?? null,
+          typeof payload.error.requestId === 'string'
+            ? payload.error.requestId
+            : null,
+        );
       }
     } catch (cause) {
       if (cause instanceof ApiError) throw cause;
