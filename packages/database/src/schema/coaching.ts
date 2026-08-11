@@ -11,17 +11,44 @@ export const feedbackTargetTypeEnum = pgEnum('feedback_target_type', [
 export interface RecommendationContextSnapshot {
   requestedAt: string;
   timezone: string;
+  targetId: string;
   remainingTargets: Record<string, number | null>;
   recentMealIds: string[];
+  calculationSnapshots: Array<{ id: string; mealLogId: string; sequence: number }>;
   dietaryConstraintIds: string[];
+  selectedNutrientProfiles: Array<{
+    id: string;
+    sourceRegistryId: string;
+    sourceItemId: string;
+    datasetVersion: string;
+    foodId: string;
+  }>;
 }
+
+interface RecommendationNutrientSnapshot {
+  energyMillicalories: number | null;
+  carbohydrateMg: number | null;
+  proteinMg: number | null;
+  fatMg: number | null;
+  fiberMg: number | null;
+}
+
+type RecommendationRationaleSnapshot =
+  | { code: 'PROTEIN_GAP'; remainingMg: number | null; scoreBps: number }
+  | { code: 'FIBER_GAP'; remainingMg: number | null; scoreBps: number }
+  | { code: 'ENERGY_FIT'; projectedEnergyMillicalories: number | null; scoreBps: number }
+  | { code: 'RECENT_FOOD_DIVERSITY'; hasRecentFood: boolean; scoreBps: number };
 
 export interface RecommendationCandidateSnapshot {
   rank: number;
-  foodIds: string[];
-  amountsMg: number[];
-  projectedTotals: Record<string, number | null>;
-  rationaleFacts: string[];
+  templateId: string;
+  titleKo: string;
+  scoreBps: number;
+  components: Array<{ foodId: string; nameKo: string; gramsMg: number }>;
+  nutrition: RecommendationNutrientSnapshot;
+  projectedTotals: RecommendationNutrientSnapshot;
+  rationaleFacts: RecommendationRationaleSnapshot[];
+  warnings: 'CALORIE_TARGET_OVERAGE'[];
 }
 
 export const recommendations = pgTable(

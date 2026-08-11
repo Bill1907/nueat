@@ -24,6 +24,7 @@ import { mealLogRoutes } from './routes/meal-log';
 import { onboardingRoutes } from './routes/onboarding';
 import { nutritionTargetRoutes } from './routes/nutrition-target';
 import { sessionRoutes } from './routes/session';
+import { recommendationRoutes } from './routes/recommendation';
 
 export interface ServerDependencies {
   environment: ApiEnvironment;
@@ -141,6 +142,10 @@ export async function buildServer(dependencies: ServerDependencies) {
     database: dependencies.database,
   });
   await app.register(foodRoutes, {
+    auth: dependencies.auth,
+    database: dependencies.database,
+  });
+  await app.register(recommendationRoutes, {
     auth: dependencies.auth,
     database: dependencies.database,
   });

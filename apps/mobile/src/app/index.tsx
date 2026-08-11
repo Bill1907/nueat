@@ -11,6 +11,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { authClient, useAuthSession } from '@/auth/client';
 import { DailyNutritionDashboard } from '@/components/daily-nutrition-dashboard';
+import { NextMealRecommendations } from '@/components/next-meal-recommendations';
 import { MealPhotoUploadCard } from '@/components/meal-photo-upload-card';
 
 import { NutritionStandardCard } from '@/components/nutrition-standard-card';
@@ -75,6 +76,7 @@ export default function HomeScreen() {
           refreshGeneration={refreshGeneration}
           onLoadComplete={handleDashboardLoadComplete}
         />
+        <NextMealRecommendations refreshGeneration={refreshGeneration} />
         <MealPhotoUploadCard
           onMealConfirmed={() =>
             setRefreshGeneration((generation) => generation + 1)
