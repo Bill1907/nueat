@@ -7,6 +7,7 @@ import {
   userProfiles,
   isRecognitionResultV2,
   type Database,
+  type RecognitionResultV2,
 } from '@nueat/database';
 import {
   calculateMealNutrition,
@@ -1508,32 +1509,50 @@ async function buildMealLogResponse(
   const nutritionPreview = 'details' in preview
     ? null
     : nutritionPreviewResponse(preview.nutrition, resolutionByItemId);
-  const publicItems = responseItems.map((item) => ({
-    id: item.id,
-    recognizedLabel: item.recognizedLabel,
-    amountMilliunits: item.amountMilliunits,
-    unit: item.unit,
-    recognitionRegionIndex: item.recognitionRegionIndex,
-    recognitionConfidenceBps: item.recognitionConfidenceBps,
-    portionConfidenceBps: item.portionConfidenceBps,
-    userCorrected: item.userCorrected,
-    foodId: item.foodId,
-    nutrientProfileId: item.nutrientProfileId,
-    mappingConfidenceBps: item.mappingConfidenceBps,
-    gramsMg: item.gramsMg,
-    origin: item.origin,
-    initialAssessment: item.initialAssessment,
-    currentResolutionSource: item.currentResolutionSource,
-    itemRevision: item.itemRevision,
-    foodRevision: item.foodRevision,
-    portionRevision: item.portionRevision,
-    foodAcknowledgedRevision: item.foodAcknowledgedRevision,
-    portionAcknowledgedRevision: item.portionAcknowledgedRevision,
-    currentResolution: {
-      status: item.currentResolution.status,
-      reason: item.currentResolution.reason,
-    },
-  }));
+  type RecognizedFood =
+    Extract<RecognitionResultV2, { outcome: 'recognized' }>['foods'][number];
+  const recognizedFoodByRegion = new Map<number, RecognizedFood>(
+    recognition?.outcome === 'recognized'
+      ? recognition.foods.map(
+          (food: RecognizedFood) =>
+            [food.regionIndex, food] as const,
+        )
+      : [],
+  );
+  const publicItems = responseItems.map((item) => {
+    const originalEstimate =
+      item.origin === 'model_estimate' && item.recognitionRegionIndex !== null
+        ? recognizedFoodByRegion.get(item.recognitionRegionIndex)
+        : null;
+    return {
+      id: item.id,
+      recognizedLabel: item.recognizedLabel,
+      amountMilliunits: item.amountMilliunits,
+      unit: item.unit,
+      estimatedAmountMilliunits: originalEstimate?.amountMilliunits ?? null,
+      estimatedUnit: originalEstimate?.unit ?? null,
+      recognitionRegionIndex: item.recognitionRegionIndex,
+      recognitionConfidenceBps: item.recognitionConfidenceBps,
+      portionConfidenceBps: item.portionConfidenceBps,
+      userCorrected: item.userCorrected,
+      foodId: item.foodId,
+      nutrientProfileId: item.nutrientProfileId,
+      mappingConfidenceBps: item.mappingConfidenceBps,
+      gramsMg: item.gramsMg,
+      origin: item.origin,
+      initialAssessment: item.initialAssessment,
+      currentResolutionSource: item.currentResolutionSource,
+      itemRevision: item.itemRevision,
+      foodRevision: item.foodRevision,
+      portionRevision: item.portionRevision,
+      foodAcknowledgedRevision: item.foodAcknowledgedRevision,
+      portionAcknowledgedRevision: item.portionAcknowledgedRevision,
+      currentResolution: {
+        status: item.currentResolution.status,
+        reason: item.currentResolution.reason,
+      },
+    };
+  });
   return {
     mealLog: {
       id: mealLog.id,

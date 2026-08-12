@@ -665,15 +665,41 @@ export function MealConfirmationModal({
   const nutritionPreview = createNutritionPreview(
     currentData?.items.map((item) => {
       const food = mappedFoods[item.id];
+      const form = forms[item.id];
       const mappingCurrent =
         !invalidatedMappings.has(item.id) &&
         isFoodMappingCurrent(item.currentResolution);
       return {
         ...item,
+        amountMilliunits:
+          form ? (decimalToMilliunits(form.amount) ?? 0) : item.amountMilliunits,
+        unit: form?.unit ?? item.unit,
         food: mappingCurrent ? food : null,
       };
     }) ?? [],
   );
+  const aiEstimateNutritionPreview = createNutritionPreview(
+    currentData?.items.flatMap((item) => {
+      if (
+        item.origin !== 'model_estimate' ||
+        item.estimatedAmountMilliunits === null ||
+        item.estimatedUnit === null
+      ) {
+        return [];
+      }
+      const food = mappedFoods[item.id];
+      const mappingCurrent =
+        !invalidatedMappings.has(item.id) &&
+        isFoodMappingCurrent(item.currentResolution);
+      return [{
+        ...item,
+        amountMilliunits: item.estimatedAmountMilliunits,
+        unit: item.estimatedUnit,
+        food: mappingCurrent ? food : null,
+      }];
+    }) ?? [],
+  );
+  const hasAiEstimate = aiEstimateNutritionPreview.items.length > 0;
   const hasUnsavedItemForms =
     currentData !== null &&
     hasUnsavedMealDraftItemForms(currentData.items, forms);
@@ -923,6 +949,27 @@ export function MealConfirmationModal({
                 </View>
               )}
             </View>
+            {isEditable && hasAiEstimate && (
+              <View style={styles.nutritionCard}>
+                <ThemedText type="smallBold">AI가 본 사진 전체 기준</ThemedText>
+                <ThemedText type="small" themeColor="textSecondary">
+                  사진에서 추정한 음식과 전체 양을 공식 음식 DB에 연결해 계산했어요.
+                  실제로 먹은 양은 아래에서 수정해 주세요.
+                </ThemedText>
+                {nutritionKeys.map((key) => {
+                  const total = aiEstimateNutritionPreview.totals[key];
+                  return (
+                    <ThemedText key={key} type="small">
+                      {nutritionLabel(key)}:{' '}
+                      {total.knownValue === null
+                        ? '계산 필요'
+                        : formatNutritionValue(total.knownValue, key)}
+                      {total.completeness === 'partial' ? ' · 일부 음식 미확인' : ''}
+                    </ThemedText>
+                  );
+                })}
+              </View>
+            )}
             {isEditable && currentData.items.map((item) => {
               const form = forms[item.id];
               if (!form) return null;
@@ -1107,9 +1154,17 @@ export function MealConfirmationModal({
                     음식 인식 {confidenceLabel(item.recognitionConfidenceBps)} ·
                     양 추정 {confidenceLabel(item.portionConfidenceBps)}
                   </ThemedText>
-                  <ThemedText type="smallBold">양</ThemedText>
+                  {item.estimatedAmountMilliunits !== null &&
+                    item.estimatedUnit !== null && (
+                      <ThemedText type="small" themeColor="textSecondary">
+                        AI가 본 사진 전체 양:{' '}
+                        {item.estimatedAmountMilliunits / 1000}{' '}
+                        {mealUnitLabel(item.estimatedUnit)}
+                      </ThemedText>
+                    )}
+                  <ThemedText type="smallBold">내가 실제로 먹은 양</ThemedText>
                   <TextInput
-                    accessibilityLabel="음식 양"
+                    accessibilityLabel={`${form.recognizedLabel} 실제로 먹은 양`}
                     editable={!saving}
                     keyboardType="decimal-pad"
                     onChangeText={(amount) => updateForm(item.id, { amount })}
@@ -1240,15 +1295,17 @@ export function MealConfirmationModal({
               />
             )}
             {isEditable && !confirmedNutrition && (
-              <View style={styles.recognition}>
-                <ThemedText type="smallBold">공식 DB 영양 요약</ThemedText>
+              <View style={styles.nutritionCard}>
+                <ThemedText type="smallBold">내가 먹은 양 기준 영양</ThemedText>
                 {nutritionKeys.map((key) => {
-                  const total = currentData.review.nutrition?.totals[key];
+                  const total = nutritionPreview.totals[key];
                   return (
                     <ThemedText key={key} type="small" themeColor="textSecondary">
                       {nutritionLabel(key)}:{' '}
-                      {total ? formatConfirmedNutritionValue(total, key) : '확인 필요'}
-                      {total?.completeness === 'partial' ? ' · 일부 항목 미확인' : ''}
+                      {total.knownValue === null
+                        ? '확인 필요'
+                        : formatNutritionValue(total.knownValue, key)}
+                      {total.completeness === 'partial' ? ' · 일부 항목 미확인' : ''}
                     </ThemedText>
                   );
                 })}
@@ -1550,6 +1607,11 @@ const styles = StyleSheet.create({
     backgroundColor: '#DDE5E0',
   },
   recognition: { gap: Spacing.one },
+  nutritionCard: {
+    gap: Spacing.one,
+    padding: Spacing.three,
+    borderRadius: 14,
+  },
   loadingState: {
     alignItems: 'center',
     gap: Spacing.two,

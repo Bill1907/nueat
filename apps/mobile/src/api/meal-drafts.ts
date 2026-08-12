@@ -48,6 +48,8 @@ export interface MealDraftItem {
   recognizedLabel: string;
   amountMilliunits: number;
   unit: MealUnit;
+  estimatedAmountMilliunits: number | null;
+  estimatedUnit: MealUnit | null;
   recognitionRegionIndex: number | null;
   recognitionConfidenceBps: number | null;
   portionConfidenceBps: number | null;

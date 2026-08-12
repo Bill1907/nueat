@@ -572,6 +572,10 @@ describe('meal log routes', () => {
     expect(publicItem).toHaveProperty('currentResolutionSource', 'model_primary');
     expect(publicItem).toHaveProperty('recognitionRegionIndex');
     expect(publicItem).toHaveProperty('gramsMg');
+    expect(publicItem).toMatchObject({
+      estimatedAmountMilliunits: 1_500,
+      estimatedUnit: 'g',
+    });
 
     const directConfirm = await server.inject({
       method: 'POST',
