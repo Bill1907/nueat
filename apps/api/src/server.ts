@@ -5,6 +5,7 @@ import Fastify, { LogController } from 'fastify';
 
 import type { Auth } from './auth/auth';
 import type { ApiEnvironment } from './config/env';
+import { calculateCatalogRegistrySha256 } from './services/catalog-registry-verifier';
 import { createS3ImageObjectStore, type ImageObjectStore } from './services/image-object-store';
 import {
   MealRecognitionCoordinator,
@@ -36,6 +37,16 @@ export interface ServerDependencies {
 
 export async function buildServer(dependencies: ServerDependencies) {
   const { environment } = dependencies;
+  if (environment.mealRecognition.reviewPolicy.mode === 'quick_confirm') {
+    const expectedCatalogSha256 =
+      environment.mealRecognition.reviewPolicy.catalogRegistrySha256;
+    const actualCatalogSha256 = await calculateCatalogRegistrySha256(
+      dependencies.database,
+    );
+    if (!expectedCatalogSha256 || actualCatalogSha256 !== expectedCatalogSha256) {
+      throw new Error('DEPLOYED_CATALOG_REGISTRY_MISMATCH');
+    }
+  }
   const imageObjectStore =
     dependencies.imageObjectStore ??
     (environment.imageBucket ? createS3ImageObjectStore(environment.imageBucket) : null);
@@ -136,6 +147,7 @@ export async function buildServer(dependencies: ServerDependencies) {
     auth: dependencies.auth,
     database: dependencies.database,
     recognitionCoordinator,
+    reviewPolicy: environment.mealRecognition.reviewPolicy,
   });
   await app.register(dailyDashboardRoutes, {
     auth: dependencies.auth,

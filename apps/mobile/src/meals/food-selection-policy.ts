@@ -3,12 +3,10 @@ export function normalizeKoreanFoodLabel(label: string) {
 }
 
 export function isFoodMappingCurrent(
-  recognizedLabel: string,
-  food: { canonicalNameKo: string } | null,
+  resolution: {
+    status: 'resolved' | 'unresolved';
+    reason?: string | null;
+  } | null,
 ) {
-  return (
-    food !== null &&
-    normalizeKoreanFoodLabel(recognizedLabel) ===
-      normalizeKoreanFoodLabel(food.canonicalNameKo)
-  );
+  return resolution?.status === 'resolved';
 }

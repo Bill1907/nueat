@@ -47,8 +47,50 @@ export const assetDeletionJobStatusEnum = pgEnum('asset_deletion_job_status', [
   'completed',
 ]);
 export const recognitionProviderEnum = pgEnum('recognition_provider', ['mock', 'openai']);
+export const mealItemOriginEnum = pgEnum('meal_item_origin', [
+  'model_estimate',
+  'manual_entry',
+  'user_added',
+  'legacy_unknown',
+]);
+export const mealItemMappingSourceEnum = pgEnum('meal_item_mapping_source', [
+  'model_primary',
+  'model_alternative',
+  'user_selected',
+  'legacy_existing',
+]);
+
+export type RecognitionEvidenceReason =
+  | 'blurred'
+  | 'too_dark'
+  | 'occluded'
+  | 'not_meal_photo'
+  | 'other';
+
+export interface RecognitionQuestionV2 {
+  target: 'food' | 'portion';
+  question: string;
+}
+
+export interface RecognitionAlternativeV2 {
+  normalizedLabel: string;
+  confidenceBps: number;
+}
+
+export interface RecognitionFoodV2 {
+  regionIndex: number;
+  rawLabel: string;
+  normalizedLabel: string;
+  foodConfidenceBps: number;
+  amountMilliunits: number;
+  unit: 'g' | 'ml' | 'serving' | 'bowl' | 'piece';
+  portionConfidenceBps: number;
+  questions: RecognitionQuestionV2[];
+  alternatives: RecognitionAlternativeV2[];
+}
 
 export interface RecognitionResultV1 {
+  version?: 1;
   foods: Array<{
     regionIndex: number;
     recognizedLabel: string;
@@ -56,14 +98,122 @@ export interface RecognitionResultV1 {
     amountMilliunits: number;
     unit: 'g' | 'ml' | 'serving' | 'bowl' | 'piece';
     portionConfidenceBps: number;
-    candidateLabels?: string[] | undefined;
-    question?: string | null | undefined;
+    candidateLabels?: string[];
+    question?: string | null;
   }>;
 }
 
+export type StoredRecognitionResult = RecognitionResultV1 | RecognitionResultV2;
+
+export function isRecognitionResultV2(
+  result: StoredRecognitionResult | null | undefined,
+): result is RecognitionResultV2 {
+  const value: Record<string, unknown> =
+    result && typeof result === 'object' ? result as Record<string, unknown> : {};
+  if (!result || value.version !== 2 || !Array.isArray(value.foods)) return false;
+  if (value.outcome === 'recognized') {
+    return typeof value.imageQualityConfidenceBps === 'number' && value.foods.length > 0;
+  }
+  if (value.outcome === 'no_food') {
+    return typeof value.imageQualityConfidenceBps === 'number' && value.foods.length === 0;
+  }
+  return value.outcome === 'insufficient_evidence' &&
+    typeof value.imageQualityConfidenceBps === 'number' &&
+    value.foods.length === 0 &&
+    ['blurred', 'too_dark', 'occluded', 'not_meal_photo', 'other'].includes(value.evidenceReason as string);
+}
+
+export type RecognitionResultV2 =
+  | {
+      version: 2;
+      outcome: 'recognized';
+      imageQualityConfidenceBps: number;
+      foods: RecognitionFoodV2[];
+    }
+  | {
+      version: 2;
+      outcome: 'no_food';
+      imageQualityConfidenceBps: number;
+      foods: [];
+    }
+  | {
+      version: 2;
+      outcome: 'insufficient_evidence';
+      imageQualityConfidenceBps: number;
+      evidenceReason: RecognitionEvidenceReason;
+      foods: [];
+    };
+
+interface ManualRecognitionOverrideBase {
+  decision: 'direct_entry';
+  actorUserId: string;
+  expectedDraftRevision: number;
+  changedFields: readonly ['recognitionStatus'];
+  decidedAt: string;
+  decisionVersion: 'recognition-manual-override-v1';
+}
+
+export type ManualRecognitionOverride =
+  | (ManualRecognitionOverrideBase & {
+      fromStatus: 'ready';
+      fromOutcome: 'no_food' | 'insufficient_evidence';
+      fromErrorCode: null;
+    })
+  | (ManualRecognitionOverrideBase & {
+      fromStatus: 'pending' | 'processing' | 'failed';
+      fromOutcome: RecognitionResultV2['outcome'] | null;
+      fromErrorCode: string | null;
+    });
+
+export interface InitialEstimateAssessment {
+  rawLabel: string;
+  normalizedLabel: string;
+  foodConfidenceBps: number;
+  portionConfidenceBps: number;
+  foodCandidateMarginBps: number | null;
+  questions: RecognitionQuestionV2[];
+  alternatives: RecognitionAlternativeV2[];
+  initialMappingSource: 'model_primary' | 'model_alternative' | null;
+  initialMatchedLabel: string | null;
+  initialFoodId: string | null;
+  initialNutrientProfileId: string | null;
+  recognitionProvider: 'mock' | 'openai';
+  recognitionModel: string;
+  recognitionPromptVersion: string;
+  recognitionSchemaVersion: string;
+  policyVersion: string;
+}
+
 export interface CalculationInputSnapshot {
+  confirmationDecision: {
+    originalRecognition: {
+      provider: 'mock' | 'openai';
+      model: string;
+      promptVersion: string;
+      schemaVersion: string;
+      outcome: RecognitionResultV2['outcome'];
+      evidenceReason?: RecognitionEvidenceReason;
+      completedAt: string;
+    } | null;
+    manualOverride: ManualRecognitionOverride | null;
+    policy: {
+      version: string;
+      activation: 'review_only' | 'quick_confirm';
+      approvedReportSha256: string | null;
+      activeReportSha256: string | null;
+      approvedReportVersion: string | null;
+    };
+  };
   mealItems: Array<{
     mealItemId: string;
+    origin: 'model_estimate' | 'manual_entry' | 'user_added' | 'legacy_unknown';
+    initialEstimateAssessment: InitialEstimateAssessment | null;
+    currentResolutionSource: 'model_primary' | 'model_alternative' | 'user_selected' | 'legacy_existing' | null;
+    itemRevision: number;
+    foodRevision: number;
+    portionRevision: number;
+    foodAcknowledgedRevision: number | null;
+    portionAcknowledgedRevision: number | null;
     foodId: string;
     nutrientProfileId: string;
     amountMilliunits: number;
@@ -211,8 +361,9 @@ export const mealLogs = pgTable(
     recognitionModel: text('recognition_model'),
     recognitionPromptVersion: text('recognition_prompt_version'),
     recognitionSchemaVersion: text('recognition_schema_version'),
-    recognitionResult: jsonb('recognition_result').$type<RecognitionResultV1>(),
+    recognitionResult: jsonb('recognition_result').$type<StoredRecognitionResult>(),
     recognitionCompletedAt: timestamp('recognition_completed_at', { withTimezone: true }),
+    recognitionManualOverride: jsonb('recognition_manual_override').$type<ManualRecognitionOverride>(),
     recognitionProviderRequestId: text('recognition_provider_request_id'),
     recognitionAttemptCount: integer('recognition_attempt_count').default(0).notNull(),
     recognitionLeaseToken: uuid('recognition_lease_token'),
@@ -227,6 +378,7 @@ export const mealLogs = pgTable(
     confirmedAt: timestamp('confirmed_at', { withTimezone: true }),
     deletedAt: timestamp('deleted_at', { withTimezone: true }),
     purgeAfter: timestamp('purge_after', { withTimezone: true }),
+    draftRevision: integer('draft_revision').default(1).notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },
@@ -267,6 +419,23 @@ export const mealLogs = pgTable(
         and jsonb_typeof(${table.recognitionResult}->'foods') = 'array'
         and ${table.recognitionCompletedAt} is not null)`,
     ),
+    check('meal_log_draft_revision_check', sql`${table.draftRevision} > 0`),
+    check(
+      'meal_log_recognition_manual_override_check',
+      sql`${table.recognitionManualOverride} is null
+        or (${table.recognitionStatus} = 'manual'
+        and ${table.recognitionManualOverride}->>'fromStatus' in ('ready', 'pending', 'processing', 'failed')
+        and ${table.recognitionManualOverride}->>'decision' = 'direct_entry'
+        and ${table.recognitionManualOverride}->>'decisionVersion' = 'recognition-manual-override-v1'
+        and ${table.recognitionManualOverride} ? 'actorUserId'
+        and jsonb_typeof(${table.recognitionManualOverride}->'expectedDraftRevision') = 'number'
+        and jsonb_typeof(${table.recognitionManualOverride}->'changedFields') = 'array'
+        and ${table.recognitionManualOverride} ? 'decidedAt'
+        and (${table.recognitionManualOverride}->>'fromStatus' <> 'ready'
+          or (${table.recognitionResult} is not null
+            and ${table.recognitionResult}->>'outcome' in ('no_food', 'insufficient_evidence')
+            and ${table.recognitionManualOverride}->>'fromOutcome' = ${table.recognitionResult}->>'outcome')))`,
+    ),
     check(
       'meal_log_recognition_attempt_usage_check',
       sql`${table.recognitionAttemptCount} >= 0
@@ -306,6 +475,15 @@ export const mealItems = pgTable(
     mappingConfidenceBps: integer('mapping_confidence_bps'),
     portionConfidenceBps: integer('portion_confidence_bps'),
     userCorrected: boolean('user_corrected').default(false).notNull(),
+    origin: mealItemOriginEnum('origin').default('legacy_unknown').notNull(),
+    initialEstimateAssessment: jsonb('initial_estimate_assessment').$type<InitialEstimateAssessment>(),
+    currentResolutionSource: mealItemMappingSourceEnum('current_resolution_source'),
+    currentResolutionSelectedAt: timestamp('current_resolution_selected_at', { withTimezone: true }),
+    itemRevision: integer('item_revision').default(1).notNull(),
+    foodRevision: integer('food_revision').default(1).notNull(),
+    portionRevision: integer('portion_revision').default(1).notNull(),
+    foodAcknowledgedRevision: integer('food_acknowledged_revision'),
+    portionAcknowledgedRevision: integer('portion_acknowledged_revision'),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },
@@ -326,6 +504,30 @@ export const mealItems = pgTable(
       'meal_item_recognition_region_index_check',
       sql`${table.recognitionRegionIndex} is null
         or ${table.recognitionRegionIndex} between 0 and 19`,
+    ),
+    check(
+      'meal_item_revision_check',
+      sql`${table.itemRevision} > 0
+        and ${table.foodRevision} > 0
+        and ${table.portionRevision} > 0
+        and (${table.foodAcknowledgedRevision} is null
+          or (${table.foodAcknowledgedRevision} > 0
+            and ${table.foodAcknowledgedRevision} <= ${table.foodRevision}))
+        and (${table.portionAcknowledgedRevision} is null
+          or (${table.portionAcknowledgedRevision} > 0
+            and ${table.portionAcknowledgedRevision} <= ${table.portionRevision}))`,
+    ),
+    check(
+      'meal_item_initial_estimate_origin_check',
+      sql`(${table.origin} = 'model_estimate'
+          and ${table.initialEstimateAssessment} is not null
+          and ${table.initialEstimateAssessment} ? 'initialFoodId'
+          and ${table.initialEstimateAssessment} ? 'initialNutrientProfileId'
+          and ${table.initialEstimateAssessment}->>'recognitionProvider' in ('mock', 'openai')
+          and ${table.initialEstimateAssessment} ? 'recognitionModel'
+          and ${table.initialEstimateAssessment} ? 'recognitionPromptVersion'
+          and ${table.initialEstimateAssessment} ? 'recognitionSchemaVersion')
+        or (${table.origin} <> 'model_estimate' and ${table.initialEstimateAssessment} is null)`,
     ),
   ],
 );

@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "feature": "source-backed-one-cta-meal-estimation",
+  "sourceHash": "sha256:6ec45bf93049435cfcce3604c40b71c1396081b29b195a5a785411d9c61412dc",
+  "recordedAt": "2026-08-11T16:25:26Z",
+  "runtime": "bun 1.3.14",
+  "cwd": ".",
+  "commands": [
+    {
+      "command": "bun test",
+      "exitCode": 0,
+      "evidence": "214 tests passed, 0 failed, 1055 assertions across 28 files"
+    },
+    {
+      "command": "bun run typecheck",
+      "exitCode": 0,
+      "evidence": "domain, database, mobile, and api workspaces exited 0"
+    },
+    {
+      "command": "bun run lint",
+      "exitCode": 0,
+      "evidence": "mobile ESLint exited 0 with no warnings"
+    },
+    {
+      "command": "bun run db:check",
+      "exitCode": 0,
+      "evidence": "drizzle-kit check reported Everything's fine"
+    }
+  ],
+  "coveredSurfaces": [
+    "Recognition V2 strict provider contract, lease/concurrency/quota/failure handling, and coordinator persistence",
+    "Authoritative review-derived confirmation, mutation-free high model confirmation, explicit-edit acknowledgement, stale/no-op/delete/manual-replay guards, source calculation, preview, one snapshot, and dashboard-safe confirmed state",
+    "Mobile one-CTA action policy, lowercase zero-outcome recovery, exact explicit-review and confirm stale convergence, source-backed summary, mapping, and partial-nutrition behavior",
+    "Runtime/evaluator threshold parity, strict golden-v1 inputs, recognized-only strata, unit-bound registry-derived conversion trust, outcome and Wilson floors, one-to-one matching, authority signature verification, provider/deployed-stack binding, and startup verification of the actual catalog digest",
+    "Database schema, immutable initial and current mapping provenance, manual-transition provenance, legacy V1 guard/backfills, generated migrations, and immutable calculation snapshots"
+  ]
+}

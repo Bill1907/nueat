@@ -13,20 +13,24 @@ import {
   MEAL_RECOGNITION_SCHEMA_VERSION,
   MealRecognitionFailure,
   type MealRecognizer,
-  type RecognitionResultV1,
+  type RecognitionResultV2,
 } from '../src/services/meal-recognizer';
 
 const bytes = new Uint8Array([1, 2, 3]);
 const sha256 = createHash('sha256').update(bytes).digest('hex');
-const result = {
+const result: RecognitionResultV2 = {
+  outcome: 'recognized',
+  imageQualityConfidenceBps: 9_000,
   foods: [
     {
       regionIndex: 0,
-      recognizedLabel: 'rice',
-      recognitionConfidenceBps: 9000,
+      rawLabel: 'rice',
+      foodConfidenceBps: 9000,
       portionConfidenceBps: 8000,
       amountMilliunits: 200,
       unit: 'g' as const,
+      questions: [],
+      alternatives: [],
     },
   ],
 };
@@ -102,6 +106,7 @@ function fakeDatabase(s: State) {
         };
         return {
           limit: rows,
+          orderBy: () => applyWhere(),
           then(
             resolve: (value: Awaited<ReturnType<typeof rows>>) => void,
             reject: (reason: unknown) => void,
@@ -231,7 +236,7 @@ function makeCoordinator(s: State, options: {
   object?: Partial<{ bytes: Uint8Array; contentType: string; byteSize: number; error: Error }>;
   onRead?: () => void;
   recognize?: (input: Parameters<MealRecognizer['recognize']>[0]) => ReturnType<MealRecognizer['recognize']>;
-  result?: RecognitionResultV1;
+  result?: RecognitionResultV2;
 } = {}) {
   const objectStore: ImageObjectStore = {
     createUploadUrl: async () => '', createDownloadUrl: async () => '', deleteObject: async () => {},
@@ -271,87 +276,50 @@ describe('MealRecognitionCoordinator', () => {
     expect(s.status).toBe('ready');
     expect(s.assetStatus).toBe('processed');
     expect(s.items).toHaveLength(1);
-    expect(s.items[0]).toMatchObject({ foodId: null, nutrientProfileId: null, gramsMg: null, mappingConfidenceBps: null });
-  });
-  test('maps a unique primary exact alias to its deterministically selected profile', async () => {
-    const s = state({
-      aliasQueries: [[{ foodId: 'food-a', isDeprecated: false }]],
-      profiles: [
-        { id: 'estimated-new', qualityGrade: 'estimated', datasetVersion: '2025-01' },
-        { id: 'verified-old', qualityGrade: 'verified', datasetVersion: '2024-01' },
-        { id: 'verified-new-b', qualityGrade: 'verified', datasetVersion: '2025-01' },
-        { id: 'verified-new-a', qualityGrade: 'verified', datasetVersion: '2025-01' },
-      ],
-    });
-
-    await expect(makeCoordinator(s).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
     expect(s.items[0]).toMatchObject({
-      foodId: 'food-a',
-      nutrientProfileId: 'verified-new-a',
-      mappingConfidenceBps: 10_000,
+      foodId: null,
+      nutrientProfileId: null,
       gramsMg: null,
+      mappingConfidenceBps: null,
     });
+    const assessmentJson = JSON.stringify(s.items[0]!.initialEstimateAssessment);
+    expect(assessmentJson).toContain('initialFoodId');
+    expect(assessmentJson).toContain('initialNutrientProfileId');
+    expect(assessmentJson).toContain('recognitionProvider');
+    expect(assessmentJson).toContain('recognitionModel');
   });
-
-  test('uses exact normalized candidate aliases only when the primary label has no aliases', async () => {
-    const candidateResult: RecognitionResultV1 = {
-      foods: [{ ...result.foods[0]!, recognizedLabel: 'unmapped', candidateLabels: [' 김 밥!! '] }],
-    };
-    const s = state({
-      aliasQueries: [[], [{ foodId: 'food-kimbap', isDeprecated: false }]],
-      profiles: [{ id: 'profile', qualityGrade: 'verified', datasetVersion: '2025' }],
-    });
-
-    await expect(makeCoordinator(s, { result: candidateResult }).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
-    expect(s.items[0]).toMatchObject({
-      foodId: 'food-kimbap',
-      nutrientProfileId: 'profile',
-      mappingConfidenceBps: 10_000,
-    });
-  });
-
-  test('leaves ambiguous and deprecated exact aliases unmapped', async () => {
-    const ambiguous = state({
-      aliasQueries: [[
-        { foodId: 'food-a', isDeprecated: false },
-        { foodId: 'food-b', isDeprecated: false },
-      ]],
-      profiles: [{ id: 'profile', qualityGrade: 'verified', datasetVersion: '2025' }],
-    });
-    const deprecated = state({
-      aliasQueries: [[{ foodId: 'old-food', isDeprecated: true }]],
-      profiles: [{ id: 'profile', qualityGrade: 'verified', datasetVersion: '2025' }],
-    });
-
-    await expect(makeCoordinator(ambiguous).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
-    await expect(makeCoordinator(deprecated).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
-    expect(ambiguous.items[0]).toMatchObject({ foodId: null, nutrientProfileId: null, mappingConfidenceBps: null });
-    expect(deprecated.items[0]).toMatchObject({ foodId: null, nutrientProfileId: null, mappingConfidenceBps: null });
-  });
-  test('prefers one curated composite Food when expanded data has duplicate exact aliases', async () => {
+  test('fails closed when a normalized alias maps to multiple canonical foods', async () => {
     const s = state({
       aliasQueries: [[
-        { foodId: 'food-generic', isDeprecated: false, isComposite: true },
-        { foodId: 'food-duplicate', isDeprecated: false, isComposite: false },
-      ]],
-      profiles: [{ id: 'profile', qualityGrade: 'verified', datasetVersion: '2026' }],
+        {
+          foodId: 'food-a',
+          canonicalNameKo: '쌀밥',
+          normalizedAliasKo: 'rice',
+          isDeprecated: false,
+        },
+        {
+          foodId: 'food-b',
+          canonicalNameKo: '현미밥',
+          normalizedAliasKo: 'rice',
+          isDeprecated: false,
+        },
+      ]] as never,
+      profiles: [
+        { id: 'profile-a', foodId: 'food-a', qualityGrade: 'verified', datasetVersion: '2026-01' },
+        { id: 'profile-b', foodId: 'food-b', qualityGrade: 'verified', datasetVersion: '2026-01' },
+      ] as never,
     });
 
-    await expect(makeCoordinator(s).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
+    await expect(makeCoordinator(s).recognize('meal', 'user')).resolves.toEqual({
+      status: 'ready',
+    });
+    expect(s.items).toHaveLength(1);
     expect(s.items[0]).toMatchObject({
-      foodId: 'food-generic',
-      nutrientProfileId: 'profile',
-      mappingConfidenceBps: 10_000,
+      foodId: null,
+      nutrientProfileId: null,
+      mappingConfidenceBps: null,
     });
   });
-
-  test('leaves a food without a trusted complete eligible profile unmapped', async () => {
-    const s = state({ aliasQueries: [[{ foodId: 'food-a', isDeprecated: false }]] });
-
-    await expect(makeCoordinator(s).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
-    expect(s.items[0]).toMatchObject({ foodId: null, nutrientProfileId: null, mappingConfidenceBps: null });
-  });
-
   test('keeps canonical mapping infrastructure failures retryable instead of finalizing unmapped', async () => {
     const s = state({ mappingLookupFails: true });
 
@@ -439,5 +407,26 @@ describe('MealRecognitionCoordinator', () => {
       expect(outcome.status).toBe(mutation === 'stale' ? 'active' : 'unavailable');
       expect(s.items).toHaveLength(0);
     }
+  });
+  test('persists no_food as a ready, zero-item immutable recognition result', async () => {
+    const s = state();
+    const noFood: RecognitionResultV2 = { outcome: 'no_food', imageQualityConfidenceBps: 9_100, foods: [] };
+    await expect(makeCoordinator(s, { result: noFood }).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
+    expect(s.status).toBe('ready');
+    expect(s.items).toEqual([]);
+  });
+
+  test('persists insufficient_evidence with reason and no invented meal item', async () => {
+    const s = state();
+    const insufficient: RecognitionResultV2 = { outcome: 'insufficient_evidence', imageQualityConfidenceBps: 1_500, evidenceReason: 'blurred', foods: [] };
+    await expect(makeCoordinator(s, { result: insufficient }).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
+    expect(s.status).toBe('ready');
+    expect(s.items).toEqual([]);
+  });
+
+  test('persists recognized model origin and immutable V2 assessment', async () => {
+    const s = state();
+    await expect(makeCoordinator(s).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
+    expect(s.items[0]).toMatchObject({ origin: 'model_estimate', itemRevision: 1, foodRevision: 1, portionRevision: 1 });
   });
 });

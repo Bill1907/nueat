@@ -66,7 +66,7 @@ describe('meal draft policy', () => {
     ).toBe(true);
     expect(hasUnsavedMealDraftItemForms(items, {})).toBe(true);
   });
-  test('requires a current mapping and a resolvable serving conversion to confirm', () => {
+  test('allows core nutrition confirmation while retaining partial fiber totals', () => {
     const food = {
       id: 'rice',
       nutrientProfile: {
@@ -126,6 +126,7 @@ describe('meal draft policy', () => {
     ]);
     expect(partial.confirmable).toBe(true);
     expect(partial.totals.fiberMg).toMatchObject({
+      value: null,
       knownValue: 840,
       missingItemCount: 1,
       completeness: 'partial',

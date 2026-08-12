@@ -1,29 +1,35 @@
 import {
   assetDeletionJobs,
   calculationSnapshots,
-  foods,
-  foodServings,
   imageAssets,
   mealItems,
   mealLogs,
-  nutrientProfiles,
-  sourceRegistries,
   userProfiles,
+  isRecognitionResultV2,
   type Database,
 } from '@nueat/database';
 import {
   calculateMealNutrition,
+  deriveItemReviewState,
+  deriveMealReviewState,
   NutritionCalculationError,
+  MEAL_ESTIMATE_REVIEW_POLICY_VERSION,
+  MEAL_ESTIMATE_REVIEW_THRESHOLDS,
   type CalculatedNutritionValues,
   type MealNutritionInput,
 } from '@nueat/domain';
-import { and, asc, desc, eq, inArray, or } from 'drizzle-orm';
+import { and, asc, desc, eq, or, sql } from 'drizzle-orm';
 import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
 import type { Auth } from '../auth/auth';
+import type { ApiEnvironment } from '../config/env';
 import type { MealRecognitionRunner } from '../services/meal-recognition-coordinator';
+import {
+  resolveCurrentMealItems,
+  resolveFoodSelection,
+} from '../services/meal-item-resolution';
 
 const mealTypeSchema = z.enum(['breakfast', 'lunch', 'dinner', 'snack']);
 const servingUnitSchema = z.enum(['g', 'ml', 'serving', 'bowl', 'piece']);
@@ -43,41 +49,111 @@ const createMealLogSchema = z
     mealType: mealTypeSchema,
   })
   .strict();
-const updateMealLogSchema = z
-  .object({
-    eatenAt: dateTimeSchema.optional(),
-    timezone: timezoneSchema.optional(),
-    mealType: mealTypeSchema.optional(),
-  })
-  .strict()
-  .refine((value) => Object.keys(value).length > 0);
-const createMealItemSchema = z
-  .object({
-    recognizedLabel: z.string().trim().min(1),
-    amountMilliunits: z.int().positive(),
-    unit: servingUnitSchema,
-  })
-  .strict();
-const updateMealItemSchema = z
-  .object({
-    recognizedLabel: z.string().trim().min(1).optional(),
-    amountMilliunits: z.int().positive().optional(),
-    unit: servingUnitSchema.optional(),
-  })
-  .strict()
-  .refine((value) => Object.keys(value).length > 0);
-const mapFoodSchema = z.object({ foodId: z.uuid() }).strict();
+const expectedDraftRevisionSchema = z.object({ expectedDraftRevision: z.int().positive() }).strict();
+const updateMealLogSchema = z.object({
+  expectedDraftRevision: z.int().positive(),
+  eatenAt: dateTimeSchema.optional(),
+  timezone: timezoneSchema.optional(),
+  mealType: mealTypeSchema.optional(),
+}).strict().refine((value) => Object.keys(value).length > 1);
+const createMealItemSchema = z.object({
+  expectedDraftRevision: z.int().positive(),
+  recognizedLabel: z.string().trim().min(1),
+  amountMilliunits: z.int().positive(),
+  unit: servingUnitSchema,
+}).strict();
+const updateMealItemSchema = z.object({
+  expectedItemRevision: z.int().positive(),
+  recognizedLabel: z.string().trim().min(1).optional(),
+  amountMilliunits: z.int().positive().optional(),
+  unit: servingUnitSchema.optional(),
+}).strict().refine((value) => Object.keys(value).length > 1);
+const mapFoodSchema = z.object({ foodId: z.uuid(), expectedItemRevision: z.int().positive() }).strict();
+const deleteMealItemSchema = z.object({
+  expectedDraftRevision: z.int().positive(),
+  expectedItemRevision: z.int().positive(),
+}).strict();
+const confirmMealSchema = z.object({
+  expectedDraftRevision: z.int().positive(),
+  items: z.array(z.object({
+    itemId: z.uuid(),
+    expectedItemRevision: z.int().positive(),
+  }).strict()),
+}).strict();
+const reviewMealSchema = z.object({
+  expectedDraftRevision: z.int().positive(),
+  items: z.array(z.object({
+    itemId: z.uuid(),
+    expectedItemRevision: z.int().positive(),
+    foodAcknowledgedRevision: z.int().positive().optional(),
+    portionAcknowledgedRevision: z.int().positive().optional(),
+  }).strict()).min(1),
+}).strict();
 
 interface MealLogRouteOptions {
   auth: Auth;
   database: Database;
   recognitionCoordinator: MealRecognitionRunner;
+  reviewPolicy: ApiEnvironment['mealRecognition']['reviewPolicy'];
 }
+type ReviewPolicyConfig = ApiEnvironment['mealRecognition']['reviewPolicy'];
+const resolutionReviewReasonCodes = new Set([
+  'FOOD_MAPPING_MISSING',
+  'FOOD_NOT_FOUND',
+  'FOOD_DEPRECATED',
+  'NUTRIENT_PROFILE_MISSING',
+  'NUTRIENT_PROFILE_MISMATCHED',
+  'NUTRIENT_PROFILE_UNTRUSTED',
+  'CORE_NUTRIENTS_MISSING',
+  'SERVING_CONVERSION_MISSING',
+  'SERVING_CONVERSION_AMBIGUOUS',
+  'SERVING_CONVERSION_UNTRUSTED',
+]);
 
 export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
   app,
   options,
 ) => {
+  const mealLogResponse = (
+    database: Database,
+    mealLog: any,
+    items: any[],
+  ) => buildMealLogResponse(database, mealLog, items, options.reviewPolicy);
+  const recognitionResponse = (
+    database: Database,
+    reply: FastifyReply,
+    mealLog: NonNullable<Awaited<ReturnType<typeof findOwnedMealLog>>>,
+    items: Awaited<ReturnType<typeof findMealItems>>,
+    outcome: {
+      status: 'ready' | 'active' | 'unavailable';
+      retryAfterSeconds?: number;
+      code?: string;
+      retryable?: boolean;
+    },
+    createdStatus?: number,
+  ) => sendRecognitionResponse(
+    database,
+    options.reviewPolicy,
+    reply,
+    mealLog,
+    items,
+    outcome,
+    createdStatus,
+  );
+  const staleMealResponse = (
+    database: Database,
+    reply: FastifyReply,
+    request: FastifyRequest,
+    code: 'MEAL_DRAFT_STALE' | 'MEAL_ITEM_STALE',
+    latest: { mealLog: unknown; items: unknown[] },
+  ) => sendStaleMealResponse(
+    database,
+    options.reviewPolicy,
+    reply,
+    request,
+    code,
+    latest,
+  );
   app.post('/api/meal-logs', async (request, reply) => {
     const userId = await requireUserId(request, reply, options.auth);
     if (!userId) return;
@@ -106,6 +182,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       const current = await findOwnedMealLog(options.database, existing.id, userId);
       if (!current) return mealLogNotFound(reply, request);
       return recognitionResponse(
+        options.database,
         reply,
         current,
         await findMealItems(options.database, current.id),
@@ -156,6 +233,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       const current = await findOwnedMealLog(options.database, concurrent.id, userId);
       if (!current) return mealLogNotFound(reply, request);
       return recognitionResponse(
+        options.database,
         reply,
         current,
         await findMealItems(options.database, current.id),
@@ -165,7 +243,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     const outcome = await options.recognitionCoordinator.recognize(mealLog.id, userId);
     const current = await findOwnedMealLog(options.database, mealLog.id, userId);
     if (!current) return mealLogNotFound(reply, request);
-    return recognitionResponse(reply, current, await findMealItems(options.database, current.id), outcome, 201);
+    return recognitionResponse(options.database, reply, current, await findMealItems(options.database, current.id), outcome, 201);
   });
 
   app.get('/api/meal-logs/:mealLogId', async (request, reply) => {
@@ -180,7 +258,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     );
     if (!mealLog) return mealLogNotFound(reply, request);
     const items = await findMealItems(options.database, mealLog.id);
-    return mealLogResponse(mealLog, items);
+    return await mealLogResponse(options.database, mealLog, items);
   });
 
   app.patch('/api/meal-logs/:mealLogId', async (request, reply) => {
@@ -215,6 +293,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         eatenTimezone: timezone,
         eatenLocalDate: localDate(eatenAt, timezone),
         mealType,
+        draftRevision: sql`${mealLogs.draftRevision} + 1`,
         updatedAt: new Date(),
       })
       .where(
@@ -222,12 +301,18 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
           eq(mealLogs.id, existing.id),
           eq(mealLogs.userId, userId),
           eq(mealLogs.status, 'draft'),
+          eq(mealLogs.draftRevision, body.data.expectedDraftRevision),
         ),
       )
       .returning(mealLogSelection);
-    if (!mealLog) return invalidMealLogState(reply, request);
+    if (!mealLog) {
+      return await staleMealResponse(options.database, reply, request, 'MEAL_DRAFT_STALE', {
+        mealLog: await findOwnedMealLog(options.database, existing.id, userId),
+        items: await findMealItems(options.database, existing.id),
+      });
+    }
     const items = await findMealItems(options.database, mealLog.id);
-    return mealLogResponse(mealLog, items);
+    return await mealLogResponse(options.database, mealLog, items);
   });
 
   app.post('/api/meal-logs/:mealLogId/items', async (request, reply) => {
@@ -255,21 +340,49 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
           mealLog.recognitionStatus !== 'manual')
       )
         return { kind: 'invalid_state' as const };
-
+      if (mealLog.draftRevision !== body.data.expectedDraftRevision)
+        return { kind: 'stale' as const, mealLog };
+      if (
+        mealLog.recognitionStatus === 'ready' &&
+        isRecognitionResultV2(mealLog.recognitionResult) &&
+        mealLog.recognitionResult.outcome !== 'recognized'
+      )
+        return { kind: 'invalid_state' as const };
+      const { expectedDraftRevision, ...itemInput } = body.data;
       await tx
         .insert(mealItems)
-        .values({ mealLogId: mealLog.id, ...body.data, userCorrected: true });
+        .values({
+          mealLogId: mealLog.id,
+          ...itemInput,
+          userCorrected: true,
+          origin: mealLog.recognitionStatus === 'manual' ? 'manual_entry' : 'user_added',
+          currentResolutionSource: null,
+        });
+      const [currentMealLog] = await tx
+        .update(mealLogs)
+        .set({ draftRevision: sql`${mealLogs.draftRevision} + 1`, updatedAt: new Date() })
+        .where(eq(mealLogs.id, mealLog.id))
+        .returning(mealLogSelection);
+      if (!currentMealLog) throw new Error('Draft meal disappeared while adding item');
       const items = await tx
         .select(mealItemSelection)
         .from(mealItems)
         .where(eq(mealItems.mealLogId, mealLog.id))
         .orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
-      return { kind: 'created' as const, mealLog, items };
+      return { kind: 'created' as const, mealLog: currentMealLog, items };
     });
     if (created.kind === 'not_found') return mealLogNotFound(reply, request);
+    if (created.kind === 'stale') {
+      const latest = await findOwnedMealLog(options.database, params.data.mealLogId, userId);
+      if (!latest) return mealLogNotFound(reply, request);
+      return await staleMealResponse(options.database, reply, request, 'MEAL_DRAFT_STALE', {
+        mealLog: latest,
+        items: await findMealItems(options.database, latest.id),
+      });
+    }
     if (created.kind === 'invalid_state')
       return invalidMealLogState(reply, request);
-    return reply.status(201).send(mealLogResponse(created.mealLog, created.items));
+    return reply.status(201).send(await mealLogResponse(options.database, created.mealLog, created.items));
   });
 
   app.patch(
@@ -301,17 +414,54 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         )
           return { kind: 'invalid_state' as const };
 
+        const { expectedItemRevision, ...changes } = body.data;
+        const [currentItem] = await tx
+          .select(mealItemSelection)
+          .from(mealItems)
+          .where(and(eq(mealItems.id, params.data.itemId), eq(mealItems.mealLogId, mealLog.id)))
+          .limit(1);
+        if (!currentItem || currentItem.itemRevision !== body.data.expectedItemRevision)
+          return { kind: 'item_not_found' as const };
+        const foodChanged =
+          body.data.recognizedLabel !== undefined &&
+          body.data.recognizedLabel !== currentItem.recognizedLabel;
+        const amountChanged =
+          body.data.amountMilliunits !== undefined &&
+          body.data.amountMilliunits !== currentItem.amountMilliunits;
+        const unitChanged =
+          body.data.unit !== undefined && body.data.unit !== currentItem.unit;
+        const portionChanged = amountChanged || unitChanged;
+        if (!foodChanged && !portionChanged) {
+          const items = await tx.select(mealItemSelection).from(mealItems)
+            .where(eq(mealItems.mealLogId, mealLog.id))
+            .orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
+          return { kind: 'updated' as const, mealLog, items };
+        }
         const [item] = await tx
           .update(mealItems)
           .set({
-            ...body.data,
-            ...(body.data.recognizedLabel === undefined
-              ? {}
-              : {
+            ...(foodChanged
+              ? {
+                  recognizedLabel: changes.recognizedLabel,
                   foodId: null,
                   nutrientProfileId: null,
                   mappingConfidenceBps: null,
-                }),
+                  currentResolutionSource: null,
+                  foodAcknowledgedRevision: null,
+                }
+              : {}),
+            ...(amountChanged ? { amountMilliunits: changes.amountMilliunits } : {}),
+            ...(unitChanged ? { unit: changes.unit } : {}),
+            itemRevision: sql`${mealItems.itemRevision} + 1`,
+            ...(foodChanged
+              ? { foodRevision: sql`${mealItems.foodRevision} + 1` }
+              : {}),
+            ...(portionChanged
+              ? {
+                  portionRevision: sql`${mealItems.portionRevision} + 1`,
+                  portionAcknowledgedRevision: sql`${mealItems.portionRevision} + 1`,
+                }
+              : {}),
             userCorrected: true,
             updatedAt: new Date(),
           })
@@ -319,22 +469,36 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
             and(
               eq(mealItems.id, params.data.itemId),
               eq(mealItems.mealLogId, mealLog.id),
+              eq(mealItems.itemRevision, expectedItemRevision),
             ),
           )
           .returning(mealItemSelection);
         if (!item) return { kind: 'item_not_found' as const };
+        const [currentMealLog] = await tx
+          .update(mealLogs)
+          .set({ draftRevision: sql`${mealLogs.draftRevision} + 1`, updatedAt: new Date() })
+          .where(eq(mealLogs.id, mealLog.id))
+          .returning(mealLogSelection);
+        if (!currentMealLog) throw new Error('Draft meal disappeared while updating item');
         const items = await tx
           .select(mealItemSelection)
           .from(mealItems)
           .where(eq(mealItems.mealLogId, mealLog.id))
           .orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
-        return { kind: 'updated' as const, mealLog, items };
+        return { kind: 'updated' as const, mealLog: currentMealLog, items };
       });
-      if (updated.kind === 'not_found' || updated.kind === 'item_not_found')
-        return mealLogNotFound(reply, request);
+      if (updated.kind === 'not_found') return mealLogNotFound(reply, request);
+      if (updated.kind === 'item_not_found') {
+        const latest = await findOwnedMealLog(options.database, params.data.mealLogId, userId);
+        if (!latest) return mealLogNotFound(reply, request);
+        return await staleMealResponse(options.database, reply, request, 'MEAL_ITEM_STALE', {
+          mealLog: latest,
+          items: await findMealItems(options.database, latest.id),
+        });
+      }
       if (updated.kind === 'invalid_state')
         return invalidMealLogState(reply, request);
-      return mealLogResponse(updated.mealLog, updated.items);
+      return await mealLogResponse(options.database, updated.mealLog, updated.items);
     },
   );
   app.put(
@@ -360,40 +524,39 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
             mealLog.recognitionStatus !== 'manual')
         )
           return { kind: 'invalid_state' as const };
-
-        const [food] = await tx
-          .select({ id: foods.id, canonicalNameKo: foods.canonicalNameKo })
-          .from(foods)
-          .where(and(eq(foods.id, body.data.foodId), eq(foods.isDeprecated, false)))
+        const [currentItem] = await tx
+          .select(mealItemSelection)
+          .from(mealItems)
+          .where(and(eq(mealItems.id, params.data.itemId), eq(mealItems.mealLogId, mealLog.id)))
           .limit(1);
-        if (!food) return { kind: 'food_not_found' as const };
-        const [profile] = await tx
-          .select({ id: nutrientProfiles.id })
-          .from(nutrientProfiles)
-          .where(
-            and(
-              eq(nutrientProfiles.foodId, food.id),
-              or(
-                eq(nutrientProfiles.qualityGrade, 'verified'),
-                eq(nutrientProfiles.qualityGrade, 'estimated'),
-              ),
-            ),
-          )
-          .orderBy(
-            desc(nutrientProfiles.qualityGrade),
-            desc(nutrientProfiles.datasetVersion),
-            asc(nutrientProfiles.id),
-          )
-          .limit(1);
-        if (!profile) return { kind: 'profile_unavailable' as const };
+        if (!currentItem || currentItem.itemRevision !== body.data.expectedItemRevision)
+          return { kind: 'item_not_found' as const };
+        const selection = await resolveFoodSelection(tx, body.data.foodId);
+        if (selection.kind === 'food_not_found')
+          return { kind: 'food_not_found' as const };
+        if (selection.kind === 'profile_unavailable')
+          return { kind: 'profile_unavailable' as const };
+        if (
+          currentItem.foodId === selection.food.id &&
+          currentItem.nutrientProfileId === selection.nutrientProfileId
+        ) {
+          const items = await tx.select(mealItemSelection).from(mealItems)
+            .where(eq(mealItems.mealLogId, mealLog.id))
+            .orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
+          return { kind: 'mapped' as const, mealLog, items };
+        }
 
         const [item] = await tx
           .update(mealItems)
           .set({
-            recognizedLabel: food.canonicalNameKo,
-            foodId: food.id,
-            nutrientProfileId: profile.id,
+            recognizedLabel: selection.food.canonicalNameKo,
+            foodId: selection.food.id,
+            nutrientProfileId: selection.nutrientProfileId,
             mappingConfidenceBps: 10_000,
+            currentResolutionSource: 'user_selected',
+            itemRevision: sql`${mealItems.itemRevision} + 1`,
+            foodRevision: sql`${mealItems.foodRevision} + 1`,
+            foodAcknowledgedRevision: sql`${mealItems.foodRevision} + 1`,
             userCorrected: true,
             updatedAt: new Date(),
           })
@@ -401,32 +564,102 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
             and(
               eq(mealItems.id, params.data.itemId),
               eq(mealItems.mealLogId, mealLog.id),
+              eq(mealItems.itemRevision, body.data.expectedItemRevision),
             ),
           )
           .returning(mealItemSelection);
         if (!item) return { kind: 'item_not_found' as const };
+        const [currentMealLog] = await tx
+          .update(mealLogs)
+          .set({ draftRevision: sql`${mealLogs.draftRevision} + 1`, updatedAt: new Date() })
+          .where(eq(mealLogs.id, mealLog.id))
+          .returning(mealLogSelection);
+        if (!currentMealLog) throw new Error('Draft meal disappeared while mapping food');
         const items = await tx
           .select(mealItemSelection)
           .from(mealItems)
           .where(eq(mealItems.mealLogId, mealLog.id))
           .orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
-        return { kind: 'mapped' as const, mealLog, items };
+        return { kind: 'mapped' as const, mealLog: currentMealLog, items };
       });
-      if (mapped.kind === 'not_found' || mapped.kind === 'item_not_found')
-        return mealLogNotFound(reply, request);
+      if (mapped.kind === 'not_found') return mealLogNotFound(reply, request);
+      if (mapped.kind === 'item_not_found') {
+        const latest = await findOwnedMealLog(options.database, params.data.mealLogId, userId);
+        if (!latest) return mealLogNotFound(reply, request);
+        return await staleMealResponse(options.database, reply, request, 'MEAL_ITEM_STALE', {
+          mealLog: latest,
+          items: await findMealItems(options.database, latest.id),
+        });
+      }
       if (mapped.kind === 'invalid_state')
         return invalidMealLogState(reply, request);
       if (mapped.kind === 'food_not_found') return foodNotFound(reply, request);
       if (mapped.kind === 'profile_unavailable')
         return foodNutrientProfileUnavailable(reply, request);
-      return mealLogResponse(mapped.mealLog, mapped.items);
+      return await mealLogResponse(options.database, mapped.mealLog, mapped.items);
     },
   );
+  app.post('/api/meal-logs/:mealLogId/review', async (request, reply) => {
+    const userId = await requireUserId(request, reply, options.auth);
+    if (!userId) return;
+    const params = mealLogIdParamsSchema.safeParse(request.params);
+    const body = reviewMealSchema.safeParse(request.body);
+    if (!params.success || !body.success) return invalidRequest(reply, request);
+    const result = await options.database.transaction(async (tx) => {
+      const [mealLog] = await tx.select(mealLogSelection).from(mealLogs).where(and(eq(mealLogs.id, params.data.mealLogId), eq(mealLogs.userId, userId))).for('update').limit(1);
+      if (!mealLog) return { kind: 'not_found' as const };
+      const items = await tx.select(mealItemSelection).from(mealItems).where(eq(mealItems.mealLogId, mealLog.id)).orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
+      if (mealLog.status !== 'draft' || mealLog.draftRevision !== body.data.expectedDraftRevision) return { kind: 'stale' as const, mealLog, items };
+      const requested = new Map(body.data.items.map((item) => [item.itemId, item]));
+      const targets = items.filter((item) => requested.has(item.id));
+      if (targets.length !== body.data.items.length || targets.some((item) => requested.get(item.id)!.expectedItemRevision !== item.itemRevision)) return { kind: 'stale' as const, mealLog, items };
+      if (targets.some((item) => {
+        const acknowledgement = requested.get(item.id)!;
+        return (
+          (acknowledgement.foodAcknowledgedRevision !== undefined &&
+            acknowledgement.foodAcknowledgedRevision !== item.foodRevision) ||
+          (acknowledgement.portionAcknowledgedRevision !== undefined &&
+            acknowledgement.portionAcknowledgedRevision !== item.portionRevision)
+        );
+      })) return { kind: 'stale' as const, mealLog, items };
+      const resolutions = await resolveCurrentMealItems(tx, targets);
+      if (resolutions.some((resolution) => resolution.reason !== null)) return { kind: 'unacknowledgeable' as const };
+      const changesAcknowledgement = targets.some((item) => {
+        const acknowledgement = requested.get(item.id)!;
+        return (
+          (acknowledgement.foodAcknowledgedRevision !== undefined &&
+            item.foodAcknowledgedRevision !== item.foodRevision) ||
+          (acknowledgement.portionAcknowledgedRevision !== undefined &&
+            item.portionAcknowledgedRevision !== item.portionRevision)
+        );
+      });
+      if (!changesAcknowledgement)
+        return { kind: 'reviewed' as const, mealLog, items };
+      for (const item of targets) {
+        const acknowledgement = requested.get(item.id)!;
+        await tx.update(mealItems).set({
+          ...(acknowledgement.foodAcknowledgedRevision === undefined ? {} : { foodAcknowledgedRevision: item.foodRevision }),
+          ...(acknowledgement.portionAcknowledgedRevision === undefined ? {} : { portionAcknowledgedRevision: item.portionRevision }),
+          itemRevision: sql`${mealItems.itemRevision} + 1`,
+          updatedAt: new Date(),
+        }).where(eq(mealItems.id, item.id));
+      }
+      const [updatedMealLog] = await tx.update(mealLogs).set({ draftRevision: sql`${mealLogs.draftRevision} + 1`, updatedAt: new Date() }).where(eq(mealLogs.id, mealLog.id)).returning(mealLogSelection);
+      if (!updatedMealLog) throw new Error('Draft meal disappeared while reviewing');
+      const updatedItems = await tx.select(mealItemSelection).from(mealItems).where(eq(mealItems.mealLogId, mealLog.id)).orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
+      return { kind: 'reviewed' as const, mealLog: updatedMealLog, items: updatedItems };
+    });
+    if (result.kind === 'not_found') return mealLogNotFound(reply, request);
+    if (result.kind === 'unacknowledgeable') return reply.status(409).send({ error: { code: 'MEAL_REVIEW_NOT_ACKNOWLEDGEABLE', message: '해결되지 않은 영양 근거는 확인할 수 없습니다.', requestId: request.id } });
+    if (result.kind === 'stale') return await staleMealResponse(options.database, reply, request, 'MEAL_ITEM_STALE', result);
+    return await mealLogResponse(options.database, result.mealLog, result.items);
+  });
   app.post('/api/meal-logs/:mealLogId/confirm', async (request, reply) => {
     const userId = await requireUserId(request, reply, options.auth);
     if (!userId) return;
     const params = mealLogIdParamsSchema.safeParse(request.params);
-    if (!params.success) return invalidRequest(reply, request);
+    const body = confirmMealSchema.safeParse(request.body);
+    if (!params.success || !body.success) return invalidRequest(reply, request);
 
     const confirmed = await options.database.transaction(async (tx) => {
       const [mealLog] = await tx
@@ -455,6 +688,13 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         .orderBy(desc(calculationSnapshots.sequence))
         .limit(1);
 
+      if (mealLog.status === 'draft' && mealLog.draftRevision !== body.data.expectedDraftRevision)
+        return { kind: 'stale' as const, mealLog, items };
+      const expectedItems = new Map(body.data.items.map((item) => [item.itemId, item.expectedItemRevision]));
+      if (
+        expectedItems.size !== items.length ||
+        items.some((item) => expectedItems.get(item.id) !== item.itemRevision)
+      ) return { kind: 'stale' as const, mealLog, items };
       if (mealLog.status === 'confirmed')
         return snapshot
           ? { kind: 'confirmed' as const, mealLog, items, snapshot }
@@ -469,174 +709,19 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
           kind: 'invalid' as const,
           details: [{ code: 'EMPTY_MEAL' }],
         };
-
-      const mappedItems = items.filter(
-        (item) => item.foodId !== null && item.nutrientProfileId !== null,
+      const authoritativeReview = await mealLogResponse(tx as unknown as Database, mealLog, items);
+      const policyBlockingReasons = authoritativeReview.review.reasons.filter(
+        (reason) => !resolutionReviewReasonCodes.has(reason.code),
       );
-      const selectedFoods =
-        mappedItems.length === 0
-          ? []
-          : await tx
-              .select({ id: foods.id, isDeprecated: foods.isDeprecated })
-              .from(foods)
-              .where(
-                inArray(
-                  foods.id,
-                  [...new Set(mappedItems.map((item) => item.foodId!))],
-                ),
-              );
-      const foodById = new Map(selectedFoods.map((food) => [food.id, food]));
-      const profiles =
-        mappedItems.length === 0
-          ? []
-          : await tx
-              .select(nutrientProfileCalculationSelection)
-              .from(nutrientProfiles)
-              .where(
-                inArray(
-                  nutrientProfiles.id,
-                  mappedItems.map((item) => item.nutrientProfileId!),
-                ),
-              );
-      const profileById = new Map(profiles.map((profile) => [profile.id, profile]));
-      const nonGramItems = mappedItems.filter((item) => item.unit !== 'g');
-      const servings =
-        nonGramItems.length === 0
-          ? []
-          : await tx
-              .select(foodServingCalculationSelection)
-              .from(foodServings)
-              .where(
-                inArray(
-                  foodServings.foodId,
-                  [...new Set(nonGramItems.map((item) => item.foodId!))],
-                ),
-              );
-      const registries =
-        profiles.length === 0 && servings.length === 0
-          ? []
-          : await tx
-              .select({ id: sourceRegistries.id, kind: sourceRegistries.kind })
-              .from(sourceRegistries)
-              .where(
-                inArray(
-                  sourceRegistries.id,
-                  [
-                    ...new Set([
-                      ...profiles.map((profile) => profile.sourceRegistryId),
-                      ...servings.map((serving) => serving.sourceRegistryId),
-                    ]),
-                  ],
-                ),
-              );
-      const registryById = new Map(
-        registries.map((registry) => [registry.id, registry]),
-      );
-
-      const details = items.flatMap((item) => {
-        if (!item.foodId || !item.nutrientProfileId)
-          return [{ itemId: item.id, code: 'MISSING_MAPPING' }];
-        const food = foodById.get(item.foodId);
-        if (!food) return [{ itemId: item.id, code: 'MISSING_FOOD' }];
-        if (food.isDeprecated) return [{ itemId: item.id, code: 'DEPRECATED_FOOD' }];
-        const profile = profileById.get(item.nutrientProfileId);
-        if (!profile) return [{ itemId: item.id, code: 'MISSING_PROFILE' }];
-        if (profile.foodId !== item.foodId)
-          return [{ itemId: item.id, code: 'MISMATCHED_PROFILE' }];
-        if (
-          profile.qualityGrade !== 'verified' &&
-          profile.qualityGrade !== 'estimated'
-        )
-          return [{ itemId: item.id, code: 'UNTRUSTED_PROFILE_SOURCE' }];
-        const profileRegistry = registryById.get(profile.sourceRegistryId);
-        if (
-          !profileRegistry ||
-          !isTrustedNutritionSourceKind(profileRegistry.kind)
-        )
-          return [{ itemId: item.id, code: 'UNTRUSTED_PROFILE_SOURCE' }];
-        if (
-          profile.energyMillicalories === null ||
-          profile.carbohydrateMg === null ||
-          profile.proteinMg === null ||
-          profile.fatMg === null
-        )
-          return [{ itemId: item.id, code: 'INCOMPLETE_PROFILE' }];
-        if (item.unit === 'g') return [];
-        const matchingServings = servings.filter(
-          (serving) => serving.foodId === item.foodId && serving.unit === item.unit,
-        );
-        if (matchingServings.length === 0)
-          return [{ itemId: item.id, code: 'MISSING_SERVING_CONVERSION' }];
-        if (matchingServings.length > 1)
-          return [{ itemId: item.id, code: 'AMBIGUOUS_SERVING_CONVERSION' }];
-        const serving = matchingServings[0]!;
-        if (
-          serving.qualityGrade !== 'verified' &&
-          serving.qualityGrade !== 'estimated'
-        )
-          return [{ itemId: item.id, code: 'UNTRUSTED_SERVING_SOURCE' }];
-        const servingRegistry = registryById.get(serving.sourceRegistryId);
-        if (
-          !servingRegistry ||
-          !isTrustedNutritionSourceKind(servingRegistry.kind)
-        )
-          return [{ itemId: item.id, code: 'UNTRUSTED_SERVING_SOURCE' }];
-        return [];
-      });
-      if (details.length > 0) return { kind: 'invalid' as const, details };
-
-      const nutritionInputs: MealNutritionInput[] = items.map((item) => {
-        const profile = profileById.get(item.nutrientProfileId!)!;
-        const baseInput = {
-          mealItemId: item.id,
-          amountMilliunits: item.amountMilliunits,
-          unit: item.unit,
-          nutrientProfile: {
-            basisAmountMg: profile.basisAmountMg,
-            energyMillicalories: profile.energyMillicalories,
-            carbohydrateMg: profile.carbohydrateMg,
-            proteinMg: profile.proteinMg,
-            fatMg: profile.fatMg,
-            fiberMg: profile.fiberMg,
-          },
-        };
-        if (item.unit === 'g') return baseInput;
-        const serving = servings.find(
-          (candidate) =>
-            candidate.foodId === item.foodId && candidate.unit === item.unit,
-        );
-        if (!serving || serving.unit === 'g')
-          throw new Error('Validated serving conversion is missing');
-        return {
-          ...baseInput,
-          unit: item.unit,
-          serving: {
-            id: serving.id,
-            unit: serving.unit,
-            amountMilliunits: serving.amountMilliunits,
-            gramsMg: serving.gramsMg,
-            sourceRegistryId: serving.sourceRegistryId,
-            qualityGrade: serving.qualityGrade,
-          },
-        };
-      });
-
-      let nutrition;
-      try {
-        nutrition = calculateMealNutrition(nutritionInputs);
-      } catch (error) {
+      if (policyBlockingReasons.length > 0)
         return {
           kind: 'invalid' as const,
-          details: [
-            {
-              code:
-                error instanceof NutritionCalculationError
-                  ? error.code
-                  : 'CALCULATION_FAILED',
-            },
-          ],
+          details: policyBlockingReasons,
         };
-      }
+
+      const resolvedNutrition = await calculateResolvedMealNutrition(tx, items);
+      if ('details' in resolvedNutrition) return { kind: 'invalid' as const, details: resolvedNutrition.details };
+      const { nutrition, resolutionsByItemId } = resolvedNutrition;
 
       const now = new Date();
       const calculatedByItemId = new Map(
@@ -655,19 +740,45 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
           mealLogId: mealLog.id,
           sequence: snapshot ? snapshot.sequence + 1 : 1,
           inputSnapshot: {
+            confirmationDecision: {
+              originalRecognition: isRecognitionResultV2(mealLog.recognitionResult) && mealLog.recognitionProvider && mealLog.recognitionModel && mealLog.recognitionPromptVersion && mealLog.recognitionSchemaVersion && mealLog.recognitionCompletedAt
+                ? {
+                    provider: mealLog.recognitionProvider,
+                    model: mealLog.recognitionModel,
+                    promptVersion: mealLog.recognitionPromptVersion,
+                    schemaVersion: mealLog.recognitionSchemaVersion,
+                    outcome: mealLog.recognitionResult.outcome,
+                    ...(mealLog.recognitionResult.outcome === 'insufficient_evidence'
+                      ? { evidenceReason: mealLog.recognitionResult.evidenceReason }
+                      : {}),
+                    completedAt: mealLog.recognitionCompletedAt.toISOString(),
+                  }
+                : null,
+              manualOverride: mealLog.recognitionManualOverride ?? null,
+              policy: {
+                version: MEAL_ESTIMATE_REVIEW_POLICY_VERSION,
+                activation: options.reviewPolicy.mode,
+                approvedReportSha256: options.reviewPolicy.approvedReportSha256 ?? null,
+                activeReportSha256: options.reviewPolicy.activeReportSha256 ?? null,
+                approvedReportVersion: options.reviewPolicy.approvedReportVersion ?? null,
+              },
+            },
             mealItems: items.map((item) => {
-              const profile = profileById.get(item.nutrientProfileId!)!;
+              const resolution = resolutionsByItemId.get(item.id)!;
+              const profile = resolution.profile!;
+              const serving = resolution.serving;
               const calculated = calculatedByItemId.get(item.id)!;
-              const serving =
-                item.unit === 'g'
-                  ? undefined
-                  : servings.find(
-                      (candidate) =>
-                        candidate.foodId === item.foodId && candidate.unit === item.unit,
-                    );
               return {
                 mealItemId: item.id,
-                foodId: item.foodId!,
+                origin: item.origin,
+                initialEstimateAssessment: item.initialEstimateAssessment,
+                currentResolutionSource: item.currentResolutionSource,
+                itemRevision: item.itemRevision,
+                foodRevision: item.foodRevision,
+                portionRevision: item.portionRevision,
+                foodAcknowledgedRevision: item.foodAcknowledgedRevision,
+                portionAcknowledgedRevision: item.portionAcknowledgedRevision,
+                foodId: resolution.food!.id,
                 nutrientProfileId: profile.id,
                 amountMilliunits: item.amountMilliunits,
                 unit: item.unit,
@@ -684,10 +795,10 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
                   fatMg: profile.fatMg!,
                   fiberMg: profile.fiberMg,
                 },
-                serving: serving && serving.unit !== 'g'
+                serving: serving && item.unit !== 'g'
                   ? {
                       id: serving.id,
-                      unit: serving.unit,
+                      unit: serving.unit as 'ml' | 'serving' | 'bowl' | 'piece',
                       amountMilliunits: serving.amountMilliunits,
                       gramsMg: serving.gramsMg,
                       sourceRegistryId: serving.sourceRegistryId,
@@ -744,12 +855,20 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
 
     if (confirmed.kind === 'retry')
       return mealConfirmationRetryable(reply, request);
+    if (confirmed.kind === 'stale') {
+      const latest = await findOwnedMealLog(options.database, params.data.mealLogId, userId);
+      if (!latest) return mealLogNotFound(reply, request);
+      return await staleMealResponse(options.database, reply, request, 'MEAL_DRAFT_STALE', {
+        mealLog: latest,
+        items: await findMealItems(options.database, latest.id),
+      });
+    }
     if (confirmed.kind === 'not_found') return mealLogNotFound(reply, request);
     if (confirmed.kind === 'invalid_state') return invalidMealLogState(reply, request);
     if (confirmed.kind === 'invalid')
       return invalidMealConfirmation(reply, request, confirmed.details);
     return {
-      ...mealLogResponse(confirmed.mealLog, confirmed.items),
+      ...(await mealLogResponse(options.database, confirmed.mealLog, confirmed.items)),
       nutrition: nutritionSnapshotResponse(confirmed.snapshot),
     };
   });
@@ -760,7 +879,8 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       const userId = await requireUserId(request, reply, options.auth);
       if (!userId) return;
       const params = mealItemIdParamsSchema.safeParse(request.params);
-      if (!params.success) return invalidRequest(reply, request);
+      const body = deleteMealItemSchema.safeParse(request.body);
+      if (!params.success || !body.success) return invalidRequest(reply, request);
       const deleted = await options.database.transaction(async (tx) => {
         const [mealLog] = await tx
           .select(mealLogSelection)
@@ -780,28 +900,44 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
             mealLog.recognitionStatus !== 'manual')
         )
           return { kind: 'invalid_state' as const };
+        if (mealLog.draftRevision !== body.data.expectedDraftRevision)
+          return { kind: 'stale' as const, mealLog };
         const [item] = await tx
           .delete(mealItems)
           .where(
             and(
               eq(mealItems.id, params.data.itemId),
               eq(mealItems.mealLogId, mealLog.id),
+              eq(mealItems.itemRevision, body.data.expectedItemRevision),
             ),
           )
           .returning({ id: mealItems.id });
-        if (!item) return { kind: 'item_not_found' as const };
+        if (!item) return { kind: 'stale' as const, mealLog };
+        const [currentMealLog] = await tx
+          .update(mealLogs)
+          .set({ draftRevision: sql`${mealLogs.draftRevision} + 1`, updatedAt: new Date() })
+          .where(eq(mealLogs.id, mealLog.id))
+          .returning(mealLogSelection);
+        if (!currentMealLog) throw new Error('Draft meal disappeared while deleting item');
         const items = await tx
           .select(mealItemSelection)
           .from(mealItems)
           .where(eq(mealItems.mealLogId, mealLog.id))
           .orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
-        return { kind: 'deleted' as const, mealLog, items };
+        return { kind: 'deleted' as const, mealLog: currentMealLog, items };
       });
-      if (deleted.kind === 'not_found' || deleted.kind === 'item_not_found')
-        return mealLogNotFound(reply, request);
+      if (deleted.kind === 'not_found') return mealLogNotFound(reply, request);
+      if (deleted.kind === 'stale') {
+        const latest = await findOwnedMealLog(options.database, params.data.mealLogId, userId);
+        if (!latest) return mealLogNotFound(reply, request);
+        return await staleMealResponse(options.database, reply, request, 'MEAL_ITEM_STALE', {
+          mealLog: latest,
+          items: await findMealItems(options.database, latest.id),
+        });
+      }
       if (deleted.kind === 'invalid_state')
         return invalidMealLogState(reply, request);
-      return mealLogResponse(deleted.mealLog, deleted.items);
+      return await mealLogResponse(options.database, deleted.mealLog, deleted.items);
     },
   );
 
@@ -809,7 +945,8 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     const userId = await requireUserId(request, reply, options.auth);
     if (!userId) return;
     const params = mealLogIdParamsSchema.safeParse(request.params);
-    if (!params.success) return invalidRequest(reply, request);
+    const body = expectedDraftRevisionSchema.safeParse(request.body);
+    if (!params.success || !body.success) return invalidRequest(reply, request);
     const existing = await findOwnedMealLog(
       options.database,
       params.data.mealLogId,
@@ -832,6 +969,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
             eq(mealLogs.id, existing.id),
             eq(mealLogs.userId, userId),
             eq(mealLogs.status, 'draft'),
+            eq(mealLogs.draftRevision, body.data.expectedDraftRevision),
           ),
         )
         .returning({ imageAssetId: mealLogs.imageAssetId });
@@ -857,7 +995,14 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       }
       return true;
     });
-    if (!deleted) return invalidMealLogState(reply, request);
+    if (!deleted) {
+      const latest = await findOwnedMealLog(options.database, existing.id, userId);
+      if (!latest) return mealLogNotFound(reply, request);
+      return await staleMealResponse(options.database, reply, request, 'MEAL_DRAFT_STALE', {
+        mealLog: latest,
+        items: await findMealItems(options.database, latest.id),
+      });
+    }
     return reply.status(204).send();
   });
   app.post('/api/meal-logs/:mealLogId/recognition/retry', async (request, reply) => {
@@ -893,14 +1038,15 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     const outcome = await options.recognitionCoordinator.recognize(existing.id, userId);
     const mealLog = await findOwnedMealLog(options.database, existing.id, userId);
     if (!mealLog) return mealLogNotFound(reply, request);
-    return recognitionResponse(reply, mealLog, await findMealItems(options.database, mealLog.id), outcome);
+    return recognitionResponse(options.database, reply, mealLog, await findMealItems(options.database, mealLog.id), outcome);
   });
 
   app.post('/api/meal-logs/:mealLogId/recognition/manual', async (request, reply) => {
     const userId = await requireUserId(request, reply, options.auth);
     if (!userId) return;
     const params = mealLogIdParamsSchema.safeParse(request.params);
-    if (!params.success) return invalidRequest(reply, request);
+    const body = expectedDraftRevisionSchema.safeParse(request.body);
+    if (!params.success || !body.success) return invalidRequest(reply, request);
     const now = new Date();
     const changed = await options.database.transaction(async (tx) => {
       const [existing] = await tx
@@ -913,33 +1059,86 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
             eq(mealLogs.status, 'draft'),
           ),
         )
+        .for('update')
         .limit(1);
       if (!existing) return null;
-      if (existing.recognitionStatus === 'manual') return existing;
-      if (existing.recognitionStatus === 'ready') return null;
+      if (existing.draftRevision !== body.data.expectedDraftRevision)
+        return { kind: 'stale' as const };
+      if (existing.recognitionStatus === 'manual')
+        return { kind: 'invalid' as const };
+      if (
+        existing.recognitionStatus === 'ready' &&
+        existing.recognitionManualOverride === null &&
+        isRecognitionResultV2(existing.recognitionResult) &&
+        (existing.recognitionResult.outcome === 'no_food' ||
+          existing.recognitionResult.outcome === 'insufficient_evidence')
+      ) {
+        const [{ count } = { count: 0 }] = await tx
+          .select({ count: sql<number>`count(*)::int` })
+          .from(mealItems)
+          .where(eq(mealItems.mealLogId, existing.id));
+        if (count === 0) {
+          const override = {
+            fromStatus: 'ready' as const,
+            fromOutcome: existing.recognitionResult.outcome,
+            decision: 'direct_entry' as const,
+            decidedAt: now.toISOString(),
+            decisionVersion: 'recognition-manual-override-v1' as const,
+            actorUserId: userId,
+            expectedDraftRevision: body.data.expectedDraftRevision,
+            changedFields: ['recognitionStatus'] as const,
+            fromErrorCode: null,
+          };
+          const [mealLog] = await tx.update(mealLogs).set({
+            recognitionStatus: 'manual',
+            recognitionManualOverride: override,
+            draftRevision: sql`${mealLogs.draftRevision} + 1`,
+            updatedAt: now,
+          }).where(and(
+            eq(mealLogs.id, existing.id),
+            eq(mealLogs.draftRevision, body.data.expectedDraftRevision),
+            eq(mealLogs.recognitionStatus, 'ready'),
+          )).returning(mealLogSelection);
+          return mealLog ? { kind: 'changed' as const, mealLog } : { kind: 'stale' as const };
+        }
+      }
+      if (existing.recognitionStatus === 'ready') return { kind: 'invalid' as const };
+      if (
+        existing.recognitionStatus !== 'pending' &&
+        existing.recognitionStatus !== 'processing' &&
+        existing.recognitionStatus !== 'failed'
+      ) {
+        return { kind: 'invalid' as const };
+      }
+      const manualOverride = {
+        fromStatus: existing.recognitionStatus,
+        fromOutcome: isRecognitionResultV2(existing.recognitionResult)
+          ? existing.recognitionResult.outcome
+          : null,
+        fromErrorCode: existing.recognitionLastErrorCode,
+        decision: 'direct_entry' as const,
+        actorUserId: userId,
+        expectedDraftRevision: body.data.expectedDraftRevision,
+        changedFields: ['recognitionStatus'] as const,
+        decidedAt: now.toISOString(),
+        decisionVersion: 'recognition-manual-override-v1' as const,
+      };
       const [mealLog] = await tx
         .update(mealLogs)
         .set({
           recognitionStatus: 'manual',
-          recognitionProvider: null,
-          recognitionModel: null,
-          recognitionPromptVersion: null,
-          recognitionSchemaVersion: null,
-          recognitionResult: null,
-          recognitionCompletedAt: null,
-          recognitionProviderRequestId: null,
-          recognitionInputTokens: 0,
-          recognitionOutputTokens: 0,
+          recognitionManualOverride: manualOverride,
           recognitionLeaseToken: null,
           recognitionLeaseExpiresAt: null,
           recognitionNextAttemptAt: null,
-          recognitionLastErrorCode: null,
+          draftRevision: sql`${mealLogs.draftRevision} + 1`,
           updatedAt: now,
         })
         .where(and(
           eq(mealLogs.id, params.data.mealLogId),
           eq(mealLogs.userId, userId),
           eq(mealLogs.status, 'draft'),
+          eq(mealLogs.draftRevision, body.data.expectedDraftRevision),
           or(
             eq(mealLogs.recognitionStatus, 'pending'),
             eq(mealLogs.recognitionStatus, 'processing'),
@@ -957,9 +1156,9 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
           eq(imageAssets.status, 'processing'),
         ));
       }
-      return mealLog;
+      return { kind: 'changed' as const, mealLog };
     });
-    if (!changed)
+    if (!changed || changed.kind === 'invalid')
       return mealLogStateOrNotFound(
         options.database,
         params.data.mealLogId,
@@ -967,10 +1166,20 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         reply,
         request,
       );
-    return mealLogResponse(changed, await findMealItems(options.database, changed.id));
+    if (changed.kind === 'stale') {
+      const latest = await findOwnedMealLog(options.database, params.data.mealLogId, userId);
+      if (!latest) return mealLogNotFound(reply, request);
+      return await staleMealResponse(options.database, reply, request, 'MEAL_DRAFT_STALE', {
+        mealLog: latest,
+        items: await findMealItems(options.database, latest.id),
+      });
+    }
+    return await mealLogResponse(options.database, changed.mealLog, await findMealItems(options.database, changed.mealLog.id));
   });
 };
-function recognitionResponse(
+async function sendRecognitionResponse(
+  database: Database,
+  reviewPolicy: ReviewPolicyConfig,
   reply: FastifyReply,
   mealLog: NonNullable<Awaited<ReturnType<typeof findOwnedMealLog>>>,
   items: Awaited<ReturnType<typeof findMealItems>>,
@@ -987,9 +1196,15 @@ function recognitionResponse(
   };
   if (outcome.status === 'active') {
     reply.header('Retry-After', String(outcome.retryAfterSeconds ?? 1));
-    return reply.status(202).send({ ...mealLogResponse(mealLog, items), recognitionOutcome });
+    return reply.status(202).send({
+      ...(await buildMealLogResponse(database, mealLog, items, reviewPolicy)),
+      recognitionOutcome,
+    });
   }
-  return reply.status(createdStatus ?? 200).send({ ...mealLogResponse(mealLog, items), recognitionOutcome });
+  return reply.status(createdStatus ?? 200).send({
+    ...(await buildMealLogResponse(database, mealLog, items, reviewPolicy)),
+    recognitionOutcome,
+  });
 }
 
 const mealLogSelection = {
@@ -1009,6 +1224,9 @@ const mealLogSelection = {
   recognitionLastErrorCode: mealLogs.recognitionLastErrorCode,
   recognitionAttemptCount: mealLogs.recognitionAttemptCount,
   recognitionNextAttemptAt: mealLogs.recognitionNextAttemptAt,
+  recognitionResult: mealLogs.recognitionResult,
+  recognitionManualOverride: mealLogs.recognitionManualOverride,
+  draftRevision: mealLogs.draftRevision,
   confirmedAt: mealLogs.confirmedAt,
 };
 const mealItemSelection = {
@@ -1024,6 +1242,14 @@ const mealItemSelection = {
   nutrientProfileId: mealItems.nutrientProfileId,
   mappingConfidenceBps: mealItems.mappingConfidenceBps,
   gramsMg: mealItems.gramsMg,
+  origin: mealItems.origin,
+  initialEstimateAssessment: mealItems.initialEstimateAssessment,
+  currentResolutionSource: mealItems.currentResolutionSource,
+  itemRevision: mealItems.itemRevision,
+  foodRevision: mealItems.foodRevision,
+  portionRevision: mealItems.portionRevision,
+  foodAcknowledgedRevision: mealItems.foodAcknowledgedRevision,
+  portionAcknowledgedRevision: mealItems.portionAcknowledgedRevision,
 };
 const calculationSnapshotSelection = {
   id: calculationSnapshots.id,
@@ -1037,39 +1263,6 @@ const calculationSnapshotSelection = {
   calculationVersion: calculationSnapshots.calculationVersion,
   calculatedAt: calculationSnapshots.calculatedAt,
 };
-const nutrientProfileCalculationSelection = {
-  id: nutrientProfiles.id,
-  foodId: nutrientProfiles.foodId,
-  sourceRegistryId: nutrientProfiles.sourceRegistryId,
-  sourceItemId: nutrientProfiles.sourceItemId,
-  datasetVersion: nutrientProfiles.datasetVersion,
-  qualityGrade: nutrientProfiles.qualityGrade,
-  basisAmountMg: nutrientProfiles.basisAmountMg,
-  energyMillicalories: nutrientProfiles.energyMillicalories,
-  carbohydrateMg: nutrientProfiles.carbohydrateMg,
-  proteinMg: nutrientProfiles.proteinMg,
-  fatMg: nutrientProfiles.fatMg,
-  fiberMg: nutrientProfiles.fiberMg,
-};
-const foodServingCalculationSelection = {
-  id: foodServings.id,
-  foodId: foodServings.foodId,
-  unit: foodServings.unit,
-  amountMilliunits: foodServings.amountMilliunits,
-  gramsMg: foodServings.gramsMg,
-  sourceRegistryId: foodServings.sourceRegistryId,
-  qualityGrade: foodServings.qualityGrade,
-};
-
-function isTrustedNutritionSourceKind(
-  kind: 'public_dataset' | 'manufacturer' | 'commercial_dataset' | 'recipe_estimate' | 'user_entered',
-) {
-  return (
-    kind === 'public_dataset' ||
-    kind === 'manufacturer' ||
-    kind === 'commercial_dataset'
-  );
-}
 function requireCompleteCoreNutrients(
   nutrients: CalculatedNutritionValues,
 ): {
@@ -1233,8 +1426,281 @@ async function mealLogStateOrNotFound(
     : mealLogNotFound(reply, request);
 }
 
-function mealLogResponse<TMeal, TItem>(mealLog: TMeal, items: TItem[]) {
-  return { mealLog, items };
+async function buildMealLogResponse(
+  database: Database,
+  mealLog: any,
+  items: any[],
+  reviewPolicy: ReviewPolicyConfig,
+) {
+  const resolutions = await resolveCurrentMealItems(database, items);
+  const resolutionByItemId = new Map(resolutions.map((resolution) => [resolution.itemId, resolution]));
+  const recognition = isRecognitionResultV2(mealLog.recognitionResult)
+    ? mealLog.recognitionResult
+    : null;
+  const imageQualityConfidenceBps = recognition?.imageQualityConfidenceBps ?? null;
+  const policy = {
+    version: MEAL_ESTIMATE_REVIEW_POLICY_VERSION,
+    activation: reviewPolicy.mode,
+    ...MEAL_ESTIMATE_REVIEW_THRESHOLDS,
+  } as const;
+  const responseItems = items.map((item) => {
+    const resolution = resolutionByItemId.get(item.id);
+    const hardReasons = resolution?.reason ? [resolverReasonToReviewReason(resolution.reason)] : [];
+    const currentResolution = {
+      mappingSource: item.currentResolutionSource,
+      foodId: resolution?.food?.id ?? null,
+      nutrientProfileId: resolution?.profile?.id ?? null,
+      hardReasons,
+      requiresServingConversion: item.unit !== 'g',
+      hasTrustedServingConversion: item.unit === 'g' || !!resolution?.serving,
+      hasCoreNutrients: !!resolution?.profile,
+    };
+    const review = deriveItemReviewState({
+      origin: item.origin,
+      itemRevision: item.itemRevision,
+      foodRevision: item.foodRevision,
+      portionRevision: item.portionRevision,
+      foodAcknowledgedRevision: item.foodAcknowledgedRevision,
+      portionAcknowledgedRevision: item.portionAcknowledgedRevision,
+      initialEstimateAssessment: item.initialEstimateAssessment,
+      currentResolution,
+      imageQualityConfidenceBps,
+      policy,
+    });
+    return {
+      ...item,
+      initialAssessment: item.initialEstimateAssessment ?? null,
+      currentResolution: {
+        status: resolution?.reason === null ? 'resolved' as const : 'unresolved' as const,
+        reason: resolution?.reason === null
+          ? null
+          : resolverReasonToReviewReason(resolution?.reason ?? 'MISSING_MAPPING'),
+        raw: item.initialEstimateAssessment?.rawLabel ?? item.recognizedLabel,
+        matched: item.initialEstimateAssessment?.initialMatchedLabel ?? null,
+        canonical: resolution?.food?.canonicalNameKo ?? null,
+        food: resolution?.food ?? null,
+        profile: resolution?.profile ?? null,
+        serving: resolution?.serving ?? null,
+      },
+      itemReview: review,
+    };
+  });
+  const mealReview = deriveMealReviewState({
+    recognition,
+    recognitionStatus: mealLog.recognitionStatus,
+    manualOverride: mealLog.recognitionManualOverride ?? null,
+    items: responseItems.map((item) => ({ origin: item.origin, review: item.itemReview })),
+    policy,
+  });
+  const requiredReviewFields = responseItems.flatMap((item) => {
+    const fields = new Set<'food' | 'portion'>();
+    if (item.itemReview.foodReasons.length > 0) fields.add('food');
+    if (item.itemReview.portionReasons.length > 0) fields.add('portion');
+    if (policy.activation !== 'quick_confirm' && item.origin === 'model_estimate') {
+      if (!item.itemReview.foodAcknowledged) fields.add('food');
+      if (!item.itemReview.portionAcknowledged) fields.add('portion');
+    }
+    return fields.size === 0
+      ? []
+      : [{ itemId: item.id, fields: [...fields] }];
+  });
+  const preview = await calculateResolvedMealNutrition(database, items, resolutions);
+  const nutritionPreview = 'details' in preview
+    ? null
+    : nutritionPreviewResponse(preview.nutrition, resolutionByItemId);
+  const publicItems = responseItems.map((item) => ({
+    id: item.id,
+    recognizedLabel: item.recognizedLabel,
+    amountMilliunits: item.amountMilliunits,
+    unit: item.unit,
+    recognitionRegionIndex: item.recognitionRegionIndex,
+    recognitionConfidenceBps: item.recognitionConfidenceBps,
+    portionConfidenceBps: item.portionConfidenceBps,
+    userCorrected: item.userCorrected,
+    foodId: item.foodId,
+    nutrientProfileId: item.nutrientProfileId,
+    mappingConfidenceBps: item.mappingConfidenceBps,
+    gramsMg: item.gramsMg,
+    origin: item.origin,
+    initialAssessment: item.initialAssessment,
+    currentResolutionSource: item.currentResolutionSource,
+    itemRevision: item.itemRevision,
+    foodRevision: item.foodRevision,
+    portionRevision: item.portionRevision,
+    foodAcknowledgedRevision: item.foodAcknowledgedRevision,
+    portionAcknowledgedRevision: item.portionAcknowledgedRevision,
+    currentResolution: {
+      status: item.currentResolution.status,
+      reason: item.currentResolution.reason,
+    },
+  }));
+  return {
+    mealLog: {
+      id: mealLog.id,
+      eatenAt: mealLog.eatenAt,
+      timezone: mealLog.timezone,
+      localDate: mealLog.localDate,
+      mealType: mealLog.mealType,
+      status: mealLog.status,
+      imageAssetId: mealLog.imageAssetId,
+      recognitionStatus: mealLog.recognitionStatus,
+      recognitionProvider: mealLog.recognitionProvider,
+      recognitionModel: mealLog.recognitionModel,
+      recognitionPromptVersion: mealLog.recognitionPromptVersion,
+      recognitionSchemaVersion: mealLog.recognitionSchemaVersion,
+      recognitionCompletedAt: mealLog.recognitionCompletedAt,
+      recognitionLastErrorCode: mealLog.recognitionLastErrorCode,
+      recognitionAttemptCount: mealLog.recognitionAttemptCount,
+      recognitionNextAttemptAt: mealLog.recognitionNextAttemptAt,
+      draftRevision: mealLog.draftRevision,
+      confirmedAt: mealLog.confirmedAt,
+      recognitionOutcome: recognition?.outcome ?? null,
+      recognitionEvidenceReason: recognition?.outcome === 'insufficient_evidence'
+        ? recognition.evidenceReason ?? null
+        : null,
+      recognitionManualOverride: mealLog.recognitionManualOverride
+        ? {
+            decision: mealLog.recognitionManualOverride.decision,
+            decisionVersion: mealLog.recognitionManualOverride.decisionVersion,
+            fromStatus: mealLog.recognitionManualOverride.fromStatus,
+            fromOutcome: mealLog.recognitionManualOverride.fromOutcome,
+            fromErrorCode: mealLog.recognitionManualOverride.fromErrorCode,
+            expectedDraftRevision: mealLog.recognitionManualOverride.expectedDraftRevision,
+            actorUserId: mealLog.recognitionManualOverride.actorUserId,
+            decidedAt: mealLog.recognitionManualOverride.decidedAt,
+            changedFields: mealLog.recognitionManualOverride.changedFields,
+          }
+        : null,
+    },
+    items: publicItems,
+    review: {
+      confirmable: mealReview.reasons.length === 0,
+      reasons: [
+        ...mealReview.reasons
+          .filter((code) =>
+            code === 'NO_FOOD_DETECTED' ||
+            code === 'INSUFFICIENT_IMAGE_EVIDENCE' ||
+            code === 'QUICK_CONFIRM_POLICY_DISABLED' ||
+            code === 'EMPTY_MEAL')
+          .map((code) => ({ code, itemId: null })),
+        ...responseItems.flatMap((item) =>
+          item.itemReview.reasons.map((code: string) => ({ code, itemId: item.id }))),
+      ],
+      requiredReviewFields,
+      nutrition: nutritionPreview,
+    },
+  };
+}
+async function calculateResolvedMealNutrition(
+  database: Parameters<typeof resolveCurrentMealItems>[0],
+  items: any[],
+  resolvedItems?: Awaited<ReturnType<typeof resolveCurrentMealItems>>,
+) {
+  const resolutions = resolvedItems ?? await resolveCurrentMealItems(database, items);
+  const details = resolutions.flatMap((resolution) =>
+    resolution.reason === null ? [] : [{ itemId: resolution.itemId, code: resolution.reason }],
+  );
+  if (details.length > 0) return { details };
+  const resolutionsByItemId = new Map(resolutions.map((resolution) => [resolution.itemId, resolution]));
+  const inputs: MealNutritionInput[] = items.map((item) => {
+    const resolution = resolutionsByItemId.get(item.id)!;
+    const profile = resolution.profile!;
+    const base = {
+      mealItemId: item.id,
+      amountMilliunits: item.amountMilliunits,
+      unit: item.unit,
+      nutrientProfile: {
+        basisAmountMg: profile.basisAmountMg,
+        energyMillicalories: profile.energyMillicalories,
+        carbohydrateMg: profile.carbohydrateMg,
+        proteinMg: profile.proteinMg,
+        fatMg: profile.fatMg,
+        fiberMg: profile.fiberMg,
+      },
+    };
+    if (item.unit === 'g') return base;
+    const serving = resolution.serving!;
+    return {
+      ...base,
+      serving: {
+        id: serving.id,
+        unit: serving.unit as 'ml' | 'serving' | 'bowl' | 'piece',
+        amountMilliunits: serving.amountMilliunits,
+        gramsMg: serving.gramsMg,
+        sourceRegistryId: serving.sourceRegistryId,
+        qualityGrade: serving.qualityGrade,
+      },
+    };
+  });
+  try {
+    return { nutrition: calculateMealNutrition(inputs), resolutionsByItemId };
+  } catch (error) {
+    return {
+      details: [{
+        code: error instanceof NutritionCalculationError ? error.code : 'CALCULATION_FAILED',
+      }],
+    };
+  }
+}
+function nutritionPreviewResponse(
+  nutrition: ReturnType<typeof calculateMealNutrition>,
+  resolutionsByItemId: Map<string, Awaited<ReturnType<typeof resolveCurrentMealItems>>[number]>,
+) {
+  const items = nutrition.items.map((item) => {
+    const resolution = resolutionsByItemId.get(item.mealItemId)!;
+    const profile = resolution.profile!;
+    return {
+      mealItemId: item.mealItemId,
+      gramsMg: item.gramsMg,
+      nutrients: requireCompleteCoreNutrients(item.nutrients),
+      source: {
+        foodId: resolution.food!.id,
+        nutrientProfileId: profile.id,
+        sourceRegistryId: profile.sourceRegistryId,
+        sourceItemId: profile.sourceItemId,
+        datasetVersion: profile.datasetVersion,
+        qualityGrade: profile.qualityGrade,
+        servingId: resolution.serving?.id ?? null,
+        servingSourceRegistryId: resolution.serving?.sourceRegistryId ?? null,
+        servingQualityGrade: resolution.serving?.qualityGrade ?? null,
+      },
+    };
+  });
+  const aggregate = (
+    key: 'energyMillicalories' | 'carbohydrateMg' | 'proteinMg' | 'fatMg' | 'fiberMg',
+    value: number | null,
+  ) => {
+    const missingItemCount = items.filter((item) => item.nutrients[key] === null).length;
+    const knownValue = items.reduce((total, item) => total + (item.nutrients[key] ?? 0), 0);
+    return { value: missingItemCount === 0 ? value : null, knownValue, missingItemCount, completeness: missingItemCount === 0 ? 'complete' as const : 'partial' as const };
+  };
+  return {
+    id: 'preview',
+    calculationVersion: 'meal-nutrition-v1-preview',
+    calculatedAt: new Date().toISOString(),
+    items,
+    totals: {
+      energyMillicalories: aggregate('energyMillicalories', nutrition.totals.energyMillicalories.value),
+      carbohydrateMg: aggregate('carbohydrateMg', nutrition.totals.carbohydrateMg.value),
+      proteinMg: aggregate('proteinMg', nutrition.totals.proteinMg.value),
+      fatMg: aggregate('fatMg', nutrition.totals.fatMg.value),
+      fiberMg: aggregate('fiberMg', nutrition.totals.fiberMg.value),
+    },
+  };
+}
+function resolverReasonToReviewReason(reason: string) {
+  return ({
+    MISSING_MAPPING: 'FOOD_MAPPING_MISSING',
+    MISSING_FOOD: 'FOOD_NOT_FOUND',
+    DEPRECATED_FOOD: 'FOOD_DEPRECATED',
+    MISSING_PROFILE: 'NUTRIENT_PROFILE_MISSING',
+    MISMATCHED_PROFILE: 'NUTRIENT_PROFILE_MISMATCHED',
+    UNTRUSTED_PROFILE_SOURCE: 'NUTRIENT_PROFILE_UNTRUSTED',
+    INCOMPLETE_PROFILE: 'CORE_NUTRIENTS_MISSING',
+    MISSING_SERVING_CONVERSION: 'SERVING_CONVERSION_MISSING',
+    UNTRUSTED_SERVING_SOURCE: 'SERVING_CONVERSION_UNTRUSTED',
+    AMBIGUOUS_SERVING_CONVERSION: 'SERVING_CONVERSION_AMBIGUOUS',
+  } as Record<string, string>)[reason] ?? 'FOOD_MAPPING_MISSING';
 }
 
 async function findUserTimezone(database: Database, userId: string) {
@@ -1382,6 +1848,33 @@ function imageUnavailable(reply: FastifyReply, request: FastifyRequest) {
     error: {
       code: 'IMAGE_ASSET_UNAVAILABLE',
       message: '사용할 수 있는 이미지를 찾을 수 없습니다.',
+      requestId: request.id,
+    },
+  });
+}
+async function sendStaleMealResponse(
+  database: Database,
+  reviewPolicy: ReviewPolicyConfig,
+  reply: FastifyReply,
+  request: FastifyRequest,
+  code: 'MEAL_DRAFT_STALE' | 'MEAL_ITEM_STALE',
+  latest: { mealLog: unknown; items: unknown[] },
+) {
+  const mealLog = latest.mealLog;
+  const items = latest.items;
+  const fullLatest = mealLog && Array.isArray(items)
+    ? await buildMealLogResponse(
+        database,
+        mealLog as Record<string, any>,
+        items as Array<Record<string, any>>,
+        reviewPolicy,
+      )
+    : latest;
+  return reply.status(409).send({
+    error: {
+      code,
+      message: '식사 초안이 다른 변경으로 최신 상태가 아닙니다.',
+      details: { latest: fullLatest },
       requestId: request.id,
     },
   });

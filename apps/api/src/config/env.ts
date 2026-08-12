@@ -1,4 +1,12 @@
+import { createHash, createPublicKey, verify as verifySignature } from 'node:crypto';
 import { z } from 'zod';
+import { MEAL_ESTIMATE_REVIEW_POLICY_VERSION } from '@nueat/domain';
+
+import { MEAL_ITEM_RESOLVER_VERSION } from '../services/meal-item-resolution';
+import {
+  MEAL_RECOGNITION_PROMPT_VERSION,
+  MEAL_RECOGNITION_SCHEMA_VERSION,
+} from '../services/meal-recognizer';
 
 const environmentSchema = z
   .object({
@@ -82,6 +90,31 @@ const environmentSchema = z
       .min(1)
       .max(100)
       .default(20),
+    MEAL_RECOGNITION_REVIEW_POLICY: z
+      .enum(['review_only', 'quick_confirm'])
+      .default('review_only'),
+    MEAL_RECOGNITION_APPROVED_REPORT_SHA256: z
+      .string()
+      .trim()
+      .regex(/^[a-f0-9]{64}$/, 'MEAL_RECOGNITION_APPROVED_REPORT_SHA256 must be a lowercase SHA-256 hex digest')
+      .optional(),
+    MEAL_RECOGNITION_ACTIVE_REPORT_SHA256: z
+      .string()
+      .trim()
+      .regex(/^[a-f0-9]{64}$/, 'MEAL_RECOGNITION_ACTIVE_REPORT_SHA256 must be a lowercase SHA-256 hex digest')
+      .optional(),
+    MEAL_RECOGNITION_APPROVED_REPORT_VERSION: z
+      .literal('meal-recognition-golden-report-v2')
+      .optional(),
+    MEAL_RECOGNITION_APPROVED_REPORT_JSON: z.string().trim().optional(),
+    MEAL_RECOGNITION_APPROVAL_KEY_ID: z.string().trim().min(1).optional(),
+    MEAL_RECOGNITION_APPROVAL_PUBLIC_KEY: z.string().trim().min(1).optional(),
+    MEAL_RECOGNITION_CATALOG_REGISTRY_VERSION: z.string().trim().min(1).optional(),
+    MEAL_RECOGNITION_CATALOG_REGISTRY_SHA256: z
+      .string()
+      .trim()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
   })
   .superRefine((value, context) => {
     const bucketValues = [
@@ -104,6 +137,43 @@ const environmentSchema = z
         path: ['OPENAI_API_KEY'],
         message: 'OPENAI_API_KEY is required when MEAL_RECOGNITION_MODE is openai',
       });
+    }
+    if (
+      value.NODE_ENV === 'production' &&
+      value.MEAL_RECOGNITION_REVIEW_POLICY === 'quick_confirm'
+    ) {
+      const receipt = parseApprovedGoldenReport(
+        value.MEAL_RECOGNITION_APPROVED_REPORT_JSON,
+        value.MEAL_RECOGNITION_APPROVAL_KEY_ID,
+        value.MEAL_RECOGNITION_APPROVAL_PUBLIC_KEY,
+      );
+      const receiptProvenance =
+        receipt && isRecord(receipt.provenance) ? receipt.provenance : null;
+      if (
+        value.MEAL_RECOGNITION_MODE !== 'openai' ||
+        !value.MEAL_RECOGNITION_APPROVED_REPORT_SHA256 ||
+        !value.MEAL_RECOGNITION_ACTIVE_REPORT_SHA256 ||
+        value.MEAL_RECOGNITION_APPROVED_REPORT_SHA256 !== value.MEAL_RECOGNITION_ACTIVE_REPORT_SHA256 ||
+        value.MEAL_RECOGNITION_APPROVED_REPORT_VERSION !== 'meal-recognition-golden-report-v2' ||
+        !receipt ||
+        receipt.reportSha256 !== value.MEAL_RECOGNITION_APPROVED_REPORT_SHA256 ||
+        !receiptProvenance ||
+        receiptProvenance.provider !== 'openai' ||
+        receiptProvenance.recognitionModel !== value.OPENAI_MODEL ||
+        receiptProvenance.promptVersion !== MEAL_RECOGNITION_PROMPT_VERSION ||
+        receiptProvenance.schemaVersion !== MEAL_RECOGNITION_SCHEMA_VERSION ||
+        receiptProvenance.resolverVersion !== MEAL_ITEM_RESOLVER_VERSION ||
+        receiptProvenance.reviewPolicyVersion !== MEAL_ESTIMATE_REVIEW_POLICY_VERSION ||
+        receiptProvenance.registryVersion !== value.MEAL_RECOGNITION_CATALOG_REGISTRY_VERSION ||
+        receiptProvenance.registrySha256 !== value.MEAL_RECOGNITION_CATALOG_REGISTRY_SHA256
+      ) {
+        context.addIssue({
+          code: 'custom',
+          path: ['MEAL_RECOGNITION_REVIEW_POLICY'],
+          message:
+            'production quick_confirm requires OpenAI mode and an authority-signed meal-recognition-golden-report-v2 receipt bound to matching report SHA-256 values, the deployed recognition stack, and catalog registry',
+        });
+      }
     }
   });
 
@@ -155,8 +225,127 @@ export function parseEnvironment(input: Record<string, string | undefined>) {
       maxOutputTokens: parsed.MEAL_RECOGNITION_MAX_OUTPUT_TOKENS,
       maxAttempts: parsed.MEAL_RECOGNITION_MAX_ATTEMPTS,
       dailyAttemptQuota: parsed.MEAL_RECOGNITION_DAILY_ATTEMPT_QUOTA,
+      reviewPolicy: {
+        mode: parsed.MEAL_RECOGNITION_REVIEW_POLICY,
+        approvedReportSha256: parsed.MEAL_RECOGNITION_APPROVED_REPORT_SHA256,
+        activeReportSha256: parsed.MEAL_RECOGNITION_ACTIVE_REPORT_SHA256,
+        approvedReportVersion: parsed.MEAL_RECOGNITION_APPROVED_REPORT_VERSION,
+        catalogRegistryVersion: parsed.MEAL_RECOGNITION_CATALOG_REGISTRY_VERSION,
+        catalogRegistrySha256: parsed.MEAL_RECOGNITION_CATALOG_REGISTRY_SHA256,
+        approvedReportReceipt: parseApprovedGoldenReport(
+          parsed.MEAL_RECOGNITION_APPROVED_REPORT_JSON,
+          parsed.MEAL_RECOGNITION_APPROVAL_KEY_ID,
+          parsed.MEAL_RECOGNITION_APPROVAL_PUBLIC_KEY,
+        ),
+      },
     },
   } as const;
+}
+function parseApprovedGoldenReport(
+  value: string | undefined,
+  expectedKeyId: string | undefined,
+  publicKeyBase64: string | undefined,
+) {
+  if (!value || !expectedKeyId || !publicKeyBase64) return null;
+  try {
+    const receipt: unknown = JSON.parse(value);
+    if (!isRecord(receipt) || receipt.version !== 'meal-recognition-golden-report-v2' || receipt.mode !== 'production' || receipt.result !== 'passed' || receipt.passed !== true || !Array.isArray(receipt.failures) || receipt.failures.length !== 0 || !isRecord(receipt.counts) || !isRecord(receipt.metrics) || !isRecord(receipt.provenance) || !isRecord(receipt.approval) || !isSha256(receipt.reportSha256)) return null;
+    const { reportSha256, approval, ...unsignedReport } = receipt;
+    if (canonicalSha256(unsignedReport) !== reportSha256) return null;
+    if (
+      approval.keyId !== expectedKeyId ||
+      typeof approval.signatureBase64 !== 'string' ||
+      !verifyReportApproval(reportSha256, approval.signatureBase64, publicKeyBase64)
+    ) return null;
+    const counts = receipt.counts;
+    const metrics = receipt.metrics;
+    if (
+      !integerAtLeast(counts.consentedKoreanMealPhotos, 120) ||
+      !isRecord(counts.foodGroupCases) ||
+      Object.values(counts.foodGroupCases).length !== 6 ||
+      Object.values(counts.foodGroupCases).some((count) => !integerAtLeast(count, 20)) ||
+      !integerAtLeast(counts.noFood, 10) ||
+      !integerAtLeast(counts.insufficientEvidence, 10) ||
+      !integerAtLeast(counts.quickEligibleMeals, 50) ||
+      !integerAtLeast(counts.quickEligibleItems, 100) ||
+      counts.zeroOutcomeQuickFalsePositives !== 0 ||
+      counts.nutritionOrIdErrors !== 0 ||
+      counts.untrustedConversionEligible !== 0 ||
+      counts.sensitiveReportLeakage !== 0 ||
+      !bpsAtLeast(metrics.outcomeAccuracyBps, 9_500) ||
+      !bpsAtLeast(metrics.eligibleFoodTop1Wilson95LowerBoundBps, 9_500) ||
+      !bpsAtLeast(metrics.portionWithinToleranceWilson95LowerBoundBps, 9_000) ||
+      !bpsAtLeast(metrics.jointItemWilson95LowerBoundBps, 9_000) ||
+      !bpsAtLeast(metrics.allItemsCorrectEligibleMealWilson95LowerBoundBps, 8_500) ||
+      !bpsAtLeast(metrics.eligibleCoverageBps, 1_500) ||
+      !bpsAtLeast(metrics.validV2Bps, 9_900) ||
+      !isSha256(receipt.provenance.manifestSha256) ||
+      !isSha256(receipt.provenance.groundTruthSha256) ||
+      !isSha256(receipt.provenance.predictionsSha256) ||
+      !isSha256(receipt.inputSha256) ||
+      typeof receipt.provenance.adjudicationVersion !== 'string' ||
+      !isSha256(receipt.provenance.adjudicationSha256) ||
+      typeof receipt.provenance.registryVersion !== 'string' ||
+      !isSha256(receipt.provenance.registrySha256) ||
+      receipt.provenance.provider !== 'openai' ||
+      typeof receipt.provenance.recognitionModel !== 'string' ||
+      typeof receipt.provenance.promptVersion !== 'string' ||
+      typeof receipt.provenance.schemaVersion !== 'string' ||
+      typeof receipt.provenance.resolverVersion !== 'string' ||
+      typeof receipt.provenance.reviewPolicyVersion !== 'string'
+    ) return null;
+    return receipt;
+  } catch {
+    return null;
+  }
+}
+
+function verifyReportApproval(
+  reportSha256: string,
+  signatureBase64: string,
+  publicKeyBase64: string,
+) {
+  try {
+    const publicKey = createPublicKey({
+      key: Buffer.from(publicKeyBase64, 'base64'),
+      format: 'der',
+      type: 'spki',
+    });
+    return verifySignature(
+      null,
+      Buffer.from(reportSha256, 'utf8'),
+      publicKey,
+      Buffer.from(signatureBase64, 'base64'),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+}
+
+function integerAtLeast(value: unknown, minimum: number) {
+  return Number.isInteger(value) && (value as number) >= minimum;
+}
+
+function bpsAtLeast(value: unknown, minimum: number) {
+  return integerAtLeast(value, minimum) && (value as number) <= 10_000;
+}
+
+function canonicalSha256(value: unknown) {
+  return createHash('sha256').update(canonicalJson(value)).digest('hex');
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (isRecord(value)) return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
 }
 
 function parseOriginList(value: string) {

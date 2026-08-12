@@ -26,6 +26,21 @@ export interface MealDraft {
   recognitionLastErrorCode: string | null;
   recognitionAttemptCount: number;
   recognitionNextAttemptAt: string | null;
+  draftRevision: number;
+  confirmedAt: string | null;
+  recognitionOutcome: 'recognized' | 'no_food' | 'insufficient_evidence' | null;
+  recognitionEvidenceReason: string | null;
+  recognitionManualOverride: {
+    decision: 'direct_entry';
+    decisionVersion: string;
+    fromStatus: RecognitionStatus;
+    fromOutcome: 'recognized' | 'no_food' | 'insufficient_evidence' | null;
+    fromErrorCode: string | null;
+    expectedDraftRevision: number;
+    actorUserId: string;
+    decidedAt: string;
+    changedFields: string[];
+  } | null;
 }
 
 export interface MealDraftItem {
@@ -33,17 +48,71 @@ export interface MealDraftItem {
   recognizedLabel: string;
   amountMilliunits: number;
   unit: MealUnit;
+  recognitionRegionIndex: number | null;
   recognitionConfidenceBps: number | null;
   portionConfidenceBps: number | null;
   userCorrected: boolean;
   foodId: string | null;
   nutrientProfileId: string | null;
   mappingConfidenceBps: number | null;
+  gramsMg: number | null;
+  currentResolutionSource:
+    | 'model_primary'
+    | 'model_alternative'
+    | 'user_selected'
+    | 'legacy_existing'
+    | null;
+  itemRevision: number;
+  foodRevision: number;
+  portionRevision: number;
+  foodAcknowledgedRevision: number | null;
+  portionAcknowledgedRevision: number | null;
+  origin: 'model_estimate' | 'manual_entry' | 'user_added' | 'legacy_unknown';
+  initialAssessment: unknown | null;
+  currentResolution: {
+    status: 'resolved' | 'unresolved';
+    reason: string | null;
+  } | null;
 }
 
 export interface MealDraftResponse {
   mealLog: MealDraft;
   items: MealDraftItem[];
+  review: MealDraftReview;
+}
+export type MealReviewReason =
+  | 'NO_FOOD_DETECTED'
+  | 'INSUFFICIENT_IMAGE_EVIDENCE'
+  | 'IMAGE_QUALITY_LOW'
+  | 'QUICK_CONFIRM_POLICY_DISABLED'
+  | 'FOOD_CONFIDENCE_LOW'
+  | 'FOOD_CANDIDATE_MARGIN_LOW'
+  | 'MODEL_FOOD_QUESTION'
+  | 'INITIAL_ALTERNATIVE_MAPPING'
+  | 'PORTION_CONFIDENCE_LOW'
+  | 'MODEL_PORTION_QUESTION'
+  | 'LEGACY_REVIEW_REQUIRED'
+  | 'FOOD_MAPPING_MISSING'
+  | 'FOOD_NOT_FOUND'
+  | 'FOOD_DEPRECATED'
+  | 'NUTRIENT_PROFILE_MISSING'
+  | 'NUTRIENT_PROFILE_MISMATCHED'
+  | 'NUTRIENT_PROFILE_UNTRUSTED'
+  | 'CORE_NUTRIENTS_MISSING'
+  | 'SERVING_CONVERSION_MISSING'
+  | 'SERVING_CONVERSION_AMBIGUOUS'
+  | 'SERVING_CONVERSION_UNTRUSTED'
+  | 'CATALOG_SEARCH_EMPTY'
+  | 'EMPTY_MEAL';
+
+export interface MealDraftReview {
+  confirmable: boolean;
+  reasons: { code: MealReviewReason | string; itemId: string | null }[];
+  requiredReviewFields: {
+    itemId: string;
+    fields: ('food' | 'portion')[];
+  }[];
+  nutrition: ConfirmedMealNutrition | null;
 }
 export interface ConfirmedNutrientValue {
   value: number | null;
@@ -125,14 +194,23 @@ export function retryMealDraftRecognition(mealLogId: string) {
   );
 }
 
-export function startManualMealDraftEntry(mealLogId: string) {
+export function startManualMealDraftEntry(
+  mealLogId: string,
+  expectedDraftRevision: number,
+) {
   return apiRequest<MealDraftResponse>(
     `/api/meal-logs/${mealLogId}/recognition/manual`,
-    { method: 'POST' },
+    {
+      method: 'POST',
+      body: JSON.stringify({ expectedDraftRevision }),
+    },
   );
 }
 
-export function addMealDraftItem(mealLogId: string, input: MealDraftItemInput) {
+export function addMealDraftItem(
+  mealLogId: string,
+  input: MealDraftItemInput & { expectedDraftRevision: number },
+) {
   return apiRequest<MealDraftResponse>(`/api/meal-logs/${mealLogId}/items`, {
     method: 'POST',
     body: JSON.stringify(input),
@@ -142,7 +220,7 @@ export function addMealDraftItem(mealLogId: string, input: MealDraftItemInput) {
 export function updateMealDraftItem(
   mealLogId: string,
   itemId: string,
-  input: Partial<MealDraftItemInput>,
+  input: Partial<MealDraftItemInput> & { expectedItemRevision: number },
 ) {
   return apiRequest<MealDraftResponse>(
     `/api/meal-logs/${mealLogId}/items/${itemId}`,
@@ -153,30 +231,65 @@ export function updateMealDraftItem(
   );
 }
 
-export function deleteMealDraftItem(mealLogId: string, itemId: string) {
+export function deleteMealDraftItem(
+  mealLogId: string,
+  itemId: string,
+  input: { expectedDraftRevision: number; expectedItemRevision: number },
+) {
   return apiRequest<MealDraftResponse>(
     `/api/meal-logs/${mealLogId}/items/${itemId}`,
-    { method: 'DELETE' },
+    { method: 'DELETE', body: JSON.stringify(input) },
   );
 }
 export function mapMealDraftItemFood(
   mealLogId: string,
   itemId: string,
   foodId: string,
+  expectedItemRevision: number,
 ) {
   return apiRequest<MealDraftResponse>(
     `/api/meal-logs/${mealLogId}/items/${itemId}/food`,
     {
       method: 'PUT',
-      body: JSON.stringify({ foodId }),
+      body: JSON.stringify({ foodId, expectedItemRevision }),
     },
   );
 }
-export function confirmMealDraft(mealLogId: string) {
+export function reviewMealDraft(
+  mealLogId: string,
+  input: {
+    expectedDraftRevision: number;
+    items: {
+      itemId: string;
+      expectedItemRevision: number;
+      foodAcknowledgedRevision?: number;
+      portionAcknowledgedRevision?: number;
+    }[];
+  },
+) {
+  return apiRequest<MealDraftResponse>(`/api/meal-logs/${mealLogId}/review`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export function confirmMealDraft(
+  mealLogId: string,
+  input: {
+    expectedDraftRevision: number;
+    items: { itemId: string; expectedItemRevision: number }[];
+  },
+) {
   return apiRequest<ConfirmMealDraftResponse>(
     `/api/meal-logs/${mealLogId}/confirm`,
-    { method: 'POST' },
+    { method: 'POST', body: JSON.stringify(input) },
   );
+}
+export function deleteMealDraft(mealLogId: string, expectedDraftRevision: number) {
+  return apiRequest<MealDraftResponse>(`/api/meal-logs/${mealLogId}`, {
+    method: 'DELETE',
+    body: JSON.stringify({ expectedDraftRevision }),
+  });
 }
 
 export interface MealImageDownloadIntent {

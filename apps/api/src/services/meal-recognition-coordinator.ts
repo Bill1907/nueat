@@ -1,17 +1,14 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import {
-  foodAliases,
-  foods,
   imageAssets,
   mealItems,
   mealLogs,
-  nutrientProfiles,
   recognitionDailyUsages,
-  sourceRegistries,
   type Database,
 } from '@nueat/database';
-import { and, eq, inArray, isNotNull, lte, or, sql } from 'drizzle-orm';
+import { MEAL_ESTIMATE_REVIEW_POLICY_VERSION } from '@nueat/domain';
+import { and, eq, lte, or, sql } from 'drizzle-orm';
 
 import {
   ImageObjectNotFoundError,
@@ -22,9 +19,12 @@ import {
 } from './image-object-store';
 import {
   MealRecognitionFailure,
-  RecognitionResultV1,
+  RecognitionResultV2,
+  normalizeRecognitionLabel,
+  toStoredRecognitionResultV2,
   type MealRecognizer,
 } from './meal-recognizer';
+import { resolveRecognitionCandidates } from './meal-item-resolution';
 
 export type MealRecognitionCoordinatorResult =
   | { status: 'ready' }
@@ -76,9 +76,12 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
         imageBytes: object.bytes,
         imageContentType: object.contentType,
       });
-      const parsed = RecognitionResultV1.safeParse(output.result);
+      const parsed = RecognitionResultV2.safeParse(output.result);
       if (!parsed.success) return this.fail(claimed, 'INVALID_PROVIDER_RESPONSE');
-      const mappings = await this.mapFoods(parsed.data.foods);
+      const mappings =
+        parsed.data.outcome === 'recognized'
+          ? await this.resolveFoods(parsed.data.foods)
+          : [];
       return this.finalize(claimed, output, parsed.data, mappings);
     } catch (error) {
       return this.fail(claimed, recognitionErrorCode(error, controller.signal.aborted));
@@ -209,110 +212,92 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
     return !!updated;
   }
 
-  private async mapFoods(
-    recognizedFoods: RecognitionResultV1['foods'],
-  ): Promise<CanonicalFoodMapping[]> {
+  private async resolveFoods(
+    recognizedFoods: Extract<RecognitionResultV2, { outcome: 'recognized' }>['foods'],
+  ) {
     try {
-      return await Promise.all(
-        recognizedFoods.map((food) =>
-          this.mapFood(food.recognizedLabel, food.candidateLabels ?? []),
-        ),
+      return await resolveRecognitionCandidates(
+        this.options.database,
+        recognizedFoods.map((food) => ({
+          rawLabel: food.rawLabel,
+          alternatives: food.alternatives,
+        })),
       );
     } catch (error) {
       throw new CanonicalFoodCatalogError(error);
     }
   }
 
-  private async mapFood(
-    recognizedLabel: string,
-    candidateLabels: string[],
-  ): Promise<CanonicalFoodMapping> {
-    const primaryMatches = await this.findExactFoods([recognizedLabel]);
-    if (primaryMatches.length) return this.mappingForExactFoods(primaryMatches);
-
-    const candidateMatches = await this.findExactFoods(candidateLabels);
-    return this.mappingForExactFoods(candidateMatches);
-  }
-
-  private async findExactFoods(labels: string[]) {
-    const normalizedLabels = [...new Set(labels.map(normalizeFoodLabel).filter(Boolean))];
-    if (!normalizedLabels.length) return [];
-
-    return this.options.database
-      .select({ foodId: foods.id, isDeprecated: foods.isDeprecated, isComposite: foods.isComposite })
-      .from(foodAliases)
-      .innerJoin(foods, eq(foodAliases.foodId, foods.id))
-      .where(inArray(foodAliases.normalizedAliasKo, normalizedLabels));
-  }
-
-  private async mappingForExactFoods(
-    matches: { foodId: string; isDeprecated: boolean; isComposite: boolean }[],
-  ): Promise<CanonicalFoodMapping> {
-    const matchedFoods = new Map(matches.map((match) => [match.foodId, match]));
-    const activeFoods = [...matchedFoods.values()].filter((food) => !food.isDeprecated);
-    const compositeFoods = activeFoods.filter((food) => food.isComposite);
-    const food =
-      activeFoods.length === 1
-        ? activeFoods[0]
-        : compositeFoods.length === 1
-          ? compositeFoods[0]
-          : undefined;
-    if (!food) return unmappedFood();
-
-    const profiles = await this.options.database
-      .select({
-        id: nutrientProfiles.id,
-        qualityGrade: nutrientProfiles.qualityGrade,
-        datasetVersion: nutrientProfiles.datasetVersion,
-      })
-      .from(nutrientProfiles)
-      .innerJoin(
-        sourceRegistries,
-        eq(nutrientProfiles.sourceRegistryId, sourceRegistries.id),
-      )
-      .where(
-        and(
-          eq(nutrientProfiles.foodId, food.foodId),
-          or(
-            eq(nutrientProfiles.qualityGrade, 'verified'),
-            eq(nutrientProfiles.qualityGrade, 'estimated'),
-          ),
-          inArray(sourceRegistries.kind, trustedNutritionSourceKinds),
-          isNotNull(nutrientProfiles.energyMillicalories),
-          isNotNull(nutrientProfiles.carbohydrateMg),
-          isNotNull(nutrientProfiles.proteinMg),
-          isNotNull(nutrientProfiles.fatMg),
-        ),
-      );
-
-    const profile = profiles.sort(compareCanonicalProfiles)[0];
-    return profile
-      ? { foodId: food.foodId, nutrientProfileId: profile.id, mappingConfidenceBps: 10_000 }
-      : unmappedFood();
-  }
-
-  private async finalize(claim: ClaimedRecognition, output: Awaited<ReturnType<MealRecognizer['recognize']>>, result: RecognitionResultV1, mappings: CanonicalFoodMapping[]): Promise<MealRecognitionCoordinatorResult> {
+  private async finalize(
+    claim: ClaimedRecognition,
+    output: Awaited<ReturnType<MealRecognizer['recognize']>>,
+    result: RecognitionResultV2,
+    mappings: Array<{
+      foodId: string;
+      nutrientProfileId: string;
+      canonicalNameKo: string;
+      matchedLabel: string | null;
+      mappingSource: 'model_primary' | 'model_alternative';
+    } | null>,
+  ): Promise<MealRecognitionCoordinatorResult> {
     const now = new Date();
+    const storedResult = toStoredRecognitionResultV2(result);
     const completed = await this.options.database.transaction(async (tx) => {
       const [updated] = await tx.update(mealLogs).set({
         recognitionStatus: 'ready', recognitionProvider: output.provider, recognitionModel: output.model,
         recognitionPromptVersion: output.promptVersion, recognitionSchemaVersion: output.schemaVersion,
-        recognitionResult: jsonbSql(result), recognitionCompletedAt: now, recognitionProviderRequestId: output.providerRequestId ?? null,
+        recognitionResult: jsonbSql(storedResult), recognitionCompletedAt: now, recognitionProviderRequestId: output.providerRequestId ?? null,
         recognitionInputTokens: output.inputTokens, recognitionOutputTokens: output.outputTokens,
         recognitionLeaseToken: null, recognitionLeaseExpiresAt: null, recognitionNextAttemptAt: null, recognitionLastErrorCode: null, updatedAt: now,
       }).where(and(eq(mealLogs.id, claim.mealLogId), eq(mealLogs.userId, claim.userId), eq(mealLogs.status, 'draft'), eq(mealLogs.recognitionStatus, 'processing'), eq(mealLogs.recognitionLeaseToken, claim.leaseToken))).returning({ id: mealLogs.id });
       if (!updated) return false;
-      await tx.insert(mealItems).values(result.foods.map((food, index) => {
-        const mapping = mappings[index] ?? unmappedFood();
-        return {
-          mealLogId: claim.mealLogId, recognizedLabel: food.recognizedLabel,
-          amountMilliunits: food.amountMilliunits, unit: food.unit,
-          recognitionRegionIndex: food.regionIndex, recognitionConfidenceBps: food.recognitionConfidenceBps,
-          portionConfidenceBps: food.portionConfidenceBps, foodId: mapping.foodId,
-          nutrientProfileId: mapping.nutrientProfileId,
-          mappingConfidenceBps: mapping.mappingConfidenceBps, gramsMg: null, userCorrected: false,
-        };
-      }));
+      if (result.outcome === 'recognized') {
+        await tx.insert(mealItems).values(result.foods.map((food, index) => {
+          const mapping = mappings[index] ?? null;
+          return {
+            mealLogId: claim.mealLogId,
+            recognizedLabel: food.rawLabel,
+            amountMilliunits: food.amountMilliunits,
+            unit: food.unit,
+            recognitionRegionIndex: food.regionIndex,
+            recognitionConfidenceBps: food.foodConfidenceBps,
+            portionConfidenceBps: food.portionConfidenceBps,
+            foodId: mapping?.foodId ?? null,
+            nutrientProfileId: mapping?.nutrientProfileId ?? null,
+            mappingConfidenceBps: mapping ? 10_000 : null,
+            gramsMg: null,
+            userCorrected: false,
+            origin: 'model_estimate' as const,
+            initialEstimateAssessment: jsonbSql({
+              rawLabel: food.rawLabel,
+              normalizedLabel: normalizeRecognitionLabel(food.rawLabel),
+              foodConfidenceBps: food.foodConfidenceBps,
+              portionConfidenceBps: food.portionConfidenceBps,
+              foodCandidateMarginBps: food.alternatives[0]
+                ? food.foodConfidenceBps - food.alternatives[0].confidenceBps
+                : null,
+              questions: food.questions,
+              alternatives: food.alternatives,
+              initialMappingSource: mapping?.mappingSource ?? null,
+              initialMatchedLabel: mapping?.matchedLabel ?? null,
+              initialFoodId: mapping?.foodId ?? null,
+              initialNutrientProfileId: mapping?.nutrientProfileId ?? null,
+              recognitionProvider: output.provider,
+              recognitionModel: output.model,
+              recognitionPromptVersion: output.promptVersion,
+              recognitionSchemaVersion: output.schemaVersion,
+              policyVersion: MEAL_ESTIMATE_REVIEW_POLICY_VERSION,
+            }),
+            currentResolutionSource: mapping?.mappingSource ?? null,
+            currentResolutionSelectedAt: mapping ? now : null,
+            itemRevision: 1,
+            foodRevision: 1,
+            portionRevision: 1,
+            foodAcknowledgedRevision: null,
+            portionAcknowledgedRevision: null,
+          };
+        }));
+      }
       await tx.update(imageAssets).set({ status: 'processed', processingCompletedAt: now }).where(and(eq(imageAssets.id, claim.imageAssetId), eq(imageAssets.status, 'processing')));
       return true;
     });
@@ -355,44 +340,11 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
 }
 
 type ClaimedRecognition = { mealLogId: string; userId: string; leaseToken: string; imageAssetId: string; objectKey: string; byteSize: number; contentType: string; sha256: string; attemptCount: number };
-type CanonicalFoodMapping = {
-  foodId: string | null;
-  nutrientProfileId: string | null;
-  mappingConfidenceBps: number | null;
-};
 class CanonicalFoodCatalogError extends Error {
   constructor(readonly cause: unknown) {
     super('Canonical food catalog lookup failed');
     this.name = 'CanonicalFoodCatalogError';
   }
-}
-
-
-const trustedNutritionSourceKinds = [
-  'public_dataset',
-  'manufacturer',
-  'commercial_dataset',
-] as const;
-
-function normalizeFoodLabel(value: string) {
-  return value.normalize('NFC').toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '');
-}
-
-function unmappedFood(): CanonicalFoodMapping {
-  return { foodId: null, nutrientProfileId: null, mappingConfidenceBps: null };
-}
-
-function compareCanonicalProfiles(
-  left: { qualityGrade: string; datasetVersion: string; id: string },
-  right: { qualityGrade: string; datasetVersion: string; id: string },
-) {
-  const qualityOrder = { verified: 0, estimated: 1 };
-  return (
-    (qualityOrder[left.qualityGrade as keyof typeof qualityOrder] ?? 2) -
-      (qualityOrder[right.qualityGrade as keyof typeof qualityOrder] ?? 2) ||
-    right.datasetVersion.localeCompare(left.datasetVersion) ||
-    left.id.localeCompare(right.id)
-  );
 }
 function unavailable(code: string, retryable: boolean): MealRecognitionCoordinatorResult { return { status: 'unavailable', code, retryable }; }
 function isImageContentType(value: string | undefined): value is 'image/jpeg' | 'image/png' | 'image/webp' { return value === 'image/jpeg' || value === 'image/png' || value === 'image/webp'; }

@@ -11,11 +11,19 @@ describe('food selection policy', () => {
     expect(normalizeKoreanFoodLabel('된장\n\t찌개')).toBe('된장 찌개');
   });
 
-  test('requires the editable label to match the mapped canonical food', () => {
-    const food = { canonicalNameKo: '김치찌개' };
-
-    expect(isFoodMappingCurrent(' 김치찌개 ', food)).toBe(true);
-    expect(isFoodMappingCurrent('참치김치찌개', food)).toBe(false);
-    expect(isFoodMappingCurrent('김치찌개', null)).toBe(false);
+  test('treats the server resolution as authoritative for aliases', () => {
+    expect(
+      isFoodMappingCurrent({
+        status: 'resolved',
+        reason: 'INITIAL_ALTERNATIVE_MAPPING',
+      }),
+    ).toBe(true);
+    expect(
+      isFoodMappingCurrent({
+        status: 'unresolved',
+        reason: 'FOOD_MAPPING_MISSING',
+      }),
+    ).toBe(false);
+    expect(isFoodMappingCurrent(null)).toBe(false);
   });
 });

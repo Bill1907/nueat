@@ -116,10 +116,12 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 
 1. 사용자가 홈의 “식사 기록”을 누르고 식사 시점/종류를 선택한다.
 2. 사진 촬영 또는 앨범 선택. 업로드 중 개인정보·배경 노출 안내와 취소 기능 제공.
-3. 비전 모델이 음식 영역과 후보명을 반환한다. 낮은 신뢰도 항목은 질문 또는 검색으로 전환한다.
-4. 확인 화면에서 음식별 사진 영역, 이름, 기본 양, 단위를 보여준다. 사용자는 추가·교체·삭제·양 조정한다.
-5. 확정 시 음식 레코드와 DB 영양 프로필을 결합해 섭취량을 계산하고 출처/추정 상태를 저장한다.
-6. 결과 화면에서 총열량·매크로·식이섬유와 오늘 목표 변화, 기록 수정 진입점을 보여준다.
+3. V2 인식기는 `recognized`, `no_food`, `insufficient_evidence` 중 하나와 음식·양·불확실성만 반환한다. 영양 수치·권위 없는 DB 매핑·자동 확정값은 반환하지 않는다.
+4. API는 검증된 이미지를 단 하나의 `draft` MealLog에 먼저 연결하고, canonical Food·FoodServing·NutrientProfile의 출처/버전과 결정론 계산으로만 영양을 만든다. core 4(kcal·탄수화물·단백질·지방)와 식이섬유는 각각 결측을 0으로 바꾸지 않으며, 하나라도 결측이면 알려진 합계와 결측 수를 `partial`로 표시한다.
+5. `recognized`이면서 음식·양 확신도가 빠른 경로 기준을 충족하면 확인 화면에는 “기록 확정” 하나의 CTA만 보인다. 이 CTA 전에도 draft는 존재하며, 탭하기 전에는 섭취·일일 집계가 확정되지 않는다.
+6. 낮은 확신, `no_food`, `insufficient_evidence`는 자동 확정하지 않는다. 최소 교정(음식 검색/교체 또는 양 조정)과 재시도·취소 경로를 제공하고, 사용자가 명시적으로 확정해야 한다.
+7. 음식·양 수정은 각각 revision을 증가시키며, 오래된 revision을 제출하면 `409`으로 거부한다. 수동 override는 누가·언제·어떤 revision에서 어떤 변경을 했는지 provenance와 함께 draft에 보존한다.
+8. 확정 시 음식 레코드와 DB 영양 프로필을 결합해 섭취량을 계산하고 출처/추정 상태를 저장한다. 결과 화면에서 총열량·매크로·식이섬유와 오늘 목표 변화, 기록 수정 진입점을 보여준다.
 
 ### 6.3 영양 대시보드
 
@@ -188,6 +190,8 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 - 낮은 확신은 질문·검색·범위 표시로 처리한다. 예: “김치찌개로 보이나 확인이 필요해요.”
 - 추천은 먼저 규칙과 수치 최적화로 안전한 후보를 만들고, AI는 설명·대안 표현을 담당한다.
 - 모델·프롬프트·DB·규칙 버전을 기록하고, 골든셋 회귀 테스트 없이 교체하지 않는다.
+- 골든셋 평가는 독립 adjudication/registry SHA와 배포 대상 model·prompt·schema·resolver·review-policy identity를 포함한 versioned manifest·ground truth·strict prediction을 입력으로 받는다. quick-eligible cohort는 runtime과 evaluator가 같은 versioned 상수를 사용한다: 이미지·음식·양 confidence 각각 7,000bps 이상, 후보 margin이 있으면 1,000bps 이상, model-primary 매핑, 질문 없음, 비-gram 단위의 trusted registry 변환을 모두 만족해야 한다. 최소 120개의 동의된 한국 식사 사진을 정확히 6개 승인 food group에 그룹별 20개 이상 배치하고, `no_food`와 `insufficient_evidence`를 각각 10개 이상 포함한다. outcome accuracy ≥95%, quick-eligible 식사 50개/항목 100개 이상, food top-1 Wilson-95 하한 ≥95%, `max(25g,20%)` 양 오차 Wilson-95 하한 ≥90%, joint item Wilson-95 하한 ≥90%, eligible meal 완전 일치 Wilson-95 하한 ≥85%, eligible coverage ≥15%, valid V2 ≥99%, zero-outcome quick false positive·nutrition/ID 오류·untrusted conversion eligibility·민감정보 누출 0건을 고정 gate로 계산한다.
+- release report는 입력 SHA-256과 report SHA-256 및 aggregate만 포함하며 원본 이미지·case ID·음식 label은 복사하지 않는다. 기본 정책은 review-only다. production 활성화는 독립 승인 authority가 report SHA를 Ed25519로 서명한 receipt만 허용하며, 런타임은 서명·고정 gate·배포 stack identity·승인/활성 SHA 일치를 모두 검증한다. rollback은 직전 서명 승인 SHA로 되돌린다. private golden dataset은 저장소·보고서·로그에 넣지 않는다.
 
 ### 9.3 한국 음식/DB 전략
 
@@ -231,7 +235,7 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 - 업로드 API는 인증된 `POST /api/image-assets/upload-intents` → signed PUT → `POST /api/image-assets/:id/complete` 순서다. 완료 API가 실제 객체를 다시 읽어 계약 일치, 디코딩, 형식, 1,600px 제한, 민감 EXIF/GPS 제거, SHA-256을 검증한 뒤에만 `validated`로 전환한다.
 - 모바일은 원본을 그대로 업로드하지 않는다. 재인코딩 과정에서 원본 위치·기기·촬영시각 등 식별 메타데이터를 제거하고, 서버는 GPS와 허용된 정규화 방향/크기 필드 외 EXIF를 거부한다. 네트워크 실패·취소 시 로컬 초안 하나를 최대 24시간 보존한다.
 - 검증된 이미지는 하나의 MealLog에만 연결한다. `POST /api/meal-logs`는 이미지 기준 멱등성을 보장하고, 소유한 `validated` 이미지를 트랜잭션 안에서 claim한 뒤 `draft`만 생성한다. 앱은 연결 응답을 받기 전에 로컬 `validatedAssetId`를 저장해 재시작 후에도 업로드 없이 연결을 재시도한다.
-- AI 제공자 결정 전 vertical slice는 `mock-recognition-v1`의 고정 음식명·양·confidence를 사용한다. mock 값에는 영양 수치가 없고 확정 섭취로 집계하지 않으며, 확인 화면에서 음식명·양·단위를 추가·수정·삭제할 수 있다.
+- AI 제공자 결정 전 vertical slice와 로컬 개발은 `mock-recognition-v2`의 고정 V2 음식·양·confidence/outcome을 사용한다. mock 값에는 영양 수치나 공식 Food/Profile ID가 없고 확정 섭취로 집계하지 않으며, 확인 화면에서 모든 인식 항목을 보고 필요한 음식명·양·단위만 교정할 수 있다.
 
 ### 9.6 영양 목표 계산 기준
 
@@ -346,7 +350,7 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 
 - [ ] 제품: P0 여정 E2E, 수정/삭제/재시도, 빈 상태·오류 상태, 타임존/날짜 경계 검증
 - [ ] 데이터: MFDS 등 출처 이용조건, 버전, 단위, 결측, 100g/1회 제공량 변환 검증
-- [ ] AI: 한국 음식 골든셋, 낮은 신뢰도 분기, 모델/프롬프트 롤백, 비용 상한
+- [ ] AI: 위의 120-photo stratified `golden-v1` 고정 gate를 versioned private manifest/ground truth/strict prediction으로 실행한다. duplicate food ID, nutrition/official ID, unsupported field는 입력 단계에서 거부한다. 독립 adjudication/registry provenance와 배포 stack identity가 포함된 aggregate report SHA를 승인 authority가 Ed25519로 서명한 경우에만 production `quick_confirm`에 승인·활성화한다. 기본은 review-only이며 직전 서명 승인 SHA로 rollback 가능해야 한다.
 - [ ] 안전: 알레르기 hard constraint, 위험 사용자 플로우, 의료/보충제 금칙 테스트, 전문가 검토
 - [ ] 개인정보: 동의문, 처리방침, 이미지 학습 opt-in 분리, 계정/데이터 삭제, 침해 대응
 - [ ] 품질: 크래시/성능/접근성/네트워크 테스트, 계산 단위·회귀 테스트, 스토어 기기 QA

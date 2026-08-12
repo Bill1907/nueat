@@ -5,66 +5,110 @@ import {
   type MealRecognizer,
   type MealRecognizerInput,
   type MealRecognizerOutput,
-  RecognitionResultV1,
+  RecognitionResultV2,
 } from './meal-recognizer';
 
 export const OPENAI_MEAL_RECOGNITION_MODEL = 'gpt-5.6-luna';
 export const OPENAI_MEAL_RECOGNITION_MAX_OUTPUT_TOKENS = 1_200;
 export const OPENAI_MEAL_RECOGNITION_DEADLINE_MS = 15_000;
 
-export const OPENAI_MEAL_RECOGNITION_SYSTEM_PROMPT = `당신은 식사 사진 인식기입니다. 사진에서 보이는 음식과 음료만 식별하고 각 항목의 대략적인 양을 추정하세요.
-반드시 제공된 JSON 스키마만 따르세요. 보이지 않거나 확실하지 않은 내용은 단정하지 말고, 필요한 경우 question과 candidateLabels로 불확실성을 표현하세요.
-에너지, 칼로리, 영양소, 건강 진단, 정식 Food ID, NutrientProfile ID를 출력하거나 추론하지 마세요. 사진으로 뒷받침되지 않는 확실성을 주장하지 마세요.`;
+export const OPENAI_MEAL_RECOGNITION_SYSTEM_PROMPT = `당신은 식사 사진 인식기입니다. 사진에서 보이는 음식과 음료만 식별하고 각 항목의 대략적인 양과 불확실성을 추정하세요.
+반드시 제공된 JSON 스키마만 따르세요. 음식이나 음료가 없으면 no_food를, 사진 근거가 부족하면 insufficient_evidence를 반환하고 음식 항목을 만들지 마세요.
+에너지, 칼로리, 영양소, 건강 진단, 정식 Food ID, NutrientProfile ID 또는 다른 공식 ID를 출력하거나 추론하지 마세요. 사진으로 뒷받침되지 않는 확실성을 주장하지 마세요.`;
 
-export const OPENAI_MEAL_RECOGNITION_USER_PROMPT = `이 식사 사진을 분석하세요. 서로 다른 보이는 음식 또는 음료마다 하나의 항목을 반환하세요. regionIndex는 사진 내 항목을 구분하는 0부터 시작하는 고유한 정수입니다. 양은 g, ml, serving, bowl, piece 중 하나로만 표현하세요. 질문이 필요 없으면 question은 null, 대안 후보가 없으면 candidateLabels는 빈 배열로 반환하세요.`;
+export const OPENAI_MEAL_RECOGNITION_USER_PROMPT = `이 식사 사진을 분석하세요. outcome은 recognized, no_food, insufficient_evidence 중 하나입니다. recognized일 때만 서로 다른 보이는 음식 또는 음료마다 하나의 항목을 반환하세요. regionIndex는 사진 내 항목을 구분하는 0부터 시작하는 고유한 정수입니다. 양은 g, ml, serving, bowl, piece 중 하나로만 표현하세요. questions는 음식명 또는 양 중 확인이 필요한 대상을 target과 question으로 명시합니다. alternatives는 주 인식보다 낮은 confidence의 서로 다른 정규화 후보명을 normalizedLabel로 confidence 내림차순으로 반환하세요.`;
 
 const labelSchema = { type: 'string', minLength: 1, maxLength: 120 };
+const confidenceBpsSchema = { type: 'integer', minimum: 0, maximum: 10_000 };
 
-export const OPENAI_MEAL_RECOGNITION_JSON_SCHEMA = {
+const recognitionFoodSchema = {
   type: 'object',
   additionalProperties: false,
-  required: ['foods'],
+  required: [
+    'regionIndex',
+    'rawLabel',
+    'foodConfidenceBps',
+    'portionConfidenceBps',
+    'amountMilliunits',
+    'unit',
+    'questions',
+    'alternatives',
+  ],
   properties: {
-    foods: {
+    regionIndex: { type: 'integer', minimum: 0, maximum: 19 },
+    rawLabel: labelSchema,
+    foodConfidenceBps: confidenceBpsSchema,
+    portionConfidenceBps: confidenceBpsSchema,
+    amountMilliunits: { type: 'integer', minimum: 1 },
+    unit: { type: 'string', enum: ['g', 'ml', 'serving', 'bowl', 'piece'] },
+    questions: {
       type: 'array',
-      minItems: 1,
-      maxItems: 20,
+      minItems: 0,
+      maxItems: 2,
       items: {
         type: 'object',
         additionalProperties: false,
-        required: [
-          'regionIndex',
-          'recognizedLabel',
-          'recognitionConfidenceBps',
-          'portionConfidenceBps',
-          'amountMilliunits',
-          'unit',
-          'question',
-          'candidateLabels',
-        ],
+        required: ['target', 'question'],
         properties: {
-          regionIndex: { type: 'integer', minimum: 0, maximum: 19 },
-          recognizedLabel: labelSchema,
-          recognitionConfidenceBps: { type: 'integer', minimum: 0, maximum: 10_000 },
-          portionConfidenceBps: { type: 'integer', minimum: 0, maximum: 10_000 },
-          amountMilliunits: { type: 'integer', minimum: 1 },
-          unit: { type: 'string', enum: ['g', 'ml', 'serving', 'bowl', 'piece'] },
-          question: {
-            anyOf: [
-              { type: 'string', minLength: 1, maxLength: 240 },
-              { type: 'null' },
-            ],
-          },
-          candidateLabels: {
-            type: 'array',
-            minItems: 0,
-            maxItems: 5,
-            items: labelSchema,
-          },
+          target: { type: 'string', enum: ['food', 'portion'] },
+          question: { type: 'string', minLength: 1, maxLength: 240 },
+        },
+      },
+    },
+    alternatives: {
+      type: 'array',
+      minItems: 0,
+      maxItems: 5,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['normalizedLabel', 'confidenceBps'],
+        properties: {
+          normalizedLabel: labelSchema,
+          confidenceBps: confidenceBpsSchema,
         },
       },
     },
   },
+} as const;
+
+export const OPENAI_MEAL_RECOGNITION_JSON_SCHEMA = {
+  oneOf: [
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['outcome', 'imageQualityConfidenceBps', 'foods'],
+      properties: {
+        outcome: { const: 'recognized' },
+        imageQualityConfidenceBps: confidenceBpsSchema,
+        foods: { type: 'array', minItems: 1, maxItems: 20, items: recognitionFoodSchema },
+      },
+    },
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['outcome', 'imageQualityConfidenceBps', 'foods'],
+      properties: {
+        outcome: { const: 'no_food' },
+        imageQualityConfidenceBps: confidenceBpsSchema,
+        foods: { type: 'array', minItems: 0, maxItems: 0 },
+      },
+    },
+    {
+      type: 'object',
+      additionalProperties: false,
+      required: ['outcome', 'imageQualityConfidenceBps', 'evidenceReason', 'foods'],
+      properties: {
+        outcome: { const: 'insufficient_evidence' },
+        imageQualityConfidenceBps: confidenceBpsSchema,
+        evidenceReason: {
+          type: 'string',
+          enum: ['blurred', 'too_dark', 'occluded', 'not_meal_photo', 'other'],
+        },
+        foods: { type: 'array', minItems: 0, maxItems: 0 },
+      },
+    },
+  ],
 } as const;
 
 export interface OpenAIResponsesClient {
@@ -158,7 +202,7 @@ export class OpenAIMealRecognizer implements MealRecognizer {
       throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE');
     }
 
-    const result = RecognitionResultV1.safeParse(parsed);
+    const result = RecognitionResultV2.safeParse(parsed);
     if (!result.success) {
       throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE');
     }
@@ -203,7 +247,7 @@ function createRequest(input: MealRecognizerInput, maxOutputTokens: number): Rec
     text: {
       format: {
         type: 'json_schema',
-        name: 'meal_recognition_v1',
+        name: 'meal_recognition_v2',
         strict: true,
         schema: OPENAI_MEAL_RECOGNITION_JSON_SCHEMA,
       },

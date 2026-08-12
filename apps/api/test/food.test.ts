@@ -124,6 +124,42 @@ describe('canonical food routes', () => {
       expect(JSON.parse(response.body).error.code).toBe(expected);
     }
   });
+  test('rejects untrusted and incomplete profiles through canonical selection', async () => {
+    const untrusted = await createServer(true, {
+      profiles: [{
+        id: profileId,
+        foodId,
+        sourceKind: 'user',
+        qualityGrade: 'verified',
+        datasetVersion: '2026-01',
+        energyMillicalories: 150000,
+        carbohydrateMg: 30000,
+        proteinMg: 2000,
+        fatMg: 1000,
+      }],
+    });
+    const incomplete = await createServer(true, {
+      profiles: [{
+        id: profileId,
+        foodId,
+        sourceKind: 'public_dataset',
+        qualityGrade: 'verified',
+        datasetVersion: '2026-01',
+        energyMillicalories: 150000,
+        carbohydrateMg: null,
+        proteinMg: 2000,
+        fatMg: 1000,
+      }],
+    });
+
+    for (const server of [untrusted, incomplete]) {
+      const response = await mapFood(server);
+      expect(response.statusCode).toBe(409);
+      expect(JSON.parse(response.body).error.code).toBe(
+        'FOOD_NUTRIENT_PROFILE_UNAVAILABLE',
+      );
+    }
+  });
 
   test('maps an item to the preferred profile and returns the full envelope', async () => {
     const server = await createServer(true);
@@ -137,6 +173,8 @@ describe('canonical food routes', () => {
       foodId,
       nutrientProfileId: profileId,
       mappingConfidenceBps: 10000,
+      currentResolutionSource: 'user_selected',
+      foodAcknowledgedRevision: 2,
       userCorrected: true,
     });
   });
@@ -258,7 +296,7 @@ async function mapFood(server: FastifyInstance) {
   return server.inject({
     method: 'PUT',
     url: `/api/meal-logs/${mealLogId}/items/${itemId}/food`,
-    payload: { foodId },
+    payload: { foodId, expectedItemRevision: 1 },
   });
 }
 
@@ -304,6 +342,11 @@ async function createServer(
       foodId: null,
       nutrientProfileId: null,
       mappingConfidenceBps: null,
+      itemRevision: 1,
+      foodRevision: 1,
+      portionRevision: 1,
+      foodAcknowledgedRevision: 1,
+      portionAcknowledgedRevision: 1,
     },
     food:
       overrides.food === undefined
@@ -338,10 +381,32 @@ async function createServer(
   return server;
 }
 
+function applyValuesWithRevisionIncrements(
+  target: Record<string, unknown>,
+  values: Record<string, unknown>,
+  revisionKeys: string[],
+) {
+  for (const [key, value] of Object.entries(values)) {
+    if (key === 'foodAcknowledgedRevision' && typeof value !== 'number') {
+      target[key] = target.foodRevision;
+    } else if (key === 'portionAcknowledgedRevision' && typeof value !== 'number') {
+      target[key] = target.portionRevision;
+    } else if (revisionKeys.includes(key) && typeof value !== 'number') {
+      target[key] = Number(target[key] ?? 1) + 1;
+    } else {
+      target[key] = value;
+    }
+  }
+}
+
 function databaseMock(state: Record<string, any>) {
   const resultFor = (table: unknown) => {
     if (table === foodAliases) return state.aliases;
-    if (table === nutrientProfiles) return state.profiles;
+    if (table === nutrientProfiles)
+      return state.profiles.map((profile: Record<string, unknown>) => ({
+        sourceKind: 'public_dataset',
+        ...profile,
+      }));
     if (table === foodServings) return state.servings;
     if (table === foods)
       return state.food && !state.food.isDeprecated ? [state.food] : [];
@@ -380,9 +445,19 @@ function databaseMock(state: Record<string, any>) {
       set: (values: Record<string, unknown>) => ({
         where: () => ({
           returning: async () => {
-            if (table !== mealItems) return [];
-            Object.assign(state.item, values);
-            return [state.item];
+            if (table === mealItems) {
+              applyValuesWithRevisionIncrements(state.item, values, [
+                'itemRevision',
+                'foodRevision',
+                'portionRevision',
+              ]);
+              return [state.item];
+            }
+            if (table === mealLogs) {
+              applyValuesWithRevisionIncrements(state.meal, values, ['draftRevision']);
+              return [state.meal];
+            }
+            return [];
           },
         }),
       }),
