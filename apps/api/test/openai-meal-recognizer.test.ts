@@ -51,13 +51,18 @@ describe('OpenAIMealRecognizer', () => {
     expect(result).toMatchObject({ provider: 'openai', model: 'gpt-5.4-mini-2026-03-17', providerRequestId: 'req_123', result: recognized });
     const request = fake.requests[0]!;
     expect(request).toMatchObject({ model: 'gpt-5.4-mini-2026-03-17', store: false, max_output_tokens: 1_200, text: { format: { type: 'json_schema', strict: true } } });
+    expect((request.text as { format: { schema: unknown } }).format.schema).toMatchObject({
+      type: 'object',
+      required: ['outcome', 'imageQualityConfidenceBps', 'evidenceReason', 'foods'],
+    });
+    expect(JSON.stringify((request.text as { format: { schema: unknown } }).format.schema)).not.toContain('"oneOf"');
     expect(JSON.stringify(request)).toContain('data:image/png;base64,AAEC');
     expect(JSON.stringify(request)).not.toContain('https://');
     expect(JSON.stringify(request)).not.toContain('nutrientProfileId');
   });
 
   test('accepts all three V2 outcomes, including zero-item no-food and insufficient-evidence results', async () => {
-    await expect(recognizeOutput({ outcome: 'no_food', imageQualityConfidenceBps: 8_000, foods: [] })).resolves.toMatchObject({ result: { outcome: 'no_food', foods: [] } });
+    await expect(recognizeOutput({ outcome: 'no_food', imageQualityConfidenceBps: 8_000, evidenceReason: null, foods: [] })).resolves.toMatchObject({ result: { outcome: 'no_food', foods: [] } });
     await expect(recognizeOutput({ outcome: 'insufficient_evidence', imageQualityConfidenceBps: 2_000, evidenceReason: 'blurred', foods: [] })).resolves.toMatchObject({ result: { outcome: 'insufficient_evidence', evidenceReason: 'blurred', foods: [] } });
   });
 
