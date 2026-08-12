@@ -65,7 +65,13 @@ const environmentSchema = z
       .trim()
       .optional()
       .transform((value) => value || undefined),
-    OPENAI_MODEL: z.literal('gpt-5.6-luna').default('gpt-5.6-luna'),
+    OPENAI_MODEL: z
+      .string()
+      .trim()
+      .min(1)
+      .max(128)
+      .regex(/^[A-Za-z0-9._-]+$/, 'OPENAI_MODEL must be a valid OpenAI model ID')
+      .default('gpt-5.4-mini-2026-03-17'),
     MEAL_RECOGNITION_DEADLINE_MS: z.coerce
       .number()
       .int()

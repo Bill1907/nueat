@@ -1,7 +1,6 @@
 import { useCallback, useState } from 'react';
 import {
   Platform,
-  Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -9,7 +8,7 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { authClient, useAuthSession } from '@/auth/client';
+import { useAuthSession } from '@/auth/client';
 import { DailyNutritionDashboard } from '@/components/daily-nutrition-dashboard';
 import { NextMealRecommendations } from '@/components/next-meal-recommendations';
 
@@ -25,18 +24,9 @@ export default function HomeScreen() {
   const insets = useSafeAreaInsets();
   const theme = useTheme();
   const session = useAuthSession();
-  const [isSigningOut, setIsSigningOut] = useState(false);
   const [refreshGeneration, setRefreshGeneration] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
 
-  async function signOut() {
-    setIsSigningOut(true);
-    try {
-      await authClient.signOut();
-    } finally {
-      setIsSigningOut(false);
-    }
-  }
   function refreshHome() {
     setRefreshing(true);
     setRefreshGeneration((generation) => generation + 1);
@@ -89,30 +79,6 @@ export default function HomeScreen() {
           onLoadComplete={handleDashboardLoadComplete}
         />
         <MealPhotoUploadCard compact onMealConfirmed={handleMealConfirmed} />
-
-
-        <ThemedView type="backgroundElement" style={styles.accountCard}>
-          <View style={styles.accountCopy}>
-            <ThemedText type="smallBold">로그인 계정</ThemedText>
-            <ThemedText type="small" themeColor="textSecondary">
-              {session.data?.user.email}
-            </ThemedText>
-          </View>
-          <Pressable
-            accessibilityRole="button"
-            accessibilityState={{ disabled: isSigningOut }}
-            disabled={isSigningOut}
-            onPress={() => void signOut()}
-            style={({ pressed }) => [
-              styles.signOutButton,
-              pressed && styles.pressed,
-            ]}
-          >
-            <ThemedText type="smallBold" style={{ color: theme.danger }}>
-              {isSigningOut ? '로그아웃 중…' : '로그아웃'}
-            </ThemedText>
-          </Pressable>
-        </ThemedView>
       </ThemedView>
     </ScrollView>
   );
@@ -141,25 +107,5 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     fontWeight: '800',
     letterSpacing: 1.5,
-  },
-  accountCard: {
-    minHeight: 72,
-    padding: Spacing.three,
-    borderRadius: 18,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Spacing.three,
-  },
-  accountCopy: {
-    flex: 1,
-    gap: Spacing.half,
-  },
-  signOutButton: {
-    minHeight: 44,
-    justifyContent: 'center',
-    paddingHorizontal: Spacing.three,
-  },
-  pressed: {
-    opacity: 0.7,
   },
 });

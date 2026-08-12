@@ -35,7 +35,7 @@ function approvedReceipt(change: Record<string, unknown> = {}) {
       registryVersion: 'registry-v2',
       registrySha256: 'e'.repeat(64),
       provider: 'openai',
-      recognitionModel: 'gpt-5.6-luna',
+      recognitionModel: 'gpt-5.4-mini-2026-03-17',
       promptVersion: 'meal-recognition-prompt-v2',
       schemaVersion: 'meal-recognition-schema-v2',
       resolverVersion: 'meal-item-resolution-v1',
@@ -82,7 +82,17 @@ function quickConfirmEnvironment(receipt: ReturnType<typeof approvedReceipt>) {
 describe('parseEnvironment', () => {
   test('defaults meal recognition and its UX policy to review_only', () => {
     const result = parseEnvironment({ ...validEnvironment, OPENAI_API_KEY: '' });
-    expect(result.mealRecognition).toMatchObject({ mode: 'mock', apiKey: undefined, model: 'gpt-5.6-luna', deadlineMs: 20_000, maxOutputTokens: 2_000, maxAttempts: 2, dailyAttemptQuota: 20, reviewPolicy: { mode: 'review_only', approvedReportSha256: undefined, activeReportSha256: undefined, approvedReportVersion: undefined, approvedReportReceipt: null } });
+    expect(result.mealRecognition).toMatchObject({ mode: 'mock', apiKey: undefined, model: 'gpt-5.4-mini-2026-03-17', deadlineMs: 20_000, maxOutputTokens: 2_000, maxAttempts: 2, dailyAttemptQuota: 20, reviewPolicy: { mode: 'review_only', approvedReportSha256: undefined, activeReportSha256: undefined, approvedReportVersion: undefined, approvedReportReceipt: null } });
+  });
+
+  test('passes a configured model ID through in review-only mode', () => {
+    const result = parseEnvironment({
+      ...validEnvironment,
+      MEAL_RECOGNITION_MODE: 'openai',
+      OPENAI_API_KEY: 'test-openai-key',
+      OPENAI_MODEL: 'gpt-5.4-mini',
+    });
+    expect(result.mealRecognition.model).toBe('gpt-5.4-mini');
   });
 
   test('accepts production quick_confirm only with a canonical passing V2 approval receipt bound to both SHA values', () => {

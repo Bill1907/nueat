@@ -1,6 +1,7 @@
 import { Image } from 'expo-image';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
   AppState,
   Modal,
   Pressable,
@@ -32,6 +33,7 @@ import { getFood, searchFoods, type CanonicalFood } from '@/api/foods';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
+import { useTheme } from '@/hooks/use-theme';
 import {
   createNutritionPreview,
   decimalToMilliunits,
@@ -81,6 +83,7 @@ export function MealConfirmationModal({
   onClose: () => void;
   onConfirmed?: () => void;
 }) {
+  const theme = useTheme();
   const [data, setData] = useState<MealDraftResponse | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [forms, setForms] = useState<Record<string, ItemForm>>({});
@@ -836,9 +839,17 @@ export function MealConfirmationModal({
           />
         )}
         {!currentData && !currentError && (
-          <ThemedText type="small" themeColor="textSecondary">
-            사진과 인식 결과를 불러오고 있어요.
-          </ThemedText>
+          <View
+            accessibilityLabel="사진과 음식 인식 결과를 불러오고 있어요"
+            accessibilityLiveRegion="polite"
+            style={styles.loadingState}
+          >
+            <ActivityIndicator color={theme.primary} size="large" />
+            <ThemedText type="smallBold">음식 인식 결과를 기다리고 있어요</ThemedText>
+            <ThemedText type="small" themeColor="textSecondary">
+              AI 분석에는 잠시 시간이 걸릴 수 있어요.
+            </ThemedText>
+          </View>
         )}
         {currentData && (
           <ScrollView contentContainerStyle={styles.content}>
@@ -858,6 +869,19 @@ export function MealConfirmationModal({
                   ? '사진에서 음식을 인식하고 있어요. 완료될 때까지 잠시만 기다려 주세요.'
                   : `상태: ${currentData.mealLog.recognitionStatus} · 제공자: ${currentData.mealLog.recognitionProvider ?? '알 수 없음'} · 모델: ${currentData.mealLog.recognitionModel ?? '알 수 없음'}`}
               </ThemedText>
+              {(currentData.mealLog.recognitionStatus === 'pending' ||
+                currentData.mealLog.recognitionStatus === 'processing') && (
+                <View
+                  accessibilityLabel="AI 음식 인식 진행 중"
+                  accessibilityLiveRegion="polite"
+                  style={styles.loadingRow}
+                >
+                  <ActivityIndicator color={theme.primary} />
+                  <ThemedText type="small" themeColor="textSecondary">
+                    분석이 끝나면 결과가 자동으로 표시돼요.
+                  </ThemedText>
+                </View>
+              )}
               {(currentData.mealLog.recognitionStatus === 'pending' ||
                 currentData.mealLog.recognitionStatus === 'processing') &&
                 currentData.mealLog.recognitionNextAttemptAt && (
@@ -1526,6 +1550,16 @@ const styles = StyleSheet.create({
     backgroundColor: '#DDE5E0',
   },
   recognition: { gap: Spacing.one },
+  loadingState: {
+    alignItems: 'center',
+    gap: Spacing.two,
+    paddingVertical: Spacing.four,
+  },
+  loadingRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: Spacing.two,
+  },
   itemCard: {
     gap: Spacing.two,
     padding: Spacing.three,

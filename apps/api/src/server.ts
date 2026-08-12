@@ -63,6 +63,7 @@ export async function buildServer(dependencies: ServerDependencies) {
                     apiKey: environment.mealRecognition.apiKey,
                   }) as unknown as OpenAIResponsesClient,
                   {
+                    model: environment.mealRecognition.model,
                     deadlineMs: environment.mealRecognition.deadlineMs,
                     maxOutputTokens: environment.mealRecognition.maxOutputTokens,
                   },

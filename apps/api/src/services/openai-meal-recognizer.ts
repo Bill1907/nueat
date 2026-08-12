@@ -8,7 +8,7 @@ import {
   RecognitionResultV2,
 } from './meal-recognizer';
 
-export const OPENAI_MEAL_RECOGNITION_MODEL = 'gpt-5.6-luna';
+export const OPENAI_MEAL_RECOGNITION_MODEL = 'gpt-5.4-mini-2026-03-17';
 export const OPENAI_MEAL_RECOGNITION_MAX_OUTPUT_TOKENS = 1_200;
 export const OPENAI_MEAL_RECOGNITION_DEADLINE_MS = 15_000;
 
@@ -132,11 +132,13 @@ export interface OpenAIResponse {
 }
 
 export interface OpenAIMealRecognizerOptions {
+  model?: string;
   deadlineMs?: number;
   maxOutputTokens?: number;
 }
 
 export class OpenAIMealRecognizer implements MealRecognizer {
+  private readonly model: string;
   private readonly deadlineMs: number;
   private readonly maxOutputTokens: number;
 
@@ -144,6 +146,7 @@ export class OpenAIMealRecognizer implements MealRecognizer {
     private readonly client: OpenAIResponsesClient,
     options: OpenAIMealRecognizerOptions = {},
   ) {
+    this.model = options.model?.trim() || OPENAI_MEAL_RECOGNITION_MODEL;
     this.deadlineMs = positiveInteger(options.deadlineMs, OPENAI_MEAL_RECOGNITION_DEADLINE_MS);
     this.maxOutputTokens = positiveInteger(
       options.maxOutputTokens,
@@ -165,7 +168,7 @@ export class OpenAIMealRecognizer implements MealRecognizer {
     try {
       response = await Promise.race([
         this.client.responses.create(
-          createRequest(input, this.maxOutputTokens),
+          createRequest(input, this.model, this.maxOutputTokens),
           { signal: controller.signal },
         ),
         deadline,
@@ -212,7 +215,7 @@ export class OpenAIMealRecognizer implements MealRecognizer {
     );
     return {
       provider: 'openai',
-      model: sanitizeModel(response.model) ?? OPENAI_MEAL_RECOGNITION_MODEL,
+      model: sanitizeModel(response.model) ?? this.model,
       promptVersion: MEAL_RECOGNITION_PROMPT_VERSION,
       schemaVersion: MEAL_RECOGNITION_SCHEMA_VERSION,
       ...(providerRequestId ? { providerRequestId } : {}),
@@ -223,9 +226,13 @@ export class OpenAIMealRecognizer implements MealRecognizer {
   }
 }
 
-function createRequest(input: MealRecognizerInput, maxOutputTokens: number): Record<string, unknown> {
+function createRequest(
+  input: MealRecognizerInput,
+  model: string,
+  maxOutputTokens: number,
+): Record<string, unknown> {
   return {
-    model: OPENAI_MEAL_RECOGNITION_MODEL,
+    model,
     store: false,
     max_output_tokens: maxOutputTokens,
     input: [

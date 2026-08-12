@@ -1,7 +1,14 @@
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import { useEffect, useRef, useState } from 'react';
-import { Linking, Platform, Pressable, StyleSheet, View } from 'react-native';
+import {
+  ActivityIndicator,
+  Linking,
+  Platform,
+  Pressable,
+  StyleSheet,
+  View,
+} from 'react-native';
 
 import {
   createMealDraft,
@@ -322,26 +329,51 @@ export function MealPhotoUploadCard({
       {(phase === 'uploading' ||
         phase === 'validating' ||
         phase === 'linking') && (
-        <View accessibilityLiveRegion="polite" style={styles.progressSection}>
-          <ThemedText accessibilityLiveRegion="polite" type="smallBold">
-            {phase === 'uploading'
-              ? `업로드 ${Math.round(progress * 100)}%`
+        <View
+          accessibilityLabel={
+            phase === 'uploading'
+              ? `사진 업로드 ${Math.round(progress * 100)}퍼센트`
               : phase === 'validating'
-                ? '이미지 검증 중'
-                : '식사 초안을 만들고 있어요'}
-          </ThemedText>
-          <View
-            accessibilityRole="progressbar"
-            accessibilityValue={{ min: 0, max: 100, now: Math.round(progress * 100) }}
-            style={[styles.progressTrack, { backgroundColor: theme.surfaceInset }]}
-          >
-            <View
-              style={[
-                styles.progressFill,
-                { width: `${Math.round(progress * 100)}%`, backgroundColor: theme.primary },
-              ]}
-            />
+                ? '업로드한 이미지를 검증하고 있어요'
+                : 'AI가 사진을 분석하고 식사 초안을 만들고 있어요'
+          }
+          accessibilityLiveRegion="polite"
+          style={styles.progressSection}
+        >
+          <View style={styles.loadingRow}>
+            {phase !== 'uploading' && (
+              <ActivityIndicator color={theme.primary} />
+            )}
+            <View style={styles.loadingCopy}>
+              <ThemedText type="smallBold">
+                {phase === 'uploading'
+                  ? `업로드 ${Math.round(progress * 100)}%`
+                  : phase === 'validating'
+                    ? '이미지 검증 중'
+                    : 'AI가 식사 초안을 만들고 있어요'}
+              </ThemedText>
+              {phase === 'linking' && (
+                <ThemedText type="small" themeColor="textSecondary">
+                  음식과 양을 분석하는 데 잠시 시간이 걸릴 수 있어요. 화면을
+                  닫지 않아도 완료되면 바로 확인할 수 있어요.
+                </ThemedText>
+              )}
+            </View>
           </View>
+          {phase === 'uploading' && (
+            <View
+              accessibilityRole="progressbar"
+              accessibilityValue={{ min: 0, max: 100, now: Math.round(progress * 100) }}
+              style={[styles.progressTrack, { backgroundColor: theme.surfaceInset }]}
+            >
+              <View
+                style={[
+                  styles.progressFill,
+                  { width: `${Math.round(progress * 100)}%`, backgroundColor: theme.primary },
+                ]}
+              />
+            </View>
+          )}
         </View>
       )}
       {phase === 'ready' && draft && (
@@ -589,6 +621,15 @@ const styles = StyleSheet.create({
   },
   progressSection: {
     gap: Spacing.two,
+  },
+  loadingRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: Spacing.two,
+  },
+  loadingCopy: {
+    flex: 1,
+    gap: Spacing.one,
   },
   progressTrack: {
     height: 8,

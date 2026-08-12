@@ -655,7 +655,7 @@ describe('meal log routes', () => {
         initialFoodId: '00000000-0000-4000-8000-000000000099',
         initialNutrientProfileId: '00000000-0000-4000-8000-000000000098',
         recognitionProvider: 'openai',
-        recognitionModel: 'gpt-5.6-luna',
+        recognitionModel: 'gpt-5.4-mini-2026-03-17',
         recognitionPromptVersion: 'meal-recognition-prompt-v2',
         recognitionSchemaVersion: 'meal-recognition-schema-v2',
         policyVersion: 'meal-estimate-review-v1',
@@ -676,7 +676,7 @@ describe('meal log routes', () => {
       initialEstimateAssessment: {
         initialFoodId: '00000000-0000-4000-8000-000000000099',
         initialNutrientProfileId: '00000000-0000-4000-8000-000000000098',
-        recognitionModel: 'gpt-5.6-luna',
+        recognitionModel: 'gpt-5.4-mini-2026-03-17',
       },
       currentResolutionSource: 'user_selected',
       foodId,

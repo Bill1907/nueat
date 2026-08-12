@@ -24,7 +24,7 @@ const recognized = {
 };
 
 const validResponse: OpenAIResponse = {
-  model: 'gpt-5.6-luna',
+  model: 'gpt-5.4-mini-2026-03-17',
   _request_id: 'req_123',
   usage: { input_tokens: 123, output_tokens: 45 },
   output_text: JSON.stringify(recognized),
@@ -48,9 +48,9 @@ describe('OpenAIMealRecognizer', () => {
     const fake = fakeClient(validResponse);
     const result = await new OpenAIMealRecognizer(fake.client).recognize({ imageBytes: new Uint8Array([0, 1, 2]), imageContentType: 'image/png' });
 
-    expect(result).toMatchObject({ provider: 'openai', model: 'gpt-5.6-luna', providerRequestId: 'req_123', result: recognized });
+    expect(result).toMatchObject({ provider: 'openai', model: 'gpt-5.4-mini-2026-03-17', providerRequestId: 'req_123', result: recognized });
     const request = fake.requests[0]!;
-    expect(request).toMatchObject({ model: 'gpt-5.6-luna', store: false, max_output_tokens: 1_200, text: { format: { type: 'json_schema', strict: true } } });
+    expect(request).toMatchObject({ model: 'gpt-5.4-mini-2026-03-17', store: false, max_output_tokens: 1_200, text: { format: { type: 'json_schema', strict: true } } });
     expect(JSON.stringify(request)).toContain('data:image/png;base64,AAEC');
     expect(JSON.stringify(request)).not.toContain('https://');
     expect(JSON.stringify(request)).not.toContain('nutrientProfileId');
