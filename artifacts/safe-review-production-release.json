@@ -1,0 +1,34 @@
+{
+  "recordedAt": "2026-08-13T07:22:00Z",
+  "sharedNeon": {
+    "migrationCount": 23,
+    "newMigrationCount": 10,
+    "latestCreatedAt": "1786520780637",
+    "checkpointColumn": true,
+    "obsoleteAcknowledgementColumnsRemoved": true,
+    "confirmationGuard": true,
+    "catalogReleaseTable": true
+  },
+  "git": {
+    "branch": "main",
+    "commit": "2f62d6f257bf63310c3651915f9686e7a79e8bb9",
+    "remoteSynchronized": true
+  },
+  "railway": {
+    "deploymentId": "178d6c3b-cfe0-47c9-8f3d-859126e8c81d",
+    "status": "SUCCESS"
+  },
+  "production": {
+    "health": "ready",
+    "readiness": "ready",
+    "database": "up",
+    "mealConfirmationProtocol": "meal-confirmation-safe-review-v1",
+    "cutoverMode": "normal"
+  },
+  "verification": {
+    "typecheck": "passed",
+    "lint": "passed",
+    "tests": "321 passed, 0 failed, 1301 assertions",
+    "databaseCheck": "passed"
+  }
+}
