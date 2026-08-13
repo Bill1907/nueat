@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   calculateItemNutrition,
   calculateMealNutrition,
+  calculateReviewedMealNutrition,
   convertAmountToGramsMg,
   NutritionCalculationError,
   type NutrientProfileValues,
@@ -170,6 +171,123 @@ describe('meal totals', () => {
       knownValue: 0,
       missingItemCount: 0,
       completeness: 'complete',
+    });
+  });
+});
+
+describe('reviewed meal totals', () => {
+  test('is pending until an item has a current review', () => {
+    const result = calculateReviewedMealNutrition([{
+      mealItemId: 'rice',
+      amountMilliunits: 100_000,
+      unit: 'g',
+      nutrientProfile: cookedRice,
+      userReview: 'unreviewed',
+    }]);
+
+    expect(result).toMatchObject({
+      status: 'pending',
+      reviewedItemCount: 0,
+      unreviewedItemCount: 1,
+      items: [],
+    });
+    expect(result.totals.proteinMg).toEqual({
+      value: null,
+      knownValue: 0,
+      missingItemCount: 0,
+      status: 'pending',
+    });
+  });
+
+  test('reports a subtotal for reviewed values while another item remains unreviewed', () => {
+    const result = calculateReviewedMealNutrition([
+      {
+        mealItemId: 'rice',
+        amountMilliunits: 100_000,
+        unit: 'g',
+        nutrientProfile: cookedRice,
+        userReview: 'current',
+      },
+      {
+        mealItemId: 'kimchi',
+        amountMilliunits: 50_000,
+        unit: 'g',
+        nutrientProfile: kimchi,
+        userReview: 'stale',
+      },
+    ]);
+
+    expect(result).toMatchObject({
+      status: 'subtotal',
+      reviewedItemCount: 1,
+      unreviewedItemCount: 1,
+    });
+    expect(result.totals.proteinMg).toEqual({
+      value: null,
+      knownValue: 2_700,
+      missingItemCount: 0,
+      status: 'subtotal',
+    });
+  });
+
+  test('preserves unknown nutrients separately from known zero in reviewed summaries', () => {
+    const knownZero: NutrientProfileValues = {
+      ...cookedRice,
+      fatMg: 0,
+      fiberMg: null,
+    };
+    const result = calculateReviewedMealNutrition([
+      {
+        mealItemId: 'zero-fat',
+        amountMilliunits: 100_000,
+        unit: 'g',
+        nutrientProfile: knownZero,
+        userReview: 'current',
+      },
+    ]);
+
+    expect(result.totals.fatMg).toEqual({
+      value: 0,
+      knownValue: 0,
+      missingItemCount: 0,
+      status: 'complete',
+    });
+    expect(result.totals.fiberMg).toEqual({
+      value: null,
+      knownValue: 0,
+      missingItemCount: 1,
+      status: 'subtotal',
+    });
+  });
+
+  test('is complete only when every item is currently reviewed and has known values', () => {
+    const result = calculateReviewedMealNutrition([
+      {
+        mealItemId: 'rice',
+        amountMilliunits: 100_000,
+        unit: 'g',
+        nutrientProfile: cookedRice,
+        userReview: 'current',
+      },
+      {
+        mealItemId: 'kimchi',
+        amountMilliunits: 50_000,
+        unit: 'g',
+        nutrientProfile: { ...kimchi, fiberMg: 1_500 },
+        userReview: 'current',
+      },
+    ]);
+
+    expect(result).toMatchObject({
+      status: 'complete',
+      reviewedItemCount: 2,
+      unreviewedItemCount: 0,
+    });
+    expect(result.totals.fiberMg).toEqual({
+      value: 1_150,
+      knownValue: 1_150,
+      missingItemCount: 0,
+      status: 'complete',
     });
   });
 });

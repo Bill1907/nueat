@@ -63,6 +63,18 @@ export async function calculateCatalogRegistrySha256(database: Pick<Database, 's
     .digest('hex');
 }
 
+export async function calculateCatalogReleaseIdentity(database: Pick<Database, 'select'>) {
+  const registrySha256 = await calculateCatalogRegistrySha256(database);
+  const registries = await database.select({
+    code: sourceRegistries.code,
+    datasetVersion: sourceRegistries.datasetVersion,
+  }).from(sourceRegistries).orderBy(asc(sourceRegistries.id));
+  return {
+    releaseIds: registries.map((registry) => `${registry.code}@${registry.datasetVersion}`),
+    registrySha256,
+  };
+}
+
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
   if (value instanceof Date) return JSON.stringify(value.toISOString());

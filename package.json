@@ -22,6 +22,8 @@
     "typecheck": "bun run --filter '*' typecheck",
     "test": "bun test",
     "db:check": "bun run --cwd packages/database db:check",
-    "db:migrate": "bun run --cwd packages/database db:migrate"
+    "db:migrate:bridge": "bun run --cwd packages/database db:migrate:bridge",
+    "db:migrate:0022": "bun run --cwd packages/database db:migrate:0022",
+    "db:migrate:0023": "bun run --cwd packages/database db:migrate:0023"
   }
 }

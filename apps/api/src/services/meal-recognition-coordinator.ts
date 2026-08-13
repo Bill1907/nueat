@@ -5,9 +5,12 @@ import {
   mealItems,
   mealLogs,
   recognitionDailyUsages,
+  recognitionAttempts,
+  resolutionAttempts,
+  storedObservations,
   type Database,
 } from '@nueat/database';
-import { MEAL_ESTIMATE_REVIEW_POLICY_VERSION } from '@nueat/domain';
+import { MEAL_REVIEW_POLICY_VERSION } from '@nueat/domain';
 import { and, eq, lte, or, sql } from 'drizzle-orm';
 
 import {
@@ -20,11 +23,18 @@ import {
 import {
   MealRecognitionFailure,
   RecognitionResultV2,
+  RecognitionResultV3,
   normalizeRecognitionLabel,
+  parseRecognitionResultV3,
   toStoredRecognitionResultV2,
+  toStoredRecognitionResultV3,
   type MealRecognizer,
 } from './meal-recognizer';
 import { resolveRecognitionCandidates } from './meal-item-resolution';
+import {
+  MealResolutionCoordinator,
+  type VerifiedCatalogAutoSelectionPolicy,
+} from './meal-resolution-coordinator';
 
 export type MealRecognitionCoordinatorResult =
   | { status: 'ready' }
@@ -43,12 +53,26 @@ export interface MealRecognitionCoordinatorOptions {
   leaseMs: number;
   maxAttempts: number;
   dailyQuota: number;
+  autoSelectionPolicy?: VerifiedCatalogAutoSelectionPolicy | null;
 }
 
 export class MealRecognitionCoordinator implements MealRecognitionRunner {
   constructor(private readonly options: MealRecognitionCoordinatorOptions) {}
 
   async recognize(mealLogId: string, userId: string): Promise<MealRecognitionCoordinatorResult> {
+    const [storedObservation] = await this.options.database
+      .select({ id: storedObservations.id })
+      .from(storedObservations)
+      .where(eq(storedObservations.mealLogId, mealLogId))
+      .limit(1);
+    if (storedObservation) {
+      return new MealResolutionCoordinator(
+        this.options.database,
+        Math.max(this.options.leaseMs, this.options.timeoutMs),
+        this.options.maxAttempts,
+        this.options.autoSelectionPolicy,
+      ).resolve(mealLogId, userId);
+    }
     const claimed = await this.claim(mealLogId, userId);
     if (claimed.kind === 'active') return { status: 'active', retryAfterSeconds: claimed.retryAfterSeconds };
     if (claimed.kind === 'unavailable') return claimed.outcome;
@@ -76,6 +100,18 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
         imageBytes: object.bytes,
         imageContentType: object.contentType,
       });
+      const parsedV3 = RecognitionResultV3.safeParse(output.result);
+      if (parsedV3.success) {
+        const persisted = await this.persistV3Observation(claimed, output, parseRecognitionResultV3(output.result));
+        return persisted.status === 'ready'
+          ? new MealResolutionCoordinator(
+            this.options.database,
+            Math.max(this.options.leaseMs, this.options.timeoutMs),
+            this.options.maxAttempts,
+            this.options.autoSelectionPolicy,
+          ).resolve(mealLogId, userId)
+          : persisted;
+      }
       const parsed = RecognitionResultV2.safeParse(output.result);
       if (!parsed.success) return this.fail(claimed, 'INVALID_PROVIDER_RESPONSE');
       const mappings =
@@ -286,19 +322,66 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
               recognitionModel: output.model,
               recognitionPromptVersion: output.promptVersion,
               recognitionSchemaVersion: output.schemaVersion,
-              policyVersion: MEAL_ESTIMATE_REVIEW_POLICY_VERSION,
+              policyVersion: MEAL_REVIEW_POLICY_VERSION,
             }),
             currentResolutionSource: mapping?.mappingSource ?? null,
             currentResolutionSelectedAt: mapping ? now : null,
             itemRevision: 1,
             foodRevision: 1,
             portionRevision: 1,
-            foodAcknowledgedRevision: null,
-            portionAcknowledgedRevision: null,
           };
         }));
       }
       await tx.update(imageAssets).set({ status: 'processed', processingCompletedAt: now }).where(and(eq(imageAssets.id, claim.imageAssetId), eq(imageAssets.status, 'processing')));
+      return true;
+    });
+    return completed ? { status: 'ready' } : this.currentOutcome(claim.mealLogId, claim.userId);
+  }
+
+  /**
+   * Provider output is durable before any catalog work. Resolution deliberately starts from
+   * this immutable observation; it never needs image bytes or another paid provider request.
+   */
+  private async persistV3Observation(
+    claim: ClaimedRecognition,
+    output: Awaited<ReturnType<MealRecognizer['recognize']>>,
+    result: RecognitionResultV3,
+  ): Promise<MealRecognitionCoordinatorResult> {
+    const now = new Date();
+    const storedResult = toStoredRecognitionResultV3(result);
+    const contentSha256 = createHash('sha256').update(JSON.stringify(storedResult)).digest('hex');
+    const completed = await this.options.database.transaction(async (tx) => {
+      const [updated] = await tx.update(mealLogs).set({
+        recognitionStatus: 'ready', recognitionProvider: output.provider, recognitionModel: output.model,
+        recognitionPromptVersion: output.promptVersion, recognitionSchemaVersion: output.schemaVersion,
+        recognitionResult: storedResult, recognitionCompletedAt: now,
+        recognitionProviderRequestId: output.providerRequestId ?? null,
+        recognitionInputTokens: output.inputTokens, recognitionOutputTokens: output.outputTokens,
+        recognitionLeaseToken: null, recognitionLeaseExpiresAt: null, recognitionNextAttemptAt: null,
+        recognitionLastErrorCode: null, updatedAt: now,
+      }).where(and(
+        eq(mealLogs.id, claim.mealLogId), eq(mealLogs.userId, claim.userId),
+        eq(mealLogs.status, 'draft'), eq(mealLogs.recognitionStatus, 'processing'),
+        eq(mealLogs.recognitionLeaseToken, claim.leaseToken),
+      )).returning({ id: mealLogs.id });
+      if (!updated) return false;
+      const [attempt] = await tx.insert(recognitionAttempts).values({
+        mealLogId: claim.mealLogId, imageAssetId: claim.imageAssetId, status: 'ready',
+        provider: output.provider, model: output.model, promptVersion: output.promptVersion,
+        schemaVersion: output.schemaVersion, providerRequestId: output.providerRequestId ?? null,
+        inputTokens: output.inputTokens, outputTokens: output.outputTokens,
+        attemptCount: claim.attemptCount, nextAttemptAt: now, completedAt: now, updatedAt: now,
+      }).returning({ id: recognitionAttempts.id });
+      const [observation] = await tx.insert(storedObservations).values({
+        mealLogId: claim.mealLogId, recognitionAttemptId: attempt!.id,
+        provider: output.provider, model: output.model, promptVersion: output.promptVersion,
+        schemaVersion: output.schemaVersion, providerRequestId: output.providerRequestId ?? null,
+        inputTokens: output.inputTokens, outputTokens: output.outputTokens,
+        canonicalContent: storedResult, contentSha256,
+      }).returning({ id: storedObservations.id });
+      await tx.insert(resolutionAttempts).values({
+        storedObservationId: observation!.id, status: 'pending', nextAttemptAt: now, updatedAt: now,
+      });
       return true;
     });
     return completed ? { status: 'ready' } : this.currentOutcome(claim.mealLogId, claim.userId);

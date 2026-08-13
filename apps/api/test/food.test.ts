@@ -1,11 +1,25 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import {
+  activeCatalogReleasePointers,
+  catalogReleaseFoodServings,
+  catalogReleaseFoods,
+  catalogReleaseNutrientProfiles,
+  catalogReleaseSearchDocuments,
+  catalogReleaseSources,
+  calculationPreviews,
+  catalogReleases,
   foodAliases,
   foods,
   foodServings,
   mealItems,
   mealLogs,
+  mappingDecisions,
   nutrientProfiles,
+  releaseActivations,
+  recognitionAttempts,
+  storedObservations,
+  sourceRegistries,
+  sourceReleases,
   type Database,
 } from '@nueat/database';
 import type { FastifyInstance } from 'fastify';
@@ -27,6 +41,8 @@ const mealLogId = '00000000-0000-4000-8000-000000000001';
 const itemId = '00000000-0000-4000-8000-000000000002';
 const foodId = '00000000-0000-4000-8000-000000000003';
 const profileId = '00000000-0000-4000-8000-000000000004';
+const catalogReleaseId = '00000000-0000-4000-8000-000000000020';
+const sourceReleaseId = '00000000-0000-4000-8000-000000000021';
 const servers: FastifyInstance[] = [];
 
 afterEach(async () => {
@@ -71,10 +87,7 @@ describe('canonical food routes', () => {
     });
     const body = JSON.parse(response.body);
     expect(response.statusCode).toBe(200);
-    expect(body.foods.map((food: { id: string }) => food.id)).toEqual([
-      foodId,
-      '00000000-0000-4000-8000-000000000005',
-    ]);
+    expect(body.foods.map((food: { id: string }) => food.id)).toEqual([foodId]);
   });
 
   test('bounds the distinct eligible food query to the requested result limit', async () => {
@@ -124,7 +137,7 @@ describe('canonical food routes', () => {
       expect(JSON.parse(response.body).error.code).toBe(expected);
     }
   });
-  test('rejects untrusted and incomplete profiles through canonical selection', async () => {
+  test('rejects untrusted profiles and allows trusted partial profiles', async () => {
     const untrusted = await createServer(true, {
       profiles: [{
         id: profileId,
@@ -152,20 +165,21 @@ describe('canonical food routes', () => {
       }],
     });
 
-    for (const server of [untrusted, incomplete]) {
-      const response = await mapFood(server);
-      expect(response.statusCode).toBe(409);
-      expect(JSON.parse(response.body).error.code).toBe(
-        'FOOD_NUTRIENT_PROFILE_UNAVAILABLE',
-      );
-    }
+    const untrustedResponse = await mapFood(untrusted);
+    expect(untrustedResponse.statusCode).toBe(409);
+    expect(JSON.parse(untrustedResponse.body).error.code).toBe(
+      'FOOD_NUTRIENT_PROFILE_UNAVAILABLE',
+    );
+
+    const partialResponse = await mapFood(incomplete);
+    expect(partialResponse.statusCode).toBe(200);
   });
 
   test('maps an item to the preferred profile and returns the full envelope', async () => {
     const server = await createServer(true);
     const response = await mapFood(server);
     const body = JSON.parse(response.body);
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode, response.body).toBe(200);
     expect(body.mealLog.id).toBe(mealLogId);
     expect(body.items[0]).toMatchObject({
       id: itemId,
@@ -174,8 +188,14 @@ describe('canonical food routes', () => {
       nutrientProfileId: profileId,
       mappingConfidenceBps: 10000,
       currentResolutionSource: 'user_selected',
-      foodAcknowledgedRevision: 2,
       userCorrected: true,
+      review: {
+        status: 'required',
+        nextAction: 'review_item',
+        authority: {
+          invalidReason: null,
+        },
+      },
     });
   });
   test('hydrates a stable food ID with its preferred trusted profile', async () => {
@@ -206,7 +226,10 @@ describe('canonical food routes', () => {
       id: foodId,
       canonicalNameKo: '김치',
       nutrientProfile: { id: profileId, qualityGrade: 'verified' },
-      servings: [],
+      servings: [{
+        id: '00000000-0000-4000-8000-000000000023',
+        unit: 'serving',
+      }],
     });
   });
   test('pins stable hydration to the requested trusted persisted profile', async () => {
@@ -227,11 +250,8 @@ describe('canonical food routes', () => {
       url: `/api/foods/${foodId}?nutrientProfileId=${persistedProfileId}`,
     });
 
-    expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body).nutrientProfile).toMatchObject({
-      id: persistedProfileId,
-      qualityGrade: 'estimated',
-    });
+    expect(response.statusCode).toBe(404);
+    expect(JSON.parse(response.body).error.code).toBe('FOOD_NOT_FOUND');
   });
 
   test('returns 404 for a mismatched or untrusted requested profile', async () => {
@@ -296,6 +316,10 @@ async function mapFood(server: FastifyInstance) {
   return server.inject({
     method: 'PUT',
     url: `/api/meal-logs/${mealLogId}/items/${itemId}/food`,
+    headers: {
+      'X-NUEAT-Meal-Confirmation-Protocol':
+        'meal-confirmation-safe-review-v1',
+    },
     payload: { foodId, expectedItemRevision: 1 },
   });
 }
@@ -315,8 +339,25 @@ async function createServer(
     searchCandidateLimits?: number[];
   } = {},
 ) {
+  const profileOverrides = overrides.profiles ?? [
+    {
+      id: profileId,
+      foodId,
+      qualityGrade: 'verified',
+      datasetVersion: '2026-01',
+    },
+  ];
   const state = {
     aliases: overrides.aliases ?? [foodAlias('김치', foodId)],
+    searchDocuments: (overrides.aliases ?? [foodAlias('김치', foodId)]).map(
+      (alias, index) => ({
+        id: `00000000-0000-4000-8001-${String(index + 1).padStart(12, '0')}`,
+        catalogReleaseId,
+        displayTextKo: alias.alias,
+        normalizedCompact: normalizeFoodTestQuery(String(alias.alias)),
+        ...alias,
+      }),
+    ),
     mealLogQueries: 0,
     meal: {
       id: mealLogId,
@@ -326,7 +367,7 @@ async function createServer(
       timezone: 'Asia/Seoul',
       localDate: '2026-08-10',
       mealType: 'lunch',
-      imageAssetId: null,
+      imageAssetId: '00000000-0000-4000-8000-000000000030',
       recognitionStatus: 'ready',
       recognitionEngineVersion: 'mock-recognition-v1',
     },
@@ -352,26 +393,67 @@ async function createServer(
       overrides.food === undefined
         ? { id: foodId, canonicalNameKo: '김치', isDeprecated: false }
         : overrides.food,
-    profiles: overrides.profiles ?? [
-      {
-        id: profileId,
-        foodId,
-        sourceRegistryId: '00000000-0000-4000-8000-000000000007',
-        sourceCode: 'dataset',
-        sourceDisplayName: 'Dataset',
-        sourceItemId: 'kimchi',
-        datasetVersion: '2026-01',
-        basisAmountMg: 100000,
-        energyMillicalories: 150000,
-        carbohydrateMg: 30000,
-        proteinMg: 2000,
-        fatMg: 1000,
-        fiberMg: 1000,
-        qualityGrade: 'verified',
-      },
-    ],
+    profiles: profileOverrides.map((profile) => ({
+      sourceRegistryId: '00000000-0000-4000-8000-000000000007',
+      sourceReleaseId,
+      sourceCode: 'dataset',
+      sourceDisplayName: 'Dataset',
+      sourceItemId: String(profile.id),
+      basisAmountMg: 100000,
+      energyMillicalories: 150000,
+      carbohydrateMg: 30000,
+      proteinMg: 2000,
+      fatMg: 1000,
+      fiberMg: 1000,
+      ...profile,
+    })),
     searchCandidateLimits: overrides.searchCandidateLimits,
-    servings: [],
+    servings: [{
+      id: '00000000-0000-4000-8000-000000000023',
+      foodId,
+      sourceRegistryId: '00000000-0000-4000-8000-000000000007',
+      sourceReleaseId,
+      unit: 'serving',
+      labelKo: '1인분',
+      amountMilliunits: 1_000,
+      gramsMg: 100_000,
+      qualityGrade: 'verified',
+    }],
+    activeCatalogRelease: {
+      id: '00000000-0000-4000-8000-000000000022',
+      activationId: '00000000-0000-4000-8000-000000000022',
+      catalogReleaseId,
+      policyVersion: 'catalog-release-v1',
+      policySha256: 'f'.repeat(64),
+    },
+    catalogRelease: { id: catalogReleaseId, status: 'published', manifestSha256: 'a'.repeat(64) },
+    foodMembers: [{ catalogReleaseId, foodId }],
+    profileMembers: profileOverrides.map((profile) => ({ catalogReleaseId, nutrientProfileId: profile.id })),
+    servingMembers: [{
+      catalogReleaseId,
+      foodServingId: '00000000-0000-4000-8000-000000000023',
+    }],
+    sourceReleases: [{
+      id: sourceReleaseId,
+      sourceRegistryId: '00000000-0000-4000-8000-000000000007',
+      version: '2026-01',
+      status: 'published',
+      kind: profileOverrides[0]?.sourceKind === 'user'
+        ? 'user_entered'
+        : 'public_dataset',
+      artifactKind: 'nutrition',
+      licenseSha256: 'b'.repeat(64),
+      artifactSha256: 'c'.repeat(64),
+      manifestSha256: 'd'.repeat(64),
+    }],
+    catalogSources: [{
+      catalogReleaseId, sourceReleaseId, priority: 100,
+      allowedArtifactKinds: ['nutrition'], eligibilityManifestSha256: 'e'.repeat(64),
+    }],
+    recognitionAttempt: null as Record<string, unknown> | null,
+    storedObservation: null as Record<string, unknown> | null,
+    mappingDecisions: [] as Record<string, unknown>[],
+    calculationPreviews: [] as Record<string, unknown>[],
   };
   const auth = {
     api: { getSession: async () => (authenticated ? { user: { id: 'user-id' } } : null) },
@@ -402,9 +484,27 @@ function applyValuesWithRevisionIncrements(
 function databaseMock(state: Record<string, any>) {
   const resultFor = (table: unknown) => {
     if (table === foodAliases) return state.aliases;
+    if (table === catalogReleaseSearchDocuments) return state.searchDocuments;
+    if (table === activeCatalogReleasePointers) return [state.activeCatalogRelease];
+    if (table === catalogReleases) return [state.catalogRelease];
+    if (table === releaseActivations) return [state.activeCatalogRelease];
+    if (table === catalogReleaseFoods) return state.foodMembers;
+    if (table === catalogReleaseNutrientProfiles) return state.profileMembers;
+    if (table === catalogReleaseFoodServings) return state.servingMembers;
+    if (table === sourceReleases) return state.sourceReleases;
+    if (table === sourceRegistries) return [];
+    if (table === recognitionAttempts)
+      return state.recognitionAttempt ? [state.recognitionAttempt] : [];
+    if (table === storedObservations)
+      return state.storedObservation ? [state.storedObservation] : [];
+    if (table === mappingDecisions) return state.mappingDecisions;
+    if (table === calculationPreviews) return state.calculationPreviews;
+    if (table === catalogReleaseSources) return state.catalogSources;
     if (table === nutrientProfiles)
-      return state.profiles.map((profile: Record<string, unknown>) => ({
+      return state.profiles.filter((profile: Record<string, unknown>) => profile.foodId === foodId).map((profile: Record<string, unknown>) => ({
         sourceKind: 'public_dataset',
+        sourceRegistryId: '00000000-0000-4000-8000-000000000007',
+        sourceReleaseId,
         ...profile,
       }));
     if (table === foodServings) return state.servings;
@@ -421,13 +521,13 @@ function databaseMock(state: Record<string, any>) {
     for: () => query(rows, table),
     groupBy: () =>
       query(
-        table === foodAliases
+        table === catalogReleaseSearchDocuments
           ? [...new Map(rows.map((row) => [row.foodId, row])).values()]
           : rows,
         table,
       ),
     limit: async (limit: number) => {
-      if (table === foodAliases) state.searchCandidateLimits?.push(limit);
+      if (table === catalogReleaseSearchDocuments) state.searchCandidateLimits?.push(limit);
       return rows.slice(0, limit);
     },
     orderBy: () => query(rows, table),
@@ -437,7 +537,9 @@ function databaseMock(state: Record<string, any>) {
     transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(database),
     select: () => ({
       from: (table: unknown) => ({
-        innerJoin: () => ({ where: () => query(resultFor(table), table) }),
+        innerJoin: () => Object.assign(query(resultFor(table), table), {
+          where: () => query(resultFor(table), table),
+        }),
         where: () => query(resultFor(table), table),
       }),
     }),
@@ -462,6 +564,60 @@ function databaseMock(state: Record<string, any>) {
         }),
       }),
     }),
+    insert: (table: unknown) => ({
+      values: (input: Record<string, unknown> | Record<string, unknown>[]) => {
+        const values = Array.isArray(input) ? input : [input];
+        const inserted = values.map((value, index) => {
+          if (table === recognitionAttempts) {
+            const row = {
+              ...value,
+              id: '00000000-0000-4000-8000-000000000031',
+            };
+            state.recognitionAttempt = row;
+            return row;
+          }
+          if (table === storedObservations) {
+            const row = {
+              ...value,
+              id: '00000000-0000-4000-8000-000000000032',
+            };
+            state.storedObservation = row;
+            return row;
+          }
+          if (table === mappingDecisions) {
+            const row = {
+              ...value,
+              id: `00000000-0000-4000-8000-${String(40 + state.mappingDecisions.length + index).padStart(12, '0')}`,
+              createdAt: new Date(),
+            };
+            state.mappingDecisions.push(row);
+            return row;
+          }
+          if (table === calculationPreviews) {
+            const row = {
+              ...value,
+              id: `00000000-0000-4000-8000-${String(50 + state.calculationPreviews.length + index).padStart(12, '0')}`,
+              createdAt: new Date(),
+            };
+            state.calculationPreviews.push(row);
+            return row;
+          }
+          return value;
+        });
+        return {
+          returning: async () => inserted,
+          then<TResult1 = unknown>(
+            resolve?: (value: unknown[]) => TResult1 | PromiseLike<TResult1>,
+          ) {
+            return Promise.resolve(inserted).then(resolve);
+          },
+        };
+      },
+    }),
   };
   return database as unknown as Database;
+}
+
+function normalizeFoodTestQuery(value: string) {
+  return value.normalize('NFC').toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '');
 }

@@ -5,20 +5,26 @@ import {
   type OpenAIResponse,
   type OpenAIResponsesClient,
 } from '../src/services/openai-meal-recognizer';
+import { toStoredRecognitionResultV3, type RecognitionResultV3 } from '../src/services/meal-recognizer';
 
-const recognized = {
+const recognized: RecognitionResultV3 = {
   outcome: 'recognized',
   imageQualityConfidenceBps: 9_100,
-  foods: [
+  observations: [
     {
       regionIndex: 0,
+      parentRegionIndex: null,
+      kind: 'dish',
       rawLabel: '비빔밥',
       foodConfidenceBps: 8_600,
       portionConfidenceBps: 7_200,
       amountMilliunits: 1_000,
       unit: 'bowl',
-      questions: [{ target: 'portion', question: '양을 확인해 주세요.' }],
-      alternatives: [{ normalizedLabel: '돌솥비빔밥', confidenceBps: 7_900 }],
+      categoryHint: 'mixed',
+      preparationCodes: ['mixed'],
+      uncertaintyCodes: ['portion_uncertain'],
+      questionReasonCodes: ['confirm_portion'],
+      alternatives: [{ label: '돌솥비빔밥', confidenceBps: 7_900 }],
     },
   ],
 };
@@ -44,7 +50,7 @@ async function recognizeOutput(output: unknown) {
 }
 
 describe('OpenAIMealRecognizer', () => {
-  test('sends private bytes with a strict V2 schema that only permits recognition evidence', async () => {
+  test('sends private bytes with a strict V3 schema that only permits recognition evidence', async () => {
     const fake = fakeClient(validResponse);
     const result = await new OpenAIMealRecognizer(fake.client).recognize({ imageBytes: new Uint8Array([0, 1, 2]), imageContentType: 'image/png' });
 
@@ -53,7 +59,7 @@ describe('OpenAIMealRecognizer', () => {
     expect(request).toMatchObject({ model: 'gpt-5.4-mini-2026-03-17', store: false, max_output_tokens: 1_200, text: { format: { type: 'json_schema', strict: true } } });
     expect((request.text as { format: { schema: unknown } }).format.schema).toMatchObject({
       type: 'object',
-      required: ['outcome', 'imageQualityConfidenceBps', 'evidenceReason', 'foods'],
+      required: ['outcome', 'imageQualityConfidenceBps', 'observations'],
     });
     expect(JSON.stringify((request.text as { format: { schema: unknown } }).format.schema)).not.toContain('"oneOf"');
     expect(JSON.stringify(request)).toContain('data:image/png;base64,AAEC');
@@ -61,23 +67,40 @@ describe('OpenAIMealRecognizer', () => {
     expect(JSON.stringify(request)).not.toContain('nutrientProfileId');
   });
 
-  test('accepts all three V2 outcomes, including zero-item no-food and insufficient-evidence results', async () => {
-    await expect(recognizeOutput({ outcome: 'no_food', imageQualityConfidenceBps: 8_000, evidenceReason: null, foods: [] })).resolves.toMatchObject({ result: { outcome: 'no_food', foods: [] } });
-    await expect(recognizeOutput({ outcome: 'insufficient_evidence', imageQualityConfidenceBps: 2_000, evidenceReason: 'blurred', foods: [] })).resolves.toMatchObject({ result: { outcome: 'insufficient_evidence', evidenceReason: 'blurred', foods: [] } });
+  test('accepts all three V3 outcomes, including zero-item no-food and insufficient-evidence results', async () => {
+    await expect(recognizeOutput({ outcome: 'no_food', imageQualityConfidenceBps: 8_000, evidenceReason: null, observations: [] })).resolves.toMatchObject({ result: { outcome: 'no_food', observations: [] } });
+    await expect(recognizeOutput({ outcome: 'insufficient_evidence', imageQualityConfidenceBps: 2_000, evidenceReason: 'blurred', observations: [] })).resolves.toMatchObject({ result: { outcome: 'insufficient_evidence', evidenceReason: 'blurred', observations: [] } });
   });
 
-  test('rejects invalid V2 cardinality and model-supplied nutrition or official IDs', async () => {
-    await expect(recognizeOutput({ outcome: 'recognized', imageQualityConfidenceBps: 9_000, foods: [] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
-    await expect(recognizeOutput({ outcome: 'no_food', imageQualityConfidenceBps: 9_000, foods: [recognized.foods[0]] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
-    await expect(recognizeOutput({ ...recognized, foods: [{ ...recognized.foods[0], calories: 200, foodId: 'official-food', nutrientProfileId: 'official-profile' }] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+  test('assigns stable local observation IDs from persisted ordering, not sparse region values', () => {
+    const stored = toStoredRecognitionResultV3({
+      ...recognized,
+      observations: [
+        { ...recognized.observations[0]!, regionIndex: 12 },
+        { ...recognized.observations[0]!, regionIndex: 3, rawLabel: '김밥' },
+      ],
+    });
+    expect(stored).toMatchObject({
+      observations: [
+        { regionIndex: 3, localObservationId: 'o0' },
+        { regionIndex: 12, localObservationId: 'o1' },
+      ],
+    });
   });
 
-  test('rejects duplicate regions, invalid question targets, and non-unique or unordered alternatives', async () => {
-    const food = recognized.foods[0]!;
-    await expect(recognizeOutput({ ...recognized, foods: [food, { ...food }] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
-    await expect(recognizeOutput({ ...recognized, foods: [{ ...food, questions: [{ target: 'nutrition', question: '칼로리?' }] }] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
-    await expect(recognizeOutput({ ...recognized, foods: [{ ...food, alternatives: [{ normalizedLabel: ' 비빔밥 ', confidenceBps: 8_500 }] }] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
-    await expect(recognizeOutput({ ...recognized, foods: [{ ...food, alternatives: [{ normalizedLabel: 'A', confidenceBps: 8_700 }, { normalizedLabel: 'B', confidenceBps: 8_700 }] }] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+  test('rejects invalid V3 cardinality and model-supplied nutrition or official IDs', async () => {
+    await expect(recognizeOutput({ outcome: 'recognized', imageQualityConfidenceBps: 9_000, observations: [] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+    await expect(recognizeOutput({ outcome: 'no_food', imageQualityConfidenceBps: 9_000, observations: [recognized.observations[0]] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+    await expect(recognizeOutput({ ...recognized, observations: [{ ...recognized.observations[0], calories: 200, foodId: 'official-food', nutrientProfileId: 'official-profile' }] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+    await expect(recognizeOutput({ ...recognized, observations: [{ ...recognized.observations[0], rawLabel: '비빔밥 K-FCDB-12345' }] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+  });
+
+  test('rejects duplicate regions, forbidden fields, and non-unique or unordered alternatives', async () => {
+    const food = recognized.observations[0]!;
+    await expect(recognizeOutput({ ...recognized, observations: [food, { ...food }] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+    await expect(recognizeOutput({ ...recognized, observations: [{ ...food, questions: [{ target: 'nutrition', question: '칼로리?' }] }] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+    await expect(recognizeOutput({ ...recognized, observations: [{ ...food, alternatives: [{ label: ' 비빔밥 ', confidenceBps: 8_500 }] }] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+    await expect(recognizeOutput({ ...recognized, observations: [{ ...food, alternatives: [{ label: 'A', confidenceBps: 8_700 }, { label: 'B', confidenceBps: 8_700 }] }] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
   });
 
   test('sanitizes refusal, incomplete, and provider errors into stable failures', async () => {

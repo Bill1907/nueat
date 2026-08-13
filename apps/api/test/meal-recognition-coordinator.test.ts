@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 
 import { describe, expect, test } from 'bun:test';
-import { foodAliases, imageAssets, nutrientProfiles, recognitionDailyUsages } from '@nueat/database';
+import { foodAliases, imageAssets, nutrientProfiles, recognitionDailyUsages, storedObservations } from '@nueat/database';
 
 import { MealRecognitionCoordinator } from '../src/services/meal-recognition-coordinator';
+import { MealResolutionCoordinator } from '../src/services/meal-resolution-coordinator';
 import {
   ImageObjectReadAbortedError,
   type ImageObjectStore,
@@ -85,6 +86,7 @@ function fakeDatabase(s: State) {
             if (s.mappingLookupFails) throw new Error('mapping lookup failed');
             return s.aliasQueries.shift() ?? [];
           }
+          if (table === storedObservations) return [];
           if (table === nutrientProfiles) {
             if (s.mappingLookupFails) throw new Error('mapping lookup failed');
             return s.profiles;
@@ -106,6 +108,9 @@ function fakeDatabase(s: State) {
         };
         return {
           limit: rows,
+          for() {
+            return this;
+          },
           orderBy: () => applyWhere(),
           then(
             resolve: (value: Awaited<ReturnType<typeof rows>>) => void,
@@ -263,6 +268,55 @@ function makeCoordinator(s: State, options: {
 }
 
 describe('MealRecognitionCoordinator', () => {
+  test('routes a persisted observation to resolution without another provider call', async () => {
+    let providerCalls = 0;
+    let resolutionCalls = 0;
+    const originalResolve = MealResolutionCoordinator.prototype.resolve;
+    MealResolutionCoordinator.prototype.resolve = async () => {
+      resolutionCalls++;
+      return { status: 'unavailable', code: 'CATALOG_UNAVAILABLE', retryable: true };
+    };
+    const database = {
+      select() {
+        return {
+          from() {
+            return {
+              where() {
+                return { limit: async () => [{ id: 'observation' }] };
+              },
+            };
+          },
+        };
+      },
+    };
+    const coordinator = new MealRecognitionCoordinator({
+      database: database as never,
+      objectStore: {
+        createUploadUrl: async () => '', createDownloadUrl: async () => '', deleteObject: async () => {},
+        readObject: async () => { throw new Error('image read must not occur'); },
+      },
+      recognizer: {
+        recognize: async () => {
+          providerCalls++;
+          throw new Error('provider must not occur');
+        },
+      },
+      maxBytes: 1024, timeoutMs: 100, leaseMs: 60_000, maxAttempts: 3, dailyQuota: 10,
+    });
+    try {
+      await expect(coordinator.recognize('meal', 'user')).resolves.toEqual({
+        status: 'unavailable', code: 'CATALOG_UNAVAILABLE', retryable: true,
+      });
+      await expect(coordinator.recognize('meal', 'user')).resolves.toEqual({
+        status: 'unavailable', code: 'CATALOG_UNAVAILABLE', retryable: true,
+      });
+      expect(resolutionCalls).toBe(2);
+      expect(providerCalls).toBe(0);
+    } finally {
+      MealResolutionCoordinator.prototype.resolve = originalResolve;
+    }
+  });
+
   test('claims, privately reads and verifies bytes, then finalizes recognition-only items', async () => {
     const s = state();
     let providerAfterClaim = false;

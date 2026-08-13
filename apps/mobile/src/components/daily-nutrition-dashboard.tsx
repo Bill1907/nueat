@@ -84,8 +84,10 @@ export function DailyNutritionDashboard({ recommendations, refreshGeneration, on
   if (!dashboard) return null;
   const { target, totals, meals } = dashboard;
   const energyTarget = target?.energyMillicalories ?? null;
-  const consumedEnergy = totals.energyMillicalories;
-  const remainingEnergy = energyTarget === null ? null : energyTarget - consumedEnergy;
+  const consumedEnergy = totals.energyMillicalories.value;
+  const remainingEnergy = energyTarget === null || consumedEnergy === null
+    ? null
+    : energyTarget - consumedEnergy;
 
   return (
     <View style={styles.section} accessibilityLabel="오늘의 영양 대시보드">
@@ -121,15 +123,9 @@ export function DailyNutritionDashboard({ recommendations, refreshGeneration, on
                 {remainingEnergy === null ? '' : remainingEnergy >= 0 ? `${formatKcal(remainingEnergy)} 남음` : `${formatKcal(-remainingEnergy)} 초과`}
               </ThemedText>
             </View>
-            <NutrientSummaryRow label="열량" value={consumedEnergy} target={target.energyMillicalories} unit="kcal" />
-            <NutrientSummaryRow label="단백질" value={totals.proteinMg} target={target.proteinMg} />
-            <NutrientSummaryRow
-              label="식이섬유"
-              value={totals.fiberKnownMg}
-              target={target.fiberMg}
-              detail={totals.fiberComplete ? undefined : '일부 항목의 식이섬유 정보가 없어 확인 가능한 값만 표시해요.'}
-              knownOnly={!totals.fiberComplete}
-            />
+            <NutrientSummaryRow label="열량" total={totals.energyMillicalories} target={target.energyMillicalories} unit="kcal" />
+            <NutrientSummaryRow label="단백질" total={totals.proteinMg} target={target.proteinMg} />
+            <NutrientSummaryRow label="식이섬유" total={totals.fiberMg} target={target.fiberMg} />
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={expanded ? '탄수화물과 지방 접기' : '탄수화물과 지방 펼치기'}
@@ -142,8 +138,8 @@ export function DailyNutritionDashboard({ recommendations, refreshGeneration, on
             </Pressable>
             {expanded && (
               <View style={styles.optionalNutrients}>
-                <NutrientSummaryRow label="탄수화물" value={totals.carbohydrateMg} target={target.carbohydrateMg} />
-                <NutrientSummaryRow label="지방" value={totals.fatMg} target={target.fatMg} />
+                <NutrientSummaryRow label="탄수화물" total={totals.carbohydrateMg} target={target.carbohydrateMg} />
+                <NutrientSummaryRow label="지방" total={totals.fatMg} target={target.fatMg} />
               </View>
             )}
           </>
@@ -169,19 +165,17 @@ function DashboardShell({ children }: { children: React.ReactNode }) {
 
 function NutrientSummaryRow({
   label,
-  value,
+  total,
   target,
-  detail,
-  knownOnly = false,
   unit,
 }: {
   label: string;
-  value: number;
+  total: DailyNutritionTotals['energyMillicalories'];
   target: number;
-  detail?: string;
-  knownOnly?: boolean;
   unit?: 'kcal';
 }) {
+  const knownOnly = total.completeness === 'partial';
+  const value = total.knownValue;
   const displayValue = unit === 'kcal' ? formatKcal(value) : formatGrams(value);
   const displayTarget = unit === 'kcal' ? formatKcal(target) : formatGrams(target);
   return (
@@ -194,7 +188,7 @@ function NutrientSummaryRow({
       </View>
       {!knownOnly && <ProgressBar value={value} target={target} />}
       <ThemedText type="small" themeColor="textSecondary">
-        {detail ?? `${unit === 'kcal' ? formatKcal(Math.max(target - value, 0)) : formatGrams(Math.max(target - value, 0))} 남음`}
+        {knownOnly ? `일부 항목의 정보가 없어 확인 가능한 값만 표시해요.` : `${unit === 'kcal' ? formatKcal(Math.max(target - value, 0)) : formatGrams(Math.max(target - value, 0))} 남음`}
       </ThemedText>
     </View>
   );
@@ -258,12 +252,9 @@ function RetryButton({ onPress }: { onPress: () => void }) {
 function ConsumedSummary({ totals }: { totals: DailyNutritionTotals }) {
   return (
     <View style={styles.summaryGrid}>
-      <SummaryValue label="섭취 열량" value={formatKcal(totals.energyMillicalories)} />
-      <SummaryValue label="단백질" value={formatGrams(totals.proteinMg)} />
-      <SummaryValue
-        label="식이섬유"
-        value={`${totals.fiberComplete ? '' : '확인 '}${formatGrams(totals.fiberKnownMg)}`}
-      />
+      <SummaryValue label="섭취 열량" value={totalValue(totals.energyMillicalories, 'kcal')} />
+      <SummaryValue label="단백질" value={totalValue(totals.proteinMg)} />
+      <SummaryValue label="식이섬유" value={totalValue(totals.fiberMg)} />
     </View>
   );
 }
@@ -297,12 +288,14 @@ function targetStatusCopy(dashboard: DailyDashboard) {
 }
 
 function gapCopy(target: NonNullable<DailyDashboard['target']>, totals: DailyNutritionTotals) {
-  const protein = target.proteinMg - totals.proteinMg;
+  if (totals.proteinMg.value === null) return '일부 영양 정보가 없어 남은 목표를 정확히 계산하지 않아요.';
+  const protein = target.proteinMg - totals.proteinMg.value;
   if (protein > 0) return `단백질 ${formatGrams(protein)}을 더 채워 보세요.`;
-  if (!totals.fiberComplete) return '식이섬유는 확인 가능한 값만 반영했어요.';
-  const fiber = target.fiberMg - totals.fiberKnownMg;
+  if (totals.fiberMg.value === null) return '식이섬유는 확인 가능한 값만 반영했어요.';
+  const fiber = target.fiberMg - totals.fiberMg.value;
   if (fiber > 0) return `식이섬유 ${formatGrams(fiber)}을 더 채워 보세요.`;
-  const energy = target.energyMillicalories - totals.energyMillicalories;
+  if (totals.energyMillicalories.value === null) return '열량은 확인 가능한 값만 반영했어요.';
+  const energy = target.energyMillicalories - totals.energyMillicalories.value;
   return energy >= 0 ? '남은 목표를 고려해 다음 식사를 선택해 보세요.' : '현재 섭취량과 남은 목표를 함께 확인해 보세요.';
 }
 
@@ -312,7 +305,11 @@ function formatDate(value: string) { return value.replace(/^(\d{4})-(\d{2})-(\d{
 function formatTime(value: string, timezone: string) { return new Intl.DateTimeFormat('ko-KR', { hour: 'numeric', minute: '2-digit', timeZone: timezone }).format(new Date(value)); }
 function mealTypeLabel(value: string) { return ({ breakfast: '아침', lunch: '점심', dinner: '저녁', snack: '간식' } as Record<string, string>)[value] ?? '식사'; }
 function mealDiffCopy(meal: DailyMeal) {
-  return `+${formatKcal(meal.totals.energyMillicalories)} · +${formatCompactGrams(meal.totals.proteinMg)} 단백질`;
+  return `+${totalValue(meal.totals.energyMillicalories, 'kcal')} · +${totalValue(meal.totals.proteinMg)} 단백질`;
+}
+function totalValue(total: DailyNutritionTotals['energyMillicalories'], unit?: 'kcal') {
+  const value = unit === 'kcal' ? formatKcal(total.knownValue) : formatCompactGrams(total.knownValue);
+  return `${total.completeness === 'partial' ? '확인 ' : ''}${value}`;
 }
 function formatCompactGrams(value: number) { return `${new Intl.NumberFormat('ko-KR', { maximumFractionDigits: 1 }).format(value / 1000)}g`; }
 

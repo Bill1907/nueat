@@ -56,7 +56,7 @@ describe('next recommendation route', () => {
     expect(database.inserts).toHaveLength(0);
   });
 
-  test('aggregates latest confirmed snapshots and preserves a partial fiber gap', async () => {
+  test('suppresses ranking when a partial confirmed intake affects a target nutrient', async () => {
     const { server, database } = await createServer(true, {
       meals: [{ id: 'meal-a' }, { id: 'meal-b' }],
       snapshots: [
@@ -69,9 +69,9 @@ describe('next recommendation route', () => {
     const body = JSON.parse(response.body);
 
     expect(response.statusCode).toBe(200);
-    expect(body.gaps).toEqual({ energyMillicalories: 1_300_000, proteinMg: 50_000, fiberMg: null });
-    expect(body.safetyFlags).toEqual([]);
-    expect(database.inserts[0]?.candidateItems).toHaveLength(3);
+    expect(body.gaps).toEqual({ energyMillicalories: null, proteinMg: null, fiberMg: null });
+    expect(body.safetyFlags).toEqual(['PARTIAL_CONFIRMED_INTAKE']);
+    expect(database.inserts[0]?.candidateItems).toEqual([]);
   });
 
   test('persists an empty fail-closed response for a missing or malformed snapshot', async () => {
@@ -391,7 +391,20 @@ function snapshot(mealLogId: string, sequence: number, energyMillicalories: numb
   return {
     id: `${mealLogId}-snapshot-${sequence}`,
     mealLogId, sequence, energyMillicalories, carbohydrateMg, proteinMg, fatMg,
-    inputSnapshot: { mealItems: fiber.map((fiberMg) => ({ nutrients: { fiberMg } })) },
+    fiberMg: fiber.every((value) => value !== null)
+      ? fiber.reduce<number>((sum, value) => sum + (value ?? 0), 0)
+      : null,
+    inputSnapshot: {
+      mealItems: fiber.map((fiberMg, index) => ({
+        nutrients: {
+          energyMillicalories: index === 0 ? energyMillicalories : 0,
+          carbohydrateMg: index === 0 ? carbohydrateMg : 0,
+          proteinMg: index === 0 ? proteinMg : 0,
+          fatMg: index === 0 ? fatMg : 0,
+          fiberMg,
+        },
+      })),
+    },
   };
 }
 

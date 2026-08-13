@@ -33,6 +33,7 @@
     "Authoritative review-derived confirmation, mutation-free high model confirmation, explicit-edit acknowledgement, stale/no-op/delete/manual-replay guards, source calculation, preview, one snapshot, and dashboard-safe confirmed state",
     "Mobile one-CTA action policy, lowercase zero-outcome recovery, exact explicit-review and confirm stale convergence, source-backed summary, mapping, and partial-nutrition behavior",
     "Runtime/evaluator threshold parity, strict golden-v1 inputs, recognized-only strata, unit-bound registry-derived conversion trust, outcome and Wilson floors, one-to-one matching, authority signature verification, provider/deployed-stack binding, and startup verification of the actual catalog digest",
+    "Signed mapping rollout identity binding for observation schema, prompt/model, resolver/policy, normalizer/taxonomy/search thresholds, catalog releases, optional local encoder manifest, and staged exact/hybrid/vector modes; hybrid-auto receipt gates remain aggregate-only",
     "Database schema, immutable initial and current mapping provenance, manual-transition provenance, legacy V1 guard/backfills, generated migrations, and immutable calculation snapshots"
   ]
 }

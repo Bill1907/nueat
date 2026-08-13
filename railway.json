@@ -14,9 +14,6 @@
     ]
   },
   "deploy": {
-    "preDeployCommand": [
-      "bun run --cwd packages/database db:migrate"
-    ],
     "startCommand": "bun run --cwd apps/api start",
     "healthcheckPath": "/health/ready",
     "healthcheckTimeout": 120,

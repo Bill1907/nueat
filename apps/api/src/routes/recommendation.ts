@@ -35,7 +35,13 @@ interface RecommendationRouteOptions {
 const bodySchema = z.object({ excludeFoodIds: z.array(z.string().uuid()).max(20).optional() }).strict();
 const mealDraftBodySchema = z.object({ candidateRank: z.number().int().min(1).max(3) }).strict();
 const snapshotSchema = z.object({
-  mealItems: z.array(z.object({ nutrients: z.object({ fiberMg: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable() }).passthrough() }).passthrough()).min(1),
+  mealItems: z.array(z.object({ nutrients: z.object({
+    energyMillicalories: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
+    carbohydrateMg: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
+    proteinMg: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
+    fatMg: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
+    fiberMg: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
+  }).passthrough() }).passthrough()).min(1),
 }).passthrough();
 const trustedKinds = ['public_dataset', 'manufacturer', 'commercial_dataset'] as const;
 
@@ -92,10 +98,11 @@ export const recommendationRoutes: FastifyPluginAsync<RecommendationRouteOptions
     const mealIds = meals.map((meal) => meal.id);
     const consumed = emptyNutrients();
     let snapshotInvalid = false;
+    let partialTargetDrivingNutrient = false;
     const calculationSnapshotRefs: Array<{ id: string; mealLogId: string; sequence: number }> = [];
     if (mealIds.length) {
       const snapshots = await options.database
-        .select({ id: calculationSnapshots.id, mealLogId: calculationSnapshots.mealLogId, sequence: calculationSnapshots.sequence, inputSnapshot: calculationSnapshots.inputSnapshot, energyMillicalories: calculationSnapshots.energyMillicalories, carbohydrateMg: calculationSnapshots.carbohydrateMg, proteinMg: calculationSnapshots.proteinMg, fatMg: calculationSnapshots.fatMg })
+        .select({ id: calculationSnapshots.id, mealLogId: calculationSnapshots.mealLogId, sequence: calculationSnapshots.sequence, inputSnapshot: calculationSnapshots.inputSnapshot, energyMillicalories: calculationSnapshots.energyMillicalories, carbohydrateMg: calculationSnapshots.carbohydrateMg, proteinMg: calculationSnapshots.proteinMg, fatMg: calculationSnapshots.fatMg, fiberMg: calculationSnapshots.fiberMg })
         .from(calculationSnapshots)
         .where(inArray(calculationSnapshots.mealLogId, mealIds))
         .orderBy(desc(calculationSnapshots.sequence));
@@ -106,14 +113,11 @@ export const recommendationRoutes: FastifyPluginAsync<RecommendationRouteOptions
         const parsed = snapshot && snapshotSchema.safeParse(snapshot.inputSnapshot);
         if (!snapshot || !parsed?.success) { snapshotInvalid = true; break; }
         calculationSnapshotRefs.push({ id: snapshot.id, mealLogId: snapshot.mealLogId, sequence: snapshot.sequence });
-        consumed.energyMillicalories = addKnown(consumed.energyMillicalories, snapshot.energyMillicalories);
-        consumed.carbohydrateMg = addKnown(consumed.carbohydrateMg, snapshot.carbohydrateMg);
-        consumed.proteinMg = addKnown(consumed.proteinMg, snapshot.proteinMg);
-        consumed.fatMg = addKnown(consumed.fatMg, snapshot.fatMg);
-        const fiber = parsed.data.mealItems.every((item) => item.nutrients.fiberMg !== null)
-          ? parsed.data.mealItems.reduce((sum, item) => safeAdd(sum, item.nutrients.fiberMg ?? 0), 0)
-          : null;
-        consumed.fiberMg = addNullable(consumed.fiberMg, fiber);
+        for (const key of nutrientKeys) {
+          const complete = parsed.data.mealItems.every((item) => item.nutrients[key] !== null);
+          if (!complete && target[key] !== null) partialTargetDrivingNutrient = true;
+          consumed[key] = addNullable(consumed[key], complete ? snapshot[key] : null);
+        }
       }
     }
 
@@ -150,9 +154,10 @@ export const recommendationRoutes: FastifyPluginAsync<RecommendationRouteOptions
 
     const safetyFlags = [
       ...(snapshotInvalid ? ['CALCULATION_SNAPSHOT_UNAVAILABLE'] : []),
+      ...(partialTargetDrivingNutrient ? ['PARTIAL_CONFIRMED_INTAKE'] : []),
       ...(unresolvedConstraint ? ['UNRESOLVED_DIETARY_CONSTRAINT'] : []),
     ];
-    const gaps = snapshotInvalid
+    const gaps = snapshotInvalid || partialTargetDrivingNutrient
       ? { energyMillicalories: null, proteinMg: null, fiberMg: null }
       : remaining(target, consumed);
     let candidates: ReturnType<typeof rankMealRecommendations> = [];
@@ -163,7 +168,7 @@ export const recommendationRoutes: FastifyPluginAsync<RecommendationRouteOptions
       datasetVersion: string;
       foodId: string;
     }> = [];
-    if (!snapshotInvalid && !unresolvedConstraint) {
+    if (!snapshotInvalid && !partialTargetDrivingNutrient && !unresolvedConstraint) {
       const sourceItemIds = [...new Set(CURATED_MEAL_RECOMMENDATION_TEMPLATES.flatMap((template) => template.components.map((component) => component.sourceItemId)))];
       const profiles = await options.database
         .select({ id: nutrientProfiles.id, sourceRegistryId: nutrientProfiles.sourceRegistryId, sourceItemId: nutrientProfiles.sourceItemId, datasetVersion: nutrientProfiles.datasetVersion, qualityGrade: nutrientProfiles.qualityGrade, foodId: foods.id, nameKo: foods.canonicalNameKo, basisAmountMg: nutrientProfiles.basisAmountMg, energyMillicalories: nutrientProfiles.energyMillicalories, carbohydrateMg: nutrientProfiles.carbohydrateMg, proteinMg: nutrientProfiles.proteinMg, fatMg: nutrientProfiles.fatMg, fiberMg: nutrientProfiles.fiberMg })
@@ -395,10 +400,10 @@ export const recommendationRoutes: FastifyPluginAsync<RecommendationRouteOptions
 };
 
 function emptyNutrients(): Nutrients { return { energyMillicalories: 0, carbohydrateMg: 0, proteinMg: 0, fatMg: 0, fiberMg: 0 }; }
-function addKnown(left: number | null, right: number) { return left === null ? null : safeAdd(left, right); }
 function addNullable(left: number | null, right: number | null) { return left === null || right === null ? null : safeAdd(left, right); }
 function addNutrients(left: Nutrients, right: Nutrients): Nutrients { return { energyMillicalories: addNullable(left.energyMillicalories, right.energyMillicalories), carbohydrateMg: addNullable(left.carbohydrateMg, right.carbohydrateMg), proteinMg: addNullable(left.proteinMg, right.proteinMg), fatMg: addNullable(left.fatMg, right.fatMg), fiberMg: addNullable(left.fiberMg, right.fiberMg) }; }
 function remaining(target: Nutrients, consumed: Nutrients) { return { energyMillicalories: subtractToZero(target.energyMillicalories, consumed.energyMillicalories), proteinMg: subtractToZero(target.proteinMg, consumed.proteinMg), fiberMg: target.fiberMg === null || consumed.fiberMg === null ? null : subtractToZero(target.fiberMg, consumed.fiberMg) }; }
+const nutrientKeys = ['energyMillicalories', 'carbohydrateMg', 'proteinMg', 'fatMg', 'fiberMg'] as const;
 function safeAdd(left: number, right: number) { const result = BigInt(left) + BigInt(right); if (result > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('RECOMMENDATION_TOTAL_OUT_OF_RANGE'); return Number(result); }
 function subtractToZero(target: number | null, consumed: number | null) { if (target === null || consumed === null) return null; const result = BigInt(target) - BigInt(consumed); return result > 0n ? Number(result) : 0; }
 function compareProfiles(left: { qualityGrade: string; datasetVersion: string; id: string }, right: { qualityGrade: string; datasetVersion: string; id: string }) { const quality = (value: string) => value === 'verified' ? 0 : value === 'estimated' ? 1 : 2; return quality(left.qualityGrade) - quality(right.qualityGrade) || right.datasetVersion.localeCompare(left.datasetVersion) || left.id.localeCompare(right.id); }

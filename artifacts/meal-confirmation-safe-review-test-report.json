@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "feature": "meal-confirmation-safe-review-v1",
+  "recordedAt": "2026-08-13T06:25:00Z",
+  "commands": ["bun run typecheck", "bun run lint", "bun test", "bun run --cwd packages/database db:check"],
+  "results": {
+    "typecheck": "passed across domain, database, mobile, and API",
+    "lint": "passed with zero warnings",
+    "tests": "321 passed, 0 failed, 1301 assertions across 45 files",
+    "databaseCheck": "passed"
+  },
+  "adversarialCoverage": [
+    "immutable V2 and legacy bridge confirmed recovery",
+    "complete bridge draft response with pending unknown nutrition",
+    "newest item-bound authority with fresh preview/decomposition facts",
+    "bounded missing-mapping, source-invalid, and stale-authority recovery",
+    "mixed reviewed/unmapped subtotal and unknown versus zero",
+    "free out-of-order item review and item-local recovery",
+    "bridge write barrier and auto-policy independence",
+    "normal and maintenance 0022 readiness",
+    "signed auto-selection carrier startup fail-closed",
+    "empty meal, replay, and idempotency reuse"
+  ],
+  "safety": {
+    "sharedNeonMigrationApplied": false,
+    "railwayDeploymentPerformed": false,
+    "automaticSelectionThresholdsInvented": false,
+    "railwayAutomaticMigrationDisabled": true,
+    "migration0022RequiresExplicitApproval": true,
+    "migration0023DelayedSeparately": true
+  }
+}

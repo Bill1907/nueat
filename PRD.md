@@ -118,7 +118,7 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 2. 사진 촬영 또는 앨범 선택. 업로드 중 개인정보·배경 노출 안내와 취소 기능 제공.
 3. V2 인식기는 `recognized`, `no_food`, `insufficient_evidence` 중 하나와 음식·양·불확실성만 반환한다. 영양 수치·권위 없는 DB 매핑·자동 확정값은 반환하지 않는다.
 4. API는 검증된 이미지를 단 하나의 `draft` MealLog에 먼저 연결하고, canonical Food·FoodServing·NutrientProfile의 출처/버전과 결정론 계산으로만 영양을 만든다. core 4(kcal·탄수화물·단백질·지방)와 식이섬유는 각각 결측을 0으로 바꾸지 않으며, 하나라도 결측이면 알려진 합계와 결측 수를 `partial`로 표시한다.
-5. `recognized`이면서 음식·양 확신도가 빠른 경로 기준을 충족하면 확인 화면에는 “기록 확정” 하나의 CTA만 보인다. 이 CTA 전에도 draft는 존재하며, 탭하기 전에는 섭취·일일 집계가 확정되지 않는다.
+5. `recognized` 결과는 자동 선택 기준을 통과하더라도 항목별 초안일 뿐이다. 사용자는 각 항목의 음식·실제 양·공식 출처를 보고 `확인하고 다음`을 수행하며, 모든 현재 항목의 검토가 끝난 뒤 별도의 `식사 기록` CTA로 섭취를 확정한다.
 6. 낮은 확신, `no_food`, `insufficient_evidence`는 자동 확정하지 않는다. 최소 교정(음식 검색/교체 또는 양 조정)과 재시도·취소 경로를 제공하고, 사용자가 명시적으로 확정해야 한다.
 7. 음식·양 수정은 각각 revision을 증가시키며, 오래된 revision을 제출하면 `409`으로 거부한다. 수동 override는 누가·언제·어떤 revision에서 어떤 변경을 했는지 provenance와 함께 draft에 보존한다.
 8. 확정 시 음식 레코드와 DB 영양 프로필을 결합해 섭취량을 계산하고 출처/추정 상태를 저장한다. 결과 화면에서 총열량·매크로·식이섬유와 오늘 목표 변화, 기록 수정 진입점을 보여준다.
@@ -191,7 +191,7 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 - 추천은 먼저 규칙과 수치 최적화로 안전한 후보를 만들고, AI는 설명·대안 표현을 담당한다.
 - 모델·프롬프트·DB·규칙 버전을 기록하고, 골든셋 회귀 테스트 없이 교체하지 않는다.
 - 골든셋 평가는 독립 adjudication/registry SHA와 배포 대상 model·prompt·schema·resolver·review-policy identity를 포함한 versioned manifest·ground truth·strict prediction을 입력으로 받는다. quick-eligible cohort는 runtime과 evaluator가 같은 versioned 상수를 사용한다: 이미지·음식·양 confidence 각각 7,000bps 이상, 후보 margin이 있으면 1,000bps 이상, model-primary 매핑, 질문 없음, 비-gram 단위의 trusted registry 변환을 모두 만족해야 한다. 최소 120개의 동의된 한국 식사 사진을 정확히 6개 승인 food group에 그룹별 20개 이상 배치하고, `no_food`와 `insufficient_evidence`를 각각 10개 이상 포함한다. outcome accuracy ≥95%, quick-eligible 식사 50개/항목 100개 이상, food top-1 Wilson-95 하한 ≥95%, `max(25g,20%)` 양 오차 Wilson-95 하한 ≥90%, joint item Wilson-95 하한 ≥90%, eligible meal 완전 일치 Wilson-95 하한 ≥85%, eligible coverage ≥15%, valid V2 ≥99%, zero-outcome quick false positive·nutrition/ID 오류·untrusted conversion eligibility·민감정보 누출 0건을 고정 gate로 계산한다.
-- release report는 입력 SHA-256과 report SHA-256 및 aggregate만 포함하며 원본 이미지·case ID·음식 label은 복사하지 않는다. 기본 정책은 review-only다. production 활성화는 독립 승인 authority가 report SHA를 Ed25519로 서명한 receipt만 허용하며, 런타임은 서명·고정 gate·배포 stack identity·승인/활성 SHA 일치를 모두 검증한다. rollback은 직전 서명 승인 SHA로 되돌린다. private golden dataset은 저장소·보고서·로그에 넣지 않는다.
+- release report는 입력 SHA-256과 report SHA-256 및 aggregate만 포함하며 원본 이미지·case ID·음식 label은 복사하지 않는다. 기본 정책은 후보 제시다. production 자동 선택은 독립 승인 authority가 report SHA를 Ed25519로 서명한 receipt만 허용하며, 런타임은 서명·비교 규칙·고정 모집단·배포 stack identity·승인/활성 SHA 일치를 모두 검증한다. 자동 선택 여부와 무관하게 모든 항목은 사용자 검토를 거친다.
 
 ### 9.3 한국 음식/DB 전략
 
@@ -215,13 +215,14 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 - OTP는 6자리·5분 만료·3회 시도·재발급 시 회전·해시 저장을 적용하며 발송 요청은 60초당 3회로 제한한다. 전역 rate limit은 Neon DB에 저장해 Railway 다중 인스턴스에서도 공유한다.
 - Expo 앱은 `@better-auth/expo`와 SecureStore로 세션 쿠키를 보관하고 앱 시작 시 복원한다. 미인증 사용자는 제품 탭 대신 이메일→OTP 화면을 보고, OTP 재발송은 60초 대기·로컬 3회 실패 UX를 적용한다.
 - 로그아웃 시 서버 세션을 종료하고 SecureStore 인증 쿠키를 제거한다. AsyncStorage·분석 이벤트·React 상태에 세션 토큰을 영구 저장하지 않는다.
-- Railway는 root Dockerfile로 API만 빌드하고 pre-deploy migration 후 `/health/ready`를 통과해야 배포를 완료한다.
+- Railway는 root Dockerfile로 API만 빌드하고 `/health/ready`를 통과해야 배포를 완료한다. 배포가 migration을 자동 실행하지 않는다.
+- 식사 확인 cutover는 반드시 bridge → 운영자 승인 `0022_meal_confirmation_safe_review` → `safe_review_maintenance` 검증 후 `normal` → soak → 별도 운영자 승인 `0023_remove_obsolete_meal_review` 순서로 진행한다. 운영자는 승인된 단일 명령 `bun run db:migrate:0022` 또는 soak 후 `bun run db:migrate:0023`만 실행하며, `db:migrate`나 `migrate-all` 같은 일괄/자동 migration은 존재하지 않고 사용하지 않는다.
 - 식사 이미지는 비공개 Railway Bucket에 저장한다. DB에는 영구 URL이 아닌 object key와 검증된 메타데이터만 저장한다.
 - 업로드 전 API가 사용자 인증과 권한을 확인하고 서버가 object key를 생성한 뒤 짧은 만료 시간의 presigned upload 정보를 발급한다. 콘텐츠 형식과 최대 크기를 서명 조건으로 제한한다.
 - 조회 시 소유권을 다시 확인한 뒤 짧은 만료 시간의 presigned GET URL을 발급한다. signed URL은 저장하거나 분석 이벤트에 기록하지 않는다.
 - 업로드 완료 후 MIME 선언만 신뢰하지 않고 실제 파일 시그니처·크기·디코딩 가능 여부를 검증한 뒤 인식 파이프라인에 전달한다.
 - 식사 또는 계정 삭제 시 연결된 이미지도 삭제하며, 실패한 삭제 작업은 재시도·감사 가능하게 기록한다.
-- 실시간 음식 인식의 1차 후보는 OpenAI Responses API의 `gpt-5.4-mini-2026-03-17`이다. 이미지 입력과 structured output을 지원하고 동작 재현성을 위해 snapshot을 고정한다. Realtime endpoint는 지원하지 않고 API 사용량은 유료다. 한국 음식 골든셋의 정확도·지연·비용·구조화 출력 안정성 검증 전에는 quick-confirm 모델로 승인하지 않는다.
+- 실시간 음식 인식의 1차 후보는 OpenAI Responses API의 `gpt-5.4-mini-2026-03-17`이다. 이미지 입력과 structured output을 지원하고 동작 재현성을 위해 snapshot을 고정한다. 한국 음식 골든셋 검증 전에는 공식 DB 후보 자동 선택을 활성화하지 않으며, 자동 선택 후에도 사용자 항목 검토를 생략하지 않는다.
 
 ### 9.5 이미지 수명주기
 
@@ -350,7 +351,7 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 
 - [ ] 제품: P0 여정 E2E, 수정/삭제/재시도, 빈 상태·오류 상태, 타임존/날짜 경계 검증
 - [ ] 데이터: MFDS 등 출처 이용조건, 버전, 단위, 결측, 100g/1회 제공량 변환 검증
-- [ ] AI: 위의 120-photo stratified `golden-v1` 고정 gate를 versioned private manifest/ground truth/strict prediction으로 실행한다. duplicate food ID, nutrition/official ID, unsupported field는 입력 단계에서 거부한다. 독립 adjudication/registry provenance와 배포 stack identity가 포함된 aggregate report SHA를 승인 authority가 Ed25519로 서명한 경우에만 production `quick_confirm`에 승인·활성화한다. 기본은 review-only이며 직전 서명 승인 SHA로 rollback 가능해야 한다.
+- [ ] AI: 고정 한국 음식 골든셋에서 자동 선택 대상 부분집합의 정확도와 커버리지를 버전된 정수 비교 규칙으로 평가한다. 독립 provenance와 배포 stack identity가 포함된 aggregate report SHA를 승인 authority가 서명한 경우에만 production 자동 선택을 활성화한다. 기본은 후보 제시이며 모든 항목은 사용자 검토가 필요하다.
 - [ ] 안전: 알레르기 hard constraint, 위험 사용자 플로우, 의료/보충제 금칙 테스트, 전문가 검토
 - [ ] 개인정보: 동의문, 처리방침, 이미지 학습 opt-in 분리, 계정/데이터 삭제, 침해 대응
 - [ ] 품질: 크래시/성능/접근성/네트워크 테스트, 계산 단위·회귀 테스트, 스토어 기기 QA
@@ -371,7 +372,7 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 | 미량영양소 노출? | MFDS 등 DB 커버리지/결측률 기준을 정한 뒤 항목별 베타. |
 | 브랜드 리스크? | NUEAT으로 MVP 진행하되 스토어 제출 전 국내 상표·유사 앱 이름 검토. |
 | 백엔드 인프라 | **결정:** Railway Bun/Fastify API + Better Auth + Drizzle + Neon PostgreSQL. |
-| AI 모델 | **평가 후보:** OpenAI Responses API `gpt-5.4-mini-2026-03-17`. 이미지 입력/structured output 지원, snapshot 고정, Realtime endpoint 미지원, 유료 API. 한국 음식 골든셋과 실패 복구 검증 후 quick-confirm 승인. |
+| AI 모델 | **평가 후보:** OpenAI Responses API `gpt-5.4-mini-2026-03-17`. 이미지 입력/structured output 지원, snapshot 고정. 한국 음식 골든셋과 실패 복구 검증 후 공식 DB 후보 자동 선택만 승인하며 사용자 항목 검토는 유지한다. |
 | 런타임/패키지 관리 | **결정:** Bun 1.3.14를 고정하고 `bun.lock`을 단일 lockfile로 사용한다. Expo 보조 도구용 Node.js LTS는 유지한다. |
 | 인증 방식 | **결정:** Better Auth 이메일 OTP만 사용한다. 소셜 로그인과 비밀번호 로그인은 제외한다. |
 | 서비스 도메인 | **결정:** API는 `api-nueat.boseong.dev`, OTP 발신자는 기존 Resend 인증 도메인의 `NUEAT <auth@boseong.dev>`를 사용한다. |

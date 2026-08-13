@@ -1,60 +1,57 @@
 import {
-  MEAL_RECOGNITION_PROMPT_VERSION,
-  MEAL_RECOGNITION_SCHEMA_VERSION,
+  MEAL_RECOGNITION_V3_PROMPT_VERSION,
+  MEAL_RECOGNITION_V3_SCHEMA_VERSION,
   MealRecognitionFailure,
   type MealRecognizer,
   type MealRecognizerInput,
   type MealRecognizerOutput,
-  RecognitionResultV2,
+  parseRecognitionResultV3,
 } from './meal-recognizer';
 
 export const OPENAI_MEAL_RECOGNITION_MODEL = 'gpt-5.4-mini-2026-03-17';
 export const OPENAI_MEAL_RECOGNITION_MAX_OUTPUT_TOKENS = 1_200;
 export const OPENAI_MEAL_RECOGNITION_DEADLINE_MS = 15_000;
 
-export const OPENAI_MEAL_RECOGNITION_SYSTEM_PROMPT = `당신은 식사 사진 인식기입니다. 사진에서 보이는 음식과 음료만 식별하고 각 항목의 대략적인 양과 불확실성을 추정하세요.
+export const OPENAI_MEAL_RECOGNITION_SYSTEM_PROMPT = `당신은 식사 사진 관찰기입니다. 사진에서 보이는 음식, 음료, 구성 요소, 대략적인 양과 불확실성만 구조화하세요.
 반드시 제공된 JSON 스키마만 따르세요. 음식이나 음료가 없으면 no_food를, 사진 근거가 부족하면 insufficient_evidence를 반환하고 음식 항목을 만들지 마세요.
-에너지, 칼로리, 영양소, 건강 진단, 정식 Food ID, NutrientProfile ID 또는 다른 공식 ID를 출력하거나 추론하지 마세요. 사진으로 뒷받침되지 않는 확실성을 주장하지 마세요.`;
+에너지, 칼로리, 영양소, 건강 진단, 정식 Food ID, NutrientProfile ID, 출처, 카탈로그, 레시피, 서빙 또는 다른 공식 ID를 출력하거나 추론하지 마세요. 질문은 자유 문장이 아닌 enum 사유 코드만 사용하세요. 사진으로 뒷받침되지 않는 확실성을 주장하지 마세요.`;
 
-export const OPENAI_MEAL_RECOGNITION_USER_PROMPT = `이 식사 사진을 분석하세요. outcome은 recognized, no_food, insufficient_evidence 중 하나입니다. recognized일 때만 서로 다른 보이는 음식 또는 음료마다 하나의 항목을 반환하세요. regionIndex는 사진 내 항목을 구분하는 0부터 시작하는 고유한 정수입니다. 양은 g, ml, serving, bowl, piece 중 하나로만 표현하세요. questions는 음식명 또는 양 중 확인이 필요한 대상을 target과 question으로 명시합니다. alternatives는 주 인식보다 낮은 confidence의 서로 다른 정규화 후보명을 normalizedLabel로 confidence 내림차순으로 반환하세요. evidenceReason은 insufficient_evidence일 때만 사유를, 나머지 outcome에서는 null을 반환하세요.`;
+export const OPENAI_MEAL_RECOGNITION_USER_PROMPT = `이 식사 사진을 관찰하세요. outcome은 recognized, no_food, insufficient_evidence 중 하나입니다. recognized일 때만 observations를 반환하세요. regionIndex는 0부터 19의 고유 정수입니다. parentRegionIndex는 루트면 null이고 구성 요소면 더 이른 루트 regionIndex입니다. 루트 kind는 dish 또는 drink, 자식 kind는 component만 가능합니다. 양은 g, ml, serving, bowl, piece 중 하나입니다. categoryHint와 preparationCodes는 제공된 enum만 쓰고, uncertaintyCodes와 questionReasonCodes도 enum 코드만 쓰세요. alternatives는 주 관찰보다 낮은 confidence의 서로 다른 label을 confidence 내림차순으로 반환하세요. evidenceReason은 insufficient_evidence일 때만 반환하세요.`;
 
 const labelSchema = { type: 'string', minLength: 1, maxLength: 120 };
 const confidenceBpsSchema = { type: 'integer', minimum: 0, maximum: 10_000 };
 
-const recognitionFoodSchema = {
+const recognitionObservationSchema = {
   type: 'object',
   additionalProperties: false,
   required: [
     'regionIndex',
+    'parentRegionIndex',
+    'kind',
     'rawLabel',
     'foodConfidenceBps',
     'portionConfidenceBps',
     'amountMilliunits',
     'unit',
-    'questions',
+    'categoryHint',
+    'preparationCodes',
+    'uncertaintyCodes',
+    'questionReasonCodes',
     'alternatives',
   ],
   properties: {
     regionIndex: { type: 'integer', minimum: 0, maximum: 19 },
+    parentRegionIndex: { type: ['integer', 'null'], minimum: 0, maximum: 19 },
+    kind: { type: 'string', enum: ['dish', 'drink', 'component'] },
     rawLabel: labelSchema,
     foodConfidenceBps: confidenceBpsSchema,
     portionConfidenceBps: confidenceBpsSchema,
     amountMilliunits: { type: 'integer', minimum: 1 },
     unit: { type: 'string', enum: ['g', 'ml', 'serving', 'bowl', 'piece'] },
-    questions: {
-      type: 'array',
-      minItems: 0,
-      maxItems: 2,
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['target', 'question'],
-        properties: {
-          target: { type: 'string', enum: ['food', 'portion'] },
-          question: { type: 'string', minLength: 1, maxLength: 240 },
-        },
-      },
-    },
+    categoryHint: { type: 'string', enum: ['staple', 'soup_stew', 'meat', 'seafood', 'vegetable', 'noodle_dumpling', 'snack_dessert', 'beverage', 'mixed', 'unknown'] },
+    preparationCodes: { type: 'array', minItems: 1, maxItems: 3, items: { type: 'string', enum: ['raw', 'boiled', 'steamed', 'grilled', 'fried', 'baked', 'braised', 'fermented', 'mixed', 'unknown'] } },
+    uncertaintyCodes: { type: 'array', minItems: 0, maxItems: 4, items: { type: 'string', enum: ['identity_uncertain', 'portion_uncertain', 'occluded', 'overlapping', 'mixed_dish', 'preparation_uncertain'] } },
+    questionReasonCodes: { type: 'array', minItems: 0, maxItems: 2, items: { type: 'string', enum: ['confirm_identity', 'confirm_portion', 'confirm_component'] } },
     alternatives: {
       type: 'array',
       minItems: 0,
@@ -62,9 +59,9 @@ const recognitionFoodSchema = {
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['normalizedLabel', 'confidenceBps'],
+        required: ['label', 'confidenceBps'],
         properties: {
-          normalizedLabel: labelSchema,
+          label: labelSchema,
           confidenceBps: confidenceBpsSchema,
         },
       },
@@ -75,7 +72,7 @@ const recognitionFoodSchema = {
 export const OPENAI_MEAL_RECOGNITION_JSON_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['outcome', 'imageQualityConfidenceBps', 'evidenceReason', 'foods'],
+  required: ['outcome', 'imageQualityConfidenceBps', 'observations'],
   properties: {
     outcome: {
       type: 'string',
@@ -83,14 +80,14 @@ export const OPENAI_MEAL_RECOGNITION_JSON_SCHEMA = {
     },
     imageQualityConfidenceBps: confidenceBpsSchema,
     evidenceReason: {
-      type: ['string', 'null'],
-      enum: ['blurred', 'too_dark', 'occluded', 'not_meal_photo', 'other', null],
+      type: 'string',
+      enum: ['blurred', 'too_dark', 'occluded', 'not_meal_photo', 'other'],
     },
-    foods: {
+    observations: {
       type: 'array',
       minItems: 0,
       maxItems: 20,
-      items: recognitionFoodSchema,
+      items: recognitionObservationSchema,
     },
   },
 } as const;
@@ -189,8 +186,10 @@ export class OpenAIMealRecognizer implements MealRecognizer {
       throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE');
     }
 
-    const result = RecognitionResultV2.safeParse(normalizeProviderResult(parsed));
-    if (!result.success) {
+    let result;
+    try {
+      result = parseRecognitionResultV3(normalizeProviderResult(parsed));
+    } catch {
       throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE');
     }
 
@@ -200,12 +199,12 @@ export class OpenAIMealRecognizer implements MealRecognizer {
     return {
       provider: 'openai',
       model: sanitizeModel(response.model) ?? this.model,
-      promptVersion: MEAL_RECOGNITION_PROMPT_VERSION,
-      schemaVersion: MEAL_RECOGNITION_SCHEMA_VERSION,
+      promptVersion: MEAL_RECOGNITION_V3_PROMPT_VERSION,
+      schemaVersion: MEAL_RECOGNITION_V3_SCHEMA_VERSION,
       ...(providerRequestId ? { providerRequestId } : {}),
       inputTokens: nonnegativeInteger(response.usage?.input_tokens),
       outputTokens: nonnegativeInteger(response.usage?.output_tokens),
-      result: result.data,
+      result,
     };
   }
 }
@@ -252,7 +251,7 @@ function createRequest(
     text: {
       format: {
         type: 'json_schema',
-        name: 'meal_recognition_v2',
+        name: 'meal_recognition_v3',
         strict: true,
         schema: OPENAI_MEAL_RECOGNITION_JSON_SCHEMA,
       },

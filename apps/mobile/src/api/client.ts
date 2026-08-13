@@ -3,6 +3,9 @@ import { Platform } from 'react-native';
 import { authClient } from '@/auth/client';
 import { API_URL } from '@/config/environment';
 
+export const MEAL_CONFIRMATION_PROTOCOL =
+  'meal-confirmation-safe-review-v1';
+
 export class ApiError extends Error {
   constructor(
     message = '요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.',
@@ -21,6 +24,10 @@ export async function apiRequest<T>(
 ): Promise<T> {
   const headers = new Headers(options.headers);
   headers.set('Accept', 'application/json');
+  headers.set(
+    'X-NUEAT-Meal-Confirmation-Protocol',
+    MEAL_CONFIRMATION_PROTOCOL,
+  );
 
   if (options.body !== undefined)
     headers.set('Content-Type', 'application/json');

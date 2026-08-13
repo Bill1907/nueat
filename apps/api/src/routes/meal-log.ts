@@ -1,25 +1,41 @@
 import {
   assetDeletionJobs,
+  activeCatalogReleasePointers,
   calculationSnapshots,
+  calculationPreviews,
   imageAssets,
+  mappingDecisions,
+  mealDecompositionComponents,
+  mealDecompositionRevisions,
   mealItems,
   mealLogs,
+  recognitionAttempts,
+  releaseActivations,
+  resolutionAttempts,
+  storedObservations,
   userProfiles,
   isRecognitionResultV2,
+  isRecognitionResultV3,
+  type CalculationPreviewIdentity,
   type Database,
-  type RecognitionResultV2,
 } from '@nueat/database';
 import {
   calculateMealNutrition,
-  deriveItemReviewState,
-  deriveMealReviewState,
+  calculateReviewedMealNutrition,
+  deriveCurrentItemReviewCheckpoint,
+  deriveMealConfirmability,
+  MEAL_ITEM_REVIEW_FINGERPRINT_VERSION,
   NutritionCalculationError,
-  MEAL_ESTIMATE_REVIEW_POLICY_VERSION,
-  MEAL_ESTIMATE_REVIEW_THRESHOLDS,
-  type CalculatedNutritionValues,
+  reviewRequestFingerprint,
   type MealNutritionInput,
 } from '@nueat/domain';
-import { and, asc, desc, eq, or, sql } from 'drizzle-orm';
+import {
+  CALCULATION_INPUT_SNAPSHOT_V2,
+  parseCalculationInputSnapshot,
+  projectCalculationInputSnapshot,
+} from '@nueat/database';
+import { createHash, randomUUID } from 'node:crypto';
+import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
@@ -28,10 +44,18 @@ import type { Auth } from '../auth/auth';
 import type { ApiEnvironment } from '../config/env';
 import type { MealRecognitionRunner } from '../services/meal-recognition-coordinator';
 import {
+  classifyMealConfirmationCutover,
+  MEAL_CONFIRMATION_SAFE_REVIEW_PROTOCOL,
+} from '../services/meal-confirmation-cutover';
+import {
   resolveCurrentMealItems,
-  resolveFoodSelection,
 } from '../services/meal-item-resolution';
-
+import {
+  selectTrustedNutrition,
+  type TrustedNutritionSelection,
+} from '../services/catalog-eligibility-selector';
+import { projectMealItemAuthority } from '../services/meal-item-authority';
+import { catalogEligibilityAdapter } from '../services/meal-resolution-coordinator';
 const mealTypeSchema = z.enum(['breakfast', 'lunch', 'dinner', 'snack']);
 const servingUnitSchema = z.enum(['g', 'ml', 'serving', 'bowl', 'piece']);
 const dateTimeSchema = z.iso
@@ -76,19 +100,30 @@ const deleteMealItemSchema = z.object({
 }).strict();
 const confirmMealSchema = z.object({
   expectedDraftRevision: z.int().positive(),
+  idempotencyKey: z.string().trim().min(1).max(200),
   items: z.array(z.object({
     itemId: z.uuid(),
     expectedItemRevision: z.int().positive(),
+    mappingDecisionId: z.uuid().optional(),
+    calculationPreviewId: z.uuid().optional(),
+    decompositionRevisionId: z.uuid().optional(),
   }).strict()),
 }).strict();
-const reviewMealSchema = z.object({
+const replaceMealDecompositionSchema = z.object({
   expectedDraftRevision: z.int().positive(),
-  items: z.array(z.object({
-    itemId: z.uuid(),
-    expectedItemRevision: z.int().positive(),
-    foodAcknowledgedRevision: z.int().positive().optional(),
-    portionAcknowledgedRevision: z.int().positive().optional(),
-  }).strict()).min(1),
+  expectedItemRevision: z.int().positive(),
+  components: z.array(z.object({
+    foodId: z.uuid(),
+    amountMilliunits: z.int().positive(),
+    unit: servingUnitSchema,
+  }).strict()).min(1).max(12),
+}).strict();
+const reviewMealItemSchema = z.object({
+  expectedDraftRevision: z.int().positive(),
+  expectedItemRevision: z.int().positive(),
+  idempotencyKey: z.string().trim().min(1).max(200),
+  displayedAuthorityFingerprintVersion: z.literal(MEAL_ITEM_REVIEW_FINGERPRINT_VERSION),
+  displayedAuthorityFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
 }).strict();
 
 interface MealLogRouteOptions {
@@ -96,20 +131,8 @@ interface MealLogRouteOptions {
   database: Database;
   recognitionCoordinator: MealRecognitionRunner;
   reviewPolicy: ApiEnvironment['mealRecognition']['reviewPolicy'];
+  mealConfirmationCutover: ApiEnvironment['mealConfirmationCutover'];
 }
-type ReviewPolicyConfig = ApiEnvironment['mealRecognition']['reviewPolicy'];
-const resolutionReviewReasonCodes = new Set([
-  'FOOD_MAPPING_MISSING',
-  'FOOD_NOT_FOUND',
-  'FOOD_DEPRECATED',
-  'NUTRIENT_PROFILE_MISSING',
-  'NUTRIENT_PROFILE_MISMATCHED',
-  'NUTRIENT_PROFILE_UNTRUSTED',
-  'CORE_NUTRIENTS_MISSING',
-  'SERVING_CONVERSION_MISSING',
-  'SERVING_CONVERSION_AMBIGUOUS',
-  'SERVING_CONVERSION_UNTRUSTED',
-]);
 
 export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
   app,
@@ -259,12 +282,34 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     );
     if (!mealLog) return mealLogNotFound(reply, request);
     const items = await findMealItems(options.database, mealLog.id);
+    if (mealLog.status === 'confirmed') {
+      const [snapshot] = await options.database
+        .select(calculationSnapshotSelection)
+        .from(calculationSnapshots)
+        .where(eq(calculationSnapshots.mealLogId, mealLog.id))
+        .orderBy(desc(calculationSnapshots.sequence))
+        .limit(1);
+      const response = snapshot
+        ? confirmedMealSnapshotResponse(mealLog, snapshot)
+        : null;
+      if (!response) {
+        return reply.status(500).send({
+          error: {
+            code: 'CONFIRMED_MEAL_INTEGRITY_ERROR',
+            message: '확정된 식사 기록을 안전하게 읽을 수 없습니다.',
+            requestId: request.id,
+          },
+        });
+      }
+      return response;
+    }
     return await mealLogResponse(options.database, mealLog, items);
   });
 
   app.patch('/api/meal-logs/:mealLogId', async (request, reply) => {
     const userId = await requireUserId(request, reply, options.auth);
     if (!userId) return;
+    if (!applyMealConfirmationCutover(request, reply, options)) return;
     const params = mealLogIdParamsSchema.safeParse(request.params);
     const body = updateMealLogSchema.safeParse(request.body);
     if (!params.success || !body.success) return invalidRequest(reply, request);
@@ -319,6 +364,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
   app.post('/api/meal-logs/:mealLogId/items', async (request, reply) => {
     const userId = await requireUserId(request, reply, options.auth);
     if (!userId) return;
+    if (!applyMealConfirmationCutover(request, reply, options)) return;
     const params = mealLogIdParamsSchema.safeParse(request.params);
     const body = createMealItemSchema.safeParse(request.body);
     if (!params.success || !body.success) return invalidRequest(reply, request);
@@ -345,7 +391,8 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         return { kind: 'stale' as const, mealLog };
       if (
         mealLog.recognitionStatus === 'ready' &&
-        isRecognitionResultV2(mealLog.recognitionResult) &&
+        (isRecognitionResultV2(mealLog.recognitionResult) ||
+          isRecognitionResultV3(mealLog.recognitionResult)) &&
         mealLog.recognitionResult.outcome !== 'recognized'
       )
         return { kind: 'invalid_state' as const };
@@ -369,7 +416,16 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         .select(mealItemSelection)
         .from(mealItems)
         .where(eq(mealItems.mealLogId, mealLog.id))
-        .orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
+        .orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id))
+        .for('update');
+      // Root rows are part of the confirmation tuple.  Lock them before looking
+      // at immutable resolution artifacts so a concurrent edit cannot pair a
+      // new root revision with an old decision or preview.
+      await tx
+        .select({ id: mealItems.id })
+        .from(mealItems)
+        .where(eq(mealItems.mealLogId, mealLog.id))
+        .for('update');
       return { kind: 'created' as const, mealLog: currentMealLog, items };
     });
     if (created.kind === 'not_found') return mealLogNotFound(reply, request);
@@ -391,6 +447,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     async (request, reply) => {
       const userId = await requireUserId(request, reply, options.auth);
       if (!userId) return;
+      if (!applyMealConfirmationCutover(request, reply, options)) return;
       const params = mealItemIdParamsSchema.safeParse(request.params);
       const body = updateMealItemSchema.safeParse(request.body);
       if (!params.success || !body.success)
@@ -448,19 +505,23 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
                   nutrientProfileId: null,
                   mappingConfidenceBps: null,
                   currentResolutionSource: null,
-                  foodAcknowledgedRevision: null,
                 }
               : {}),
             ...(amountChanged ? { amountMilliunits: changes.amountMilliunits } : {}),
             ...(unitChanged ? { unit: changes.unit } : {}),
             itemRevision: sql`${mealItems.itemRevision} + 1`,
+            reviewedItemRevision: null,
+            reviewedAuthorityFingerprintVersion: null,
+            reviewedAuthorityFingerprint: null,
+            reviewIdempotencyKey: null,
+            reviewRequestFingerprint: null,
+            reviewedAt: null,
             ...(foodChanged
               ? { foodRevision: sql`${mealItems.foodRevision} + 1` }
               : {}),
             ...(portionChanged
               ? {
                   portionRevision: sql`${mealItems.portionRevision} + 1`,
-                  portionAcknowledgedRevision: sql`${mealItems.portionRevision} + 1`,
                 }
               : {}),
             userCorrected: true,
@@ -507,6 +568,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     async (request, reply) => {
       const userId = await requireUserId(request, reply, options.auth);
       if (!userId) return;
+      if (!applyMealConfirmationCutover(request, reply, options)) return;
       const params = mealItemIdParamsSchema.safeParse(request.params);
       const body = mapFoodSchema.safeParse(request.body);
       if (!params.success || !body.success)
@@ -532,14 +594,167 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
           .limit(1);
         if (!currentItem || currentItem.itemRevision !== body.data.expectedItemRevision)
           return { kind: 'item_not_found' as const };
-        const selection = await resolveFoodSelection(tx, body.data.foodId);
-        if (selection.kind === 'food_not_found')
-          return { kind: 'food_not_found' as const };
-        if (selection.kind === 'profile_unavailable')
-          return { kind: 'profile_unavailable' as const };
+        let [storedObservation] = await tx
+          .select({
+            id: storedObservations.id,
+            canonicalContent: storedObservations.canonicalContent,
+          })
+          .from(storedObservations)
+          .where(eq(storedObservations.mealLogId, mealLog.id))
+          .for('update')
+          .limit(1);
+        if (!storedObservation) {
+          if (!mealLog.imageAssetId)
+            return {
+              kind: 'profile_unavailable' as const,
+              reason: 'IMAGE_ASSET_REQUIRED_FOR_MANUAL_AUTHORITY',
+            };
+          let [attempt] = await tx
+            .select({
+              id: recognitionAttempts.id,
+              provider: recognitionAttempts.provider,
+              model: recognitionAttempts.model,
+              promptVersion: recognitionAttempts.promptVersion,
+              schemaVersion: recognitionAttempts.schemaVersion,
+            })
+            .from(recognitionAttempts)
+            .where(eq(recognitionAttempts.mealLogId, mealLog.id))
+            .for('update')
+            .limit(1);
+          if (!attempt) {
+            [attempt] = await tx
+              .insert(recognitionAttempts)
+              .values({
+                mealLogId: mealLog.id,
+                imageAssetId: mealLog.imageAssetId,
+                status: 'ready',
+                provider: 'manual',
+                model: 'manual-entry-authority-v1',
+                promptVersion: 'manual-entry-authority-v1',
+                schemaVersion: 'manual-entry-authority-v1',
+                inputTokens: 0,
+                outputTokens: 0,
+                attemptCount: 0,
+                nextAttemptAt: new Date(),
+                completedAt: new Date(),
+              })
+              .returning({
+                id: recognitionAttempts.id,
+                provider: recognitionAttempts.provider,
+                model: recognitionAttempts.model,
+                promptVersion: recognitionAttempts.promptVersion,
+                schemaVersion: recognitionAttempts.schemaVersion,
+              });
+          }
+          if (!attempt)
+            throw new Error('Manual observation attempt was not created');
+          const canonicalContent = {
+            version: 3,
+            authority: 'manual_entry',
+            observations: [],
+          } as const;
+          [storedObservation] = await tx
+            .insert(storedObservations)
+            .values({
+              mealLogId: mealLog.id,
+              recognitionAttemptId: attempt.id,
+              provider: attempt.provider ?? 'manual',
+              model: attempt.model ?? 'manual-entry-authority-v1',
+              promptVersion:
+                attempt.promptVersion ?? 'manual-entry-authority-v1',
+              schemaVersion:
+                attempt.schemaVersion ?? 'manual-entry-authority-v1',
+              inputTokens: 0,
+              outputTokens: 0,
+              canonicalContent,
+              contentSha256: hash(JSON.stringify(canonicalContent)),
+            })
+            .returning({
+              id: storedObservations.id,
+              canonicalContent: storedObservations.canonicalContent,
+            });
+        }
+        if (!storedObservation)
+          throw new Error('Manual observation was not created');
+        const localObservationId =
+          currentItem.origin === 'model_estimate' &&
+          currentItem.recognitionRegionIndex !== null
+            ? observationLocalId(
+                storedObservation.canonicalContent,
+                currentItem.recognitionRegionIndex,
+              )
+            : `manual:${currentItem.id}`;
+        if (!localObservationId)
+          return {
+            kind: 'profile_unavailable' as const,
+            reason: 'OBSERVATION_ID_UNAVAILABLE',
+          };
+        const [predecessor] =
+          await tx
+                .select({
+                  id: mappingDecisions.id,
+                  candidates: mappingDecisions.candidates,
+                  selectedFoodId: mappingDecisions.selectedFoodId,
+                })
+                .from(mappingDecisions)
+                .where(
+                  and(
+                    eq(
+                      mappingDecisions.storedObservationId,
+                      storedObservation.id,
+                    ),
+                    eq(
+                      mappingDecisions.localObservationId,
+                      localObservationId,
+                    ),
+                  ),
+                )
+                .orderBy(desc(mappingDecisions.createdAt), desc(mappingDecisions.id))
+                .for('update')
+                .limit(1);
+        const [active] =
+          await tx
+                .select({
+                  activationId: activeCatalogReleasePointers.activationId,
+                  catalogReleaseId: releaseActivations.catalogReleaseId,
+                  policyVersion: releaseActivations.policyVersion,
+                  policySha256: releaseActivations.policySha256,
+                })
+                .from(activeCatalogReleasePointers)
+                .innerJoin(
+                  releaseActivations,
+                  eq(
+                    activeCatalogReleasePointers.activationId,
+                    releaseActivations.id,
+                  ),
+                )
+                .for('update')
+                .limit(1);
+        if (!active)
+          return {
+            kind: 'profile_unavailable' as const,
+            reason: 'ACTIVE_CATALOG_RELEASE_UNAVAILABLE',
+          };
+        const trustedSelection =
+          await selectTrustedNutrition(
+                catalogEligibilityAdapter(tx as unknown as Database),
+                {
+                  catalogReleaseId: active.catalogReleaseId,
+                  foodId: body.data.foodId,
+                  unit: currentItem.unit,
+                },
+              );
+        if (trustedSelection.kind === 'unavailable')
+          return {
+            kind: 'profile_unavailable' as const,
+            reason: trustedSelection.reason,
+          };
+        const selectedFood = trustedSelection.food;
+        const selectedProfileId = trustedSelection.profile.id;
         if (
-          currentItem.foodId === selection.food.id &&
-          currentItem.nutrientProfileId === selection.nutrientProfileId
+          currentItem.foodId === selectedFood.id &&
+          currentItem.nutrientProfileId === selectedProfileId &&
+          predecessor?.selectedFoodId === selectedFood.id
         ) {
           const items = await tx.select(mealItemSelection).from(mealItems)
             .where(eq(mealItems.mealLogId, mealLog.id))
@@ -547,17 +762,91 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
           return { kind: 'mapped' as const, mealLog, items };
         }
 
+        const nextItemRevision = currentItem.itemRevision + 1;
+        {
+          const resolverVersion = 'user-selected-mapping-v1';
+          const edibleAmountMg =
+            currentItem.unit === 'g'
+              ? currentItem.amountMilliunits
+              : servingAmountToGrams(
+                  currentItem.amountMilliunits,
+                  trustedSelection.serving?.amountMilliunits,
+                  trustedSelection.serving?.gramsMg,
+                );
+          if (edibleAmountMg === null)
+            return {
+              kind: 'profile_unavailable' as const,
+              reason: 'MISSING_SERVING_CONVERSION',
+            };
+          const [decision] = await tx
+            .insert(mappingDecisions)
+            .values({
+              storedObservationId: storedObservation.id,
+              localObservationId,
+              catalogReleaseId: active.catalogReleaseId,
+              releaseActivationId: active.activationId,
+              resolverVersion,
+              resolverSha256: hash(resolverVersion),
+              policyVersion: active.policyVersion,
+              policySha256: active.policySha256,
+              candidates: predecessor?.candidates ?? [],
+              selectedFoodId: trustedSelection.food.id,
+              status: 'selected',
+              method: 'user_selected',
+              reasonCode: 'USER_SELECTED',
+              evidence: {
+                predecessorDecisionId: predecessor?.id ?? null,
+                explicitUserSelection: true,
+              },
+              predecessorId: predecessor?.id ?? null,
+            })
+            .returning({ id: mappingDecisions.id });
+          if (!decision)
+            throw new Error('User selection decision insert did not return a row');
+          const identity: CalculationPreviewIdentity = {
+            basis: 'finished_profile',
+            rootMappingDecisionId: decision.id,
+            rootRevision: nextItemRevision,
+            catalogReleaseId: active.catalogReleaseId,
+            releaseActivationId: active.activationId,
+            leaves: [
+              previewLeaf(
+                decision.id,
+                0,
+                edibleAmountMg,
+                currentItem.unit,
+                trustedSelection,
+              ),
+            ],
+          };
+          await tx.insert(calculationPreviews).values({
+            mealLogId: mealLog.id,
+            rootMappingDecisionId: decision.id,
+            rootRevision: nextItemRevision,
+            catalogReleaseId: active.catalogReleaseId,
+            releaseActivationId: active.activationId,
+            discriminant: 'finished_profile',
+            identity,
+            contentSha256: hash(JSON.stringify(identity)),
+          });
+        }
+
         const [item] = await tx
           .update(mealItems)
           .set({
-            recognizedLabel: selection.food.canonicalNameKo,
-            foodId: selection.food.id,
-            nutrientProfileId: selection.nutrientProfileId,
+            recognizedLabel: selectedFood.canonicalNameKo,
+            foodId: selectedFood.id,
+            nutrientProfileId: selectedProfileId,
             mappingConfidenceBps: 10_000,
             currentResolutionSource: 'user_selected',
             itemRevision: sql`${mealItems.itemRevision} + 1`,
+            reviewedItemRevision: null,
+            reviewedAuthorityFingerprintVersion: null,
+            reviewedAuthorityFingerprint: null,
+            reviewIdempotencyKey: null,
+            reviewRequestFingerprint: null,
+            reviewedAt: null,
             foodRevision: sql`${mealItems.foodRevision} + 1`,
-            foodAcknowledgedRevision: sql`${mealItems.foodRevision} + 1`,
             userCorrected: true,
             updatedAt: new Date(),
           })
@@ -594,70 +883,254 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       }
       if (mapped.kind === 'invalid_state')
         return invalidMealLogState(reply, request);
-      if (mapped.kind === 'food_not_found') return foodNotFound(reply, request);
       if (mapped.kind === 'profile_unavailable')
-        return foodNutrientProfileUnavailable(reply, request);
+        return foodNutrientProfileUnavailable(reply, request, mapped.reason);
       return await mealLogResponse(options.database, mapped.mealLog, mapped.items);
     },
   );
-  app.post('/api/meal-logs/:mealLogId/review', async (request, reply) => {
+  app.post('/api/meal-logs/:mealLogId/items/:itemId/review', async (request, reply) => {
     const userId = await requireUserId(request, reply, options.auth);
     if (!userId) return;
-    const params = mealLogIdParamsSchema.safeParse(request.params);
-    const body = reviewMealSchema.safeParse(request.body);
+    if (!applyMealConfirmationCutover(request, reply, options)) return;
+    const params = mealItemIdParamsSchema.safeParse(request.params);
+    const body = reviewMealItemSchema.safeParse(request.body);
     if (!params.success || !body.success) return invalidRequest(reply, request);
     const result = await options.database.transaction(async (tx) => {
-      const [mealLog] = await tx.select(mealLogSelection).from(mealLogs).where(and(eq(mealLogs.id, params.data.mealLogId), eq(mealLogs.userId, userId))).for('update').limit(1);
+      const [mealLog] = await tx.select(mealLogSelection).from(mealLogs).where(and(
+        eq(mealLogs.id, params.data.mealLogId), eq(mealLogs.userId, userId),
+      )).for('update').limit(1);
       if (!mealLog) return { kind: 'not_found' as const };
-      const items = await tx.select(mealItemSelection).from(mealItems).where(eq(mealItems.mealLogId, mealLog.id)).orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
-      if (mealLog.status !== 'draft' || mealLog.draftRevision !== body.data.expectedDraftRevision) return { kind: 'stale' as const, mealLog, items };
-      const requested = new Map(body.data.items.map((item) => [item.itemId, item]));
-      const targets = items.filter((item) => requested.has(item.id));
-      if (targets.length !== body.data.items.length || targets.some((item) => requested.get(item.id)!.expectedItemRevision !== item.itemRevision)) return { kind: 'stale' as const, mealLog, items };
-      if (targets.some((item) => {
-        const acknowledgement = requested.get(item.id)!;
-        return (
-          (acknowledgement.foodAcknowledgedRevision !== undefined &&
-            acknowledgement.foodAcknowledgedRevision !== item.foodRevision) ||
-          (acknowledgement.portionAcknowledgedRevision !== undefined &&
-            acknowledgement.portionAcknowledgedRevision !== item.portionRevision)
-        );
-      })) return { kind: 'stale' as const, mealLog, items };
-      const resolutions = await resolveCurrentMealItems(tx, targets);
-      if (resolutions.some((resolution) => resolution.reason !== null)) return { kind: 'unacknowledgeable' as const };
-      const changesAcknowledgement = targets.some((item) => {
-        const acknowledgement = requested.get(item.id)!;
-        return (
-          (acknowledgement.foodAcknowledgedRevision !== undefined &&
-            item.foodAcknowledgedRevision !== item.foodRevision) ||
-          (acknowledgement.portionAcknowledgedRevision !== undefined &&
-            item.portionAcknowledgedRevision !== item.portionRevision)
-        );
+      const [item] = await tx.select(mealItemSelection).from(mealItems).where(and(
+        eq(mealItems.id, params.data.itemId), eq(mealItems.mealLogId, mealLog.id),
+      )).for('update').limit(1);
+      if (!item || mealLog.status !== 'draft') return { kind: 'stale' as const };
+      const requestFingerprint = reviewRequestFingerprint({
+        mealId: mealLog.id, itemId: item.id, idempotencyKey: body.data.idempotencyKey,
+        expectedDraftRevision: body.data.expectedDraftRevision,
+        expectedItemRevision: body.data.expectedItemRevision,
+        displayedAuthorityFingerprintVersion: body.data.displayedAuthorityFingerprintVersion,
+        displayedAuthorityFingerprint: body.data.displayedAuthorityFingerprint,
       });
-      if (!changesAcknowledgement)
-        return { kind: 'reviewed' as const, mealLog, items };
-      for (const item of targets) {
-        const acknowledgement = requested.get(item.id)!;
-        await tx.update(mealItems).set({
-          ...(acknowledgement.foodAcknowledgedRevision === undefined ? {} : { foodAcknowledgedRevision: item.foodRevision }),
-          ...(acknowledgement.portionAcknowledgedRevision === undefined ? {} : { portionAcknowledgedRevision: item.portionRevision }),
-          itemRevision: sql`${mealItems.itemRevision} + 1`,
-          updatedAt: new Date(),
-        }).where(eq(mealItems.id, item.id));
+      if (item.reviewIdempotencyKey === body.data.idempotencyKey) {
+        if (item.reviewRequestFingerprint !== requestFingerprint)
+          return { kind: 'key_reused' as const };
+        return { kind: 'replayed' as const, mealLog, item };
       }
-      const [updatedMealLog] = await tx.update(mealLogs).set({ draftRevision: sql`${mealLogs.draftRevision} + 1`, updatedAt: new Date() }).where(eq(mealLogs.id, mealLog.id)).returning(mealLogSelection);
-      if (!updatedMealLog) throw new Error('Draft meal disappeared while reviewing');
-      const updatedItems = await tx.select(mealItemSelection).from(mealItems).where(eq(mealItems.mealLogId, mealLog.id)).orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
-      return { kind: 'reviewed' as const, mealLog: updatedMealLog, items: updatedItems };
-    });
+      if (
+        mealLog.draftRevision !== body.data.expectedDraftRevision ||
+        item.itemRevision !== body.data.expectedItemRevision
+      ) return { kind: 'stale' as const };
+      const authority = await projectCurrentItemAuthority(tx as unknown as Database, item);
+      if (
+        !authority.fingerprint ||
+        authority.fingerprintVersion !== body.data.displayedAuthorityFingerprintVersion ||
+        authority.fingerprint !== body.data.displayedAuthorityFingerprint
+      ) return { kind: 'authority_stale' as const };
+      const now = new Date();
+      const [reviewed] = await tx.update(mealItems).set({
+        reviewedItemRevision: item.itemRevision,
+        reviewedAuthorityFingerprintVersion: authority.fingerprintVersion,
+        reviewedAuthorityFingerprint: authority.fingerprint,
+        reviewIdempotencyKey: body.data.idempotencyKey,
+        reviewRequestFingerprint: requestFingerprint,
+        reviewedAt: now,
+        updatedAt: now,
+      }).where(eq(mealItems.id, item.id)).returning(mealItemSelection);
+      const [updatedMealLog] = await tx.update(mealLogs).set({
+        draftRevision: sql`${mealLogs.draftRevision} + 1`, updatedAt: now,
+      }).where(eq(mealLogs.id, mealLog.id)).returning(mealLogSelection);
+      if (!reviewed || !updatedMealLog) throw new Error('Meal disappeared while reviewing');
+      return { kind: 'reviewed' as const, mealLog: updatedMealLog, item: reviewed };
+    }, { isolationLevel: 'serializable' });
     if (result.kind === 'not_found') return mealLogNotFound(reply, request);
-    if (result.kind === 'unacknowledgeable') return reply.status(409).send({ error: { code: 'MEAL_REVIEW_NOT_ACKNOWLEDGEABLE', message: '해결되지 않은 영양 근거는 확인할 수 없습니다.', requestId: request.id } });
-    if (result.kind === 'stale') return await staleMealResponse(options.database, reply, request, 'MEAL_ITEM_STALE', result);
+    if (result.kind === 'key_reused') return reply.status(409).send({ error: { code: 'IDEMPOTENCY_KEY_REUSED', message: '동일한 검토 키에 다른 요청을 사용할 수 없습니다.', requestId: request.id } });
+    if (result.kind === 'stale' || result.kind === 'authority_stale')
+      return reply.status(409).send({ error: { code: result.kind === 'authority_stale' ? 'MEAL_ITEM_AUTHORITY_STALE' : 'MEAL_ITEM_STALE', message: '식사 항목이 변경되었습니다.', requestId: request.id } });
+    const current = result.kind === 'replayed' ? result.mealLog : result.mealLog;
+    return await mealLogResponse(options.database, current, await findMealItems(options.database, current.id));
+  });
+  app.put('/api/meal-logs/:mealLogId/items/:itemId/decomposition', async (request, reply) => {
+    const userId = await requireUserId(request, reply, options.auth);
+    if (!userId) return;
+    if (!applyMealConfirmationCutover(request, reply, options)) return;
+    const params = mealItemIdParamsSchema.safeParse(request.params);
+    const body = replaceMealDecompositionSchema.safeParse(request.body);
+    if (!params.success || !body.success) return invalidRequest(reply, request);
+
+    const result = await options.database.transaction(async (tx) => {
+      const [mealLog] = await tx.select(mealLogSelection).from(mealLogs).where(and(
+        eq(mealLogs.id, params.data.mealLogId),
+        eq(mealLogs.userId, userId),
+        eq(mealLogs.status, 'draft'),
+      )).for('update').limit(1);
+      if (!mealLog) return { kind: 'not_found' as const };
+      const [root] = await tx.select(mealItemSelection).from(mealItems).where(and(
+        eq(mealItems.id, params.data.itemId),
+        eq(mealItems.mealLogId, mealLog.id),
+      )).for('update').limit(1);
+      if (!root || root.itemRevision !== body.data.expectedItemRevision ||
+        mealLog.draftRevision !== body.data.expectedDraftRevision)
+        return { kind: 'stale' as const };
+      if (mealLog.recognitionStatus !== 'ready' && mealLog.recognitionStatus !== 'manual')
+        return { kind: 'invalid_state' as const };
+
+      const [observation] = await tx.select({ id: storedObservations.id, canonicalContent: storedObservations.canonicalContent })
+        .from(storedObservations).where(eq(storedObservations.mealLogId, mealLog.id)).for('update').limit(1);
+      const localObservationId = root.recognitionRegionIndex === null
+        ? null
+        : observationLocalId(observation?.canonicalContent, root.recognitionRegionIndex);
+      if (!observation || !localObservationId) return { kind: 'stale' as const };
+      const [active] = await tx.select({
+        activationId: activeCatalogReleasePointers.activationId,
+        catalogReleaseId: releaseActivations.catalogReleaseId,
+        policyVersion: releaseActivations.policyVersion,
+        policySha256: releaseActivations.policySha256,
+      }).from(activeCatalogReleasePointers)
+        .innerJoin(releaseActivations, eq(activeCatalogReleasePointers.activationId, releaseActivations.id))
+        .for('update').limit(1);
+      if (!active) return { kind: 'stale' as const };
+      const [rootDecision] = await tx.select({
+        id: mappingDecisions.id,
+        selectedFoodId: mappingDecisions.selectedFoodId,
+        status: mappingDecisions.status,
+        catalogReleaseId: mappingDecisions.catalogReleaseId,
+        releaseActivationId: mappingDecisions.releaseActivationId,
+      }).from(mappingDecisions).where(and(
+        eq(mappingDecisions.storedObservationId, observation.id),
+        eq(mappingDecisions.localObservationId, localObservationId),
+      )).orderBy(desc(mappingDecisions.createdAt), desc(mappingDecisions.id)).for('update').limit(1);
+      if (!rootDecision || rootDecision.status !== 'selected' || !rootDecision.selectedFoodId ||
+        rootDecision.catalogReleaseId !== active.catalogReleaseId ||
+        rootDecision.releaseActivationId !== active.activationId)
+        return { kind: 'stale' as const };
+
+      const adapter = catalogEligibilityAdapter(tx as unknown as Database);
+      const selections: TrustedNutritionSelection[] = [];
+      const edibleAmountsMg: number[] = [];
+      for (const component of body.data.components) {
+        const selection = await selectTrustedNutrition(adapter, {
+          catalogReleaseId: active.catalogReleaseId,
+          foodId: component.foodId,
+          unit: component.unit,
+        });
+        if (selection.kind !== 'selected') return { kind: 'stale' as const };
+        selections.push(selection);
+        const edibleAmountMg = component.unit === 'g'
+          ? component.amountMilliunits
+          : servingAmountToGrams(component.amountMilliunits, selection.serving?.amountMilliunits, selection.serving?.gramsMg);
+        if (edibleAmountMg === null) return { kind: 'stale' as const };
+        edibleAmountsMg.push(edibleAmountMg);
+      }
+      const nextRootRevision = root.itemRevision + 1;
+      const componentDecisions = await tx.insert(mappingDecisions).values(
+        body.data.components.map((component, ordinal) => ({
+          storedObservationId: observation.id,
+          localObservationId: `decomposition:${root.id}:${nextRootRevision}:${ordinal}:${randomUUID()}`,
+          catalogReleaseId: active.catalogReleaseId,
+          releaseActivationId: active.activationId,
+          resolverVersion: 'user-selected-composition-v1',
+          resolverSha256: hash('user-selected-composition-v1'),
+          policyVersion: active.policyVersion,
+          policySha256: active.policySha256,
+          candidates: [],
+          selectedFoodId: component.foodId,
+          status: 'selected' as const,
+          method: 'user_selected' as const,
+          reasonCode: 'USER_SELECTED_COMPOSITION',
+          evidence: { rootItemId: root.id, ordinal, unit: component.unit, amountMilliunits: component.amountMilliunits, edibleAmountMg: edibleAmountsMg[ordinal] },
+        })),
+      ).returning({ id: mappingDecisions.id });
+      const componentPreviews = await Promise.all(componentDecisions.map(async (decision, ordinal) => {
+        const component = body.data.components[ordinal]!;
+        const selection = selections[ordinal]!;
+        const identity: CalculationPreviewIdentity = {
+          basis: 'finished_profile',
+          rootMappingDecisionId: decision.id,
+          rootRevision: 1,
+          catalogReleaseId: active.catalogReleaseId,
+          releaseActivationId: active.activationId,
+          leaves: [previewLeaf(
+            decision.id,
+            0,
+            edibleAmountsMg[ordinal]!,
+            component.unit,
+            selection,
+          )],
+        };
+        const [preview] = await tx.insert(calculationPreviews).values({
+          mealLogId: mealLog.id, rootMappingDecisionId: decision.id, rootRevision: 1,
+          catalogReleaseId: active.catalogReleaseId, releaseActivationId: active.activationId,
+          discriminant: 'finished_profile', identity, contentSha256: hash(JSON.stringify(identity)),
+        }).returning({ id: calculationPreviews.id });
+        if (!preview) throw new Error('Component preview insert did not return a row');
+        return preview;
+      }));
+      const decompositionId = randomUUID();
+      const rootIdentity: CalculationPreviewIdentity = {
+        basis: 'meal_decomposition',
+        rootMappingDecisionId: rootDecision.id,
+        rootRevision: nextRootRevision,
+        catalogReleaseId: active.catalogReleaseId,
+        releaseActivationId: active.activationId,
+        decompositionRevisionId: decompositionId,
+        leaves: body.data.components.map((component, ordinal) =>
+          previewLeaf(
+            componentDecisions[ordinal]!.id,
+            ordinal,
+            edibleAmountsMg[ordinal]!,
+            component.unit,
+            selections[ordinal]!,
+          )),
+      };
+      const [rootPreview] = await tx.insert(calculationPreviews).values({
+        mealLogId: mealLog.id, rootMappingDecisionId: rootDecision.id, rootRevision: nextRootRevision,
+        catalogReleaseId: active.catalogReleaseId, releaseActivationId: active.activationId,
+        discriminant: 'meal-composition', identity: rootIdentity, contentSha256: hash(JSON.stringify(rootIdentity)),
+      }).returning({ id: calculationPreviews.id });
+      if (!rootPreview) throw new Error('Root decomposition preview insert did not return a row');
+      const priorRevisions = await tx.select({ revision: mealDecompositionRevisions.revision })
+        .from(mealDecompositionRevisions).where(eq(mealDecompositionRevisions.mealLogId, mealLog.id))
+        .orderBy(desc(mealDecompositionRevisions.revision)).for('update').limit(1);
+      const revision = priorRevisions[0]?.revision ?? 0;
+      const [decomposition] = await tx.insert(mealDecompositionRevisions).values({
+        id: decompositionId, mealLogId: mealLog.id, revision: revision + 1,
+        rootMappingDecisionId: rootDecision.id, rootCalculationPreviewId: rootPreview.id,
+      }).returning({ id: mealDecompositionRevisions.id });
+      if (!decomposition) throw new Error('Decomposition insert did not return a row');
+      await tx.insert(mealDecompositionComponents).values(body.data.components.map((component, ordinal) => ({
+        mealDecompositionRevisionId: decomposition.id, ordinal, mappingDecisionId: componentDecisions[ordinal]!.id,
+        calculationPreviewId: componentPreviews[ordinal]!.id, edibleAmountMg: edibleAmountsMg[ordinal]!,
+      })));
+      const [updatedRoot] = await tx.update(mealItems).set({
+        itemRevision: nextRootRevision,
+        reviewedItemRevision: null,
+        reviewedAuthorityFingerprintVersion: null,
+        reviewedAuthorityFingerprint: null,
+        reviewIdempotencyKey: null,
+        reviewRequestFingerprint: null,
+        reviewedAt: null,
+        portionRevision: sql`${mealItems.portionRevision} + 1`,
+        userCorrected: true,
+        updatedAt: new Date(),
+      }).where(eq(mealItems.id, root.id)).returning(mealItemSelection);
+      const [updatedMealLog] = await tx.update(mealLogs).set({
+        draftRevision: sql`${mealLogs.draftRevision} + 1`, updatedAt: new Date(),
+      }).where(eq(mealLogs.id, mealLog.id)).returning(mealLogSelection);
+      if (!updatedRoot || !updatedMealLog) throw new Error('Meal disappeared while replacing decomposition');
+      const items = await tx.select(mealItemSelection).from(mealItems).where(eq(mealItems.mealLogId, mealLog.id))
+        .orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
+      return { kind: 'updated' as const, mealLog: updatedMealLog, items };
+    }, { isolationLevel: 'serializable' });
+    if (result.kind === 'not_found') return mealLogNotFound(reply, request);
+    if (result.kind === 'stale') return staleMealConfirmation(reply, request);
+    if (result.kind === 'invalid_state') return invalidMealLogState(reply, request);
     return await mealLogResponse(options.database, result.mealLog, result.items);
   });
+
   app.post('/api/meal-logs/:mealLogId/confirm', async (request, reply) => {
     const userId = await requireUserId(request, reply, options.auth);
     if (!userId) return;
+    if (!applyMealConfirmationCutover(request, reply, options)) return;
     const params = mealLogIdParamsSchema.safeParse(request.params);
     const body = confirmMealSchema.safeParse(request.body);
     if (!params.success || !body.success) return invalidRequest(reply, request);
@@ -681,13 +1154,31 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         .select(mealItemSelection)
         .from(mealItems)
         .where(eq(mealItems.mealLogId, mealLog.id))
-        .orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
+        .orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id))
+        .for('update');
       const [snapshot] = await tx
         .select(calculationSnapshotSelection)
         .from(calculationSnapshots)
         .where(eq(calculationSnapshots.mealLogId, mealLog.id))
         .orderBy(desc(calculationSnapshots.sequence))
         .limit(1);
+      const fingerprint = confirmationFingerprint(body.data);
+      if (mealLog.status === 'confirmed') {
+        const [idempotentSnapshot] = await tx
+          .select(calculationSnapshotSelection)
+          .from(calculationSnapshots)
+          .where(and(
+            eq(calculationSnapshots.mealLogId, mealLog.id),
+            eq(calculationSnapshots.confirmationIdempotencyKey, body.data.idempotencyKey),
+          ))
+          .limit(1);
+        if (idempotentSnapshot) {
+          return idempotentSnapshot.confirmationFingerprint === fingerprint
+            ? { kind: 'confirmed' as const, mealLog, items, snapshot: idempotentSnapshot }
+            : { kind: 'idempotency_reused' as const };
+        }
+        return { kind: 'idempotency_reused' as const };
+      }
 
       if (mealLog.status === 'draft' && mealLog.draftRevision !== body.data.expectedDraftRevision)
         return { kind: 'stale' as const, mealLog, items };
@@ -696,10 +1187,6 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         expectedItems.size !== items.length ||
         items.some((item) => expectedItems.get(item.id) !== item.itemRevision)
       ) return { kind: 'stale' as const, mealLog, items };
-      if (mealLog.status === 'confirmed')
-        return snapshot
-          ? { kind: 'confirmed' as const, mealLog, items, snapshot }
-          : { kind: 'invalid_state' as const };
       if (
         mealLog.recognitionStatus !== 'ready' &&
         mealLog.recognitionStatus !== 'manual'
@@ -710,19 +1197,51 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
           kind: 'invalid' as const,
           details: [{ code: 'EMPTY_MEAL' }],
         };
-      const authoritativeReview = await mealLogResponse(tx as unknown as Database, mealLog, items);
-      const policyBlockingReasons = authoritativeReview.review.reasons.filter(
-        (reason) => !resolutionReviewReasonCodes.has(reason.code),
+      const authorities = await Promise.all(
+        items.map((item) => projectCurrentItemAuthority(tx as unknown as Database, item)),
       );
-      if (policyBlockingReasons.length > 0)
+      if (authorities.some((authority, index) => {
+        const item = items[index]!;
+        return !authority.fingerprint ||
+          item.reviewedItemRevision !== item.itemRevision ||
+          item.reviewedAuthorityFingerprintVersion !== authority.fingerprintVersion ||
+          item.reviewedAuthorityFingerprint !== authority.fingerprint;
+      })) {
         return {
           kind: 'invalid' as const,
-          details: policyBlockingReasons,
+          details: [{ code: 'MEAL_ITEM_REVIEW_REQUIRED' }],
+        };
+      }
+      const resolutionTuple = await revalidateConfirmationResolutionTuples(
+        tx as unknown as Database,
+        mealLog.id,
+        items,
+        body.data.items,
+      );
+      if (resolutionTuple.stale)
+        return { kind: 'stale' as const, mealLog, items };
+      if (resolutionTuple.details.length > 0)
+        return { kind: 'stale' as const, mealLog, items };
+      const authoritativeReview = await mealLogResponse(tx as unknown as Database, mealLog, items);
+      if (!authoritativeReview.review.confirmable)
+        return {
+          kind: 'invalid' as const,
+          details: authoritativeReview.review.reasons,
         };
 
-      const resolvedNutrition = await calculateResolvedMealNutrition(tx, items);
+      const resolvedNutrition = await calculateResolvedMealNutrition(
+        tx,
+        items,
+        undefined,
+        resolutionTuple.previewsByItemId,
+      );
       if ('details' in resolvedNutrition) return { kind: 'invalid' as const, details: resolvedNutrition.details };
       const { nutrition, resolutionsByItemId } = resolvedNutrition;
+      if (!Object.values(nutrition.totals).some(
+        (total) => total.missingItemCount < items.length,
+      )) {
+        return { kind: 'invalid' as const, details: [{ code: 'NO_KNOWN_NUTRIENTS' }] };
+      }
 
       const now = new Date();
       const calculatedByItemId = new Map(
@@ -741,8 +1260,9 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
           mealLogId: mealLog.id,
           sequence: snapshot ? snapshot.sequence + 1 : 1,
           inputSnapshot: {
+            version: CALCULATION_INPUT_SNAPSHOT_V2,
             confirmationDecision: {
-              originalRecognition: isRecognitionResultV2(mealLog.recognitionResult) && mealLog.recognitionProvider && mealLog.recognitionModel && mealLog.recognitionPromptVersion && mealLog.recognitionSchemaVersion && mealLog.recognitionCompletedAt
+              originalRecognition: (isRecognitionResultV2(mealLog.recognitionResult) || isRecognitionResultV3(mealLog.recognitionResult)) && mealLog.recognitionProvider && mealLog.recognitionModel && mealLog.recognitionPromptVersion && mealLog.recognitionSchemaVersion && mealLog.recognitionCompletedAt
                 ? {
                     provider: mealLog.recognitionProvider,
                     model: mealLog.recognitionModel,
@@ -755,19 +1275,56 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
                     completedAt: mealLog.recognitionCompletedAt.toISOString(),
                   }
                 : null,
-              manualOverride: mealLog.recognitionManualOverride ?? null,
-              policy: {
-                version: MEAL_ESTIMATE_REVIEW_POLICY_VERSION,
-                activation: options.reviewPolicy.mode,
-                approvedReportSha256: options.reviewPolicy.approvedReportSha256 ?? null,
-                activeReportSha256: options.reviewPolicy.activeReportSha256 ?? null,
-                approvedReportVersion: options.reviewPolicy.approvedReportVersion ?? null,
-              },
+              manualOverride: mealLog.recognitionManualOverride
+                ? {
+                    fromStatus: mealLog.recognitionManualOverride.fromStatus,
+                    fromOutcome: mealLog.recognitionManualOverride.fromOutcome,
+                    decision: mealLog.recognitionManualOverride.decision,
+                    decidedAt: mealLog.recognitionManualOverride.decidedAt,
+                    decisionVersion:
+                      mealLog.recognitionManualOverride.decisionVersion,
+                  }
+                : null,
+              reviewProtocol: MEAL_CONFIRMATION_SAFE_REVIEW_PROTOCOL,
             },
             mealItems: items.map((item) => {
+              const authority = authorities.find(
+                (candidate) => candidate.itemId === item.id,
+              );
+              if (!authority?.fingerprint)
+                throw new Error('Confirmed item is missing review authority');
               const resolution = resolutionsByItemId.get(item.id)!;
-              const profile = resolution.profile!;
-              const serving = resolution.serving;
+              const previewValue =
+                resolutionTuple.previewsByItemId.get(item.id);
+              const preview = isCalculationPreviewIdentity(previewValue)
+                ? previewValue
+                : null;
+              const directLeaf =
+                preview?.basis === 'finished_profile'
+                  ? preview.leaves[0] ?? null
+                  : null;
+              const profile = directLeaf
+                ? {
+                    id: directLeaf.nutrientProfileId,
+                    sourceRegistryId: directLeaf.sourceRegistryId,
+                    sourceItemId: directLeaf.sourceItemId,
+                    datasetVersion: directLeaf.sourceReleaseVersion,
+                    qualityGrade: directLeaf.profileQualityGrade,
+                    ...directLeaf.nutrientProfile,
+                  }
+                : resolution.profile;
+              if (!profile && !preview)
+                throw new Error('Confirmed item is missing immutable provenance');
+              const serving = directLeaf?.servingId
+                ? {
+                    id: directLeaf.servingId,
+                    unit: item.unit,
+                    amountMilliunits: directLeaf.servingAmountMilliunits!,
+                    gramsMg: directLeaf.servingGramsMg!,
+                    sourceRegistryId: directLeaf.servingSourceRegistryId!,
+                    qualityGrade: directLeaf.servingQualityGrade!,
+                  }
+                : resolution.serving;
               const calculated = calculatedByItemId.get(item.id)!;
               return {
                 mealItemId: item.id,
@@ -777,25 +1334,25 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
                 itemRevision: item.itemRevision,
                 foodRevision: item.foodRevision,
                 portionRevision: item.portionRevision,
-                foodAcknowledgedRevision: item.foodAcknowledgedRevision,
-                portionAcknowledgedRevision: item.portionAcknowledgedRevision,
-                foodId: resolution.food!.id,
-                nutrientProfileId: profile.id,
+                foodId: item.foodId!,
+                nutrientProfileId: profile?.id ?? null,
                 amountMilliunits: item.amountMilliunits,
                 unit: item.unit,
                 gramsMg: calculated.gramsMg,
-                sourceRegistryId: profile.sourceRegistryId,
-                sourceItemId: profile.sourceItemId,
-                datasetVersion: profile.datasetVersion,
-                nutrientProfileQualityGrade: profile.qualityGrade,
-                nutrientProfile: {
-                  basisAmountMg: profile.basisAmountMg,
-                  energyMillicalories: profile.energyMillicalories!,
-                  carbohydrateMg: profile.carbohydrateMg!,
-                  proteinMg: profile.proteinMg!,
-                  fatMg: profile.fatMg!,
-                  fiberMg: profile.fiberMg,
-                },
+                sourceRegistryId: profile?.sourceRegistryId ?? null,
+                sourceItemId: profile?.sourceItemId ?? null,
+                datasetVersion: profile?.datasetVersion ?? null,
+                nutrientProfileQualityGrade: profile?.qualityGrade ?? null,
+                nutrientProfile: profile
+                  ? {
+                      basisAmountMg: profile.basisAmountMg,
+                      energyMillicalories: profile.energyMillicalories,
+                      carbohydrateMg: profile.carbohydrateMg,
+                      proteinMg: profile.proteinMg,
+                      fatMg: profile.fatMg,
+                      fiberMg: profile.fiberMg,
+                    }
+                  : null,
                 serving: serving && item.unit !== 'g'
                   ? {
                       id: serving.id,
@@ -806,15 +1363,46 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
                       qualityGrade: serving.qualityGrade,
                     }
                   : null,
-                nutrients: requireCompleteCoreNutrients(calculated.nutrients),
+                nutrients: calculated.nutrients,
+                ...(preview
+                  ? {
+                      calculationBasis: preview.basis,
+                      calculationLeaves: preview.leaves,
+                      calculationPreview: preview,
+                    }
+                  : {}),
+                checkpoint: {
+                  reviewedItemRevision: item.reviewedItemRevision!,
+                  reviewedAuthorityFingerprintVersion:
+                    item.reviewedAuthorityFingerprintVersion!,
+                  reviewedAuthorityFingerprint:
+                    item.reviewedAuthorityFingerprint!,
+                  reviewIdempotencyKey: item.reviewIdempotencyKey!,
+                  reviewRequestFingerprint: item.reviewRequestFingerprint!,
+                  reviewedAt: item.reviewedAt!.toISOString(),
+                },
+                authority: {
+                  fingerprintVersion: authority.fingerprintVersion,
+                  fingerprint: authority.fingerprint,
+                },
+                provenance: {
+                  calculationVersion: 'meal-nutrition-v1',
+                  sourceRegistryId: profile?.sourceRegistryId ?? null,
+                  sourceItemId: profile?.sourceItemId ?? null,
+                  datasetVersion: profile?.datasetVersion ?? null,
+                  nutrientProfileId: profile?.id ?? null,
+                },
               };
             }),
           },
-          energyMillicalories: nutrition.totals.energyMillicalories.value!,
-          carbohydrateMg: nutrition.totals.carbohydrateMg.value!,
-          proteinMg: nutrition.totals.proteinMg.value!,
-          fatMg: nutrition.totals.fatMg.value!,
+          energyMillicalories: nutrition.totals.energyMillicalories.value,
+          carbohydrateMg: nutrition.totals.carbohydrateMg.value,
+          proteinMg: nutrition.totals.proteinMg.value,
+          fatMg: nutrition.totals.fatMg.value,
           fiberMg: nutrition.totals.fiberMg.value,
+          nutrientEvidence: nutrition.totals,
+          confirmationIdempotencyKey: body.data.idempotencyKey,
+          confirmationFingerprint: fingerprint,
           calculationVersion: 'meal-nutrition-v1',
           calculatedAt: now,
         })
@@ -859,19 +1447,46 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     if (confirmed.kind === 'stale') {
       const latest = await findOwnedMealLog(options.database, params.data.mealLogId, userId);
       if (!latest) return mealLogNotFound(reply, request);
-      return await staleMealResponse(options.database, reply, request, 'MEAL_DRAFT_STALE', {
-        mealLog: latest,
-        items: await findMealItems(options.database, latest.id),
+      return reply.status(409).send({
+        error: {
+          code: 'STALE_MEAL_CONFIRMATION',
+          message: '식사 초안이 변경되어 확인할 수 없습니다.',
+          requestId: request.id,
+        },
+        latest: await mealLogResponse(
+          options.database,
+          latest,
+          await findMealItems(options.database, latest.id),
+        ),
       });
     }
     if (confirmed.kind === 'not_found') return mealLogNotFound(reply, request);
+    if (confirmed.kind === 'idempotency_reused') {
+      return reply.status(409).send({
+        error: {
+          code: 'IDEMPOTENCY_KEY_REUSED',
+          message: '동일한 확인 키에 다른 요청을 사용할 수 없습니다.',
+          requestId: request.id,
+        },
+      });
+    }
     if (confirmed.kind === 'invalid_state') return invalidMealLogState(reply, request);
     if (confirmed.kind === 'invalid')
       return invalidMealConfirmation(reply, request, confirmed.details);
-    return {
-      ...(await mealLogResponse(options.database, confirmed.mealLog, confirmed.items)),
-      nutrition: nutritionSnapshotResponse(confirmed.snapshot),
-    };
+    const response = confirmedMealSnapshotResponse(
+      confirmed.mealLog,
+      confirmed.snapshot,
+    );
+    if (!response) {
+      return reply.status(500).send({
+        error: {
+          code: 'CONFIRMED_MEAL_INTEGRITY_ERROR',
+          message: '확정된 식사 기록을 안전하게 읽을 수 없습니다.',
+          requestId: request.id,
+        },
+      });
+    }
+    return response;
   });
 
   app.delete(
@@ -879,6 +1494,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     async (request, reply) => {
       const userId = await requireUserId(request, reply, options.auth);
       if (!userId) return;
+      if (!applyMealConfirmationCutover(request, reply, options)) return;
       const params = mealItemIdParamsSchema.safeParse(request.params);
       const body = deleteMealItemSchema.safeParse(request.body);
       if (!params.success || !body.success) return invalidRequest(reply, request);
@@ -945,6 +1561,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
   app.delete('/api/meal-logs/:mealLogId', async (request, reply) => {
     const userId = await requireUserId(request, reply, options.auth);
     if (!userId) return;
+    if (!applyMealConfirmationCutover(request, reply, options)) return;
     const params = mealLogIdParamsSchema.safeParse(request.params);
     const body = expectedDraftRevisionSchema.safeParse(request.body);
     if (!params.success || !body.success) return invalidRequest(reply, request);
@@ -1015,7 +1632,6 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     if (!existing) return mealLogNotFound(reply, request);
     if (
       existing.status !== 'draft' ||
-      existing.recognitionStatus === 'ready' ||
       existing.recognitionStatus === 'manual' ||
       existing.recognitionStatus === 'processing' ||
       (existing.recognitionStatus === 'failed' && !existing.recognitionNextAttemptAt)
@@ -1036,6 +1652,17 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         .returning({ id: mealLogs.id });
       if (!advanced) return invalidMealLogState(reply, request);
     }
+    if (existing.recognitionStatus === 'ready' && existing.recognitionResult?.version === 3) {
+      const [observation] = await options.database.select({ id: storedObservations.id })
+        .from(storedObservations).where(eq(storedObservations.mealLogId, existing.id)).limit(1);
+      if (!observation) return invalidMealLogState(reply, request);
+      await options.database.update(resolutionAttempts)
+        .set({ nextAttemptAt: new Date(), updatedAt: new Date() })
+        .where(and(
+          eq(resolutionAttempts.storedObservationId, observation.id),
+          eq(resolutionAttempts.status, 'failed'),
+        ));
+    }
     const outcome = await options.recognitionCoordinator.recognize(existing.id, userId);
     const mealLog = await findOwnedMealLog(options.database, existing.id, userId);
     if (!mealLog) return mealLogNotFound(reply, request);
@@ -1045,6 +1672,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
   app.post('/api/meal-logs/:mealLogId/recognition/manual', async (request, reply) => {
     const userId = await requireUserId(request, reply, options.auth);
     if (!userId) return;
+    if (!applyMealConfirmationCutover(request, reply, options)) return;
     const params = mealLogIdParamsSchema.safeParse(request.params);
     const body = expectedDraftRevisionSchema.safeParse(request.body);
     if (!params.success || !body.success) return invalidRequest(reply, request);
@@ -1070,7 +1698,8 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       if (
         existing.recognitionStatus === 'ready' &&
         existing.recognitionManualOverride === null &&
-        isRecognitionResultV2(existing.recognitionResult) &&
+        (isRecognitionResultV2(existing.recognitionResult) ||
+          isRecognitionResultV3(existing.recognitionResult)) &&
         (existing.recognitionResult.outcome === 'no_food' ||
           existing.recognitionResult.outcome === 'insufficient_evidence')
       ) {
@@ -1113,7 +1742,8 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       }
       const manualOverride = {
         fromStatus: existing.recognitionStatus,
-        fromOutcome: isRecognitionResultV2(existing.recognitionResult)
+        fromOutcome: (isRecognitionResultV2(existing.recognitionResult) ||
+          isRecognitionResultV3(existing.recognitionResult))
           ? existing.recognitionResult.outcome
           : null,
         fromErrorCode: existing.recognitionLastErrorCode,
@@ -1180,7 +1810,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
 };
 async function sendRecognitionResponse(
   database: Database,
-  reviewPolicy: ReviewPolicyConfig,
+  reviewPolicy: ApiEnvironment['mealRecognition']['reviewPolicy'],
   reply: FastifyReply,
   mealLog: NonNullable<Awaited<ReturnType<typeof findOwnedMealLog>>>,
   items: Awaited<ReturnType<typeof findMealItems>>,
@@ -1200,6 +1830,20 @@ async function sendRecognitionResponse(
     return reply.status(202).send({
       ...(await buildMealLogResponse(database, mealLog, items, reviewPolicy)),
       recognitionOutcome,
+    });
+  }
+  if (
+    outcome.status === 'unavailable' &&
+    outcome.retryable &&
+    outcome.code === 'CATALOG_UNAVAILABLE'
+  ) {
+    reply.header('Retry-After', String(outcome.retryAfterSeconds ?? 60));
+    return reply.status(503).send({
+      error: {
+        code: 'CATALOG_UNAVAILABLE',
+        message: '식품 카탈로그를 일시적으로 사용할 수 없습니다.',
+        requestId: reply.request.id,
+      },
     });
   }
   return reply.status(createdStatus ?? 200).send({
@@ -1232,6 +1876,7 @@ const mealLogSelection = {
 };
 const mealItemSelection = {
   id: mealItems.id,
+  mealLogId: mealItems.mealLogId,
   recognizedLabel: mealItems.recognizedLabel,
   amountMilliunits: mealItems.amountMilliunits,
   unit: mealItems.unit,
@@ -1249,8 +1894,12 @@ const mealItemSelection = {
   itemRevision: mealItems.itemRevision,
   foodRevision: mealItems.foodRevision,
   portionRevision: mealItems.portionRevision,
-  foodAcknowledgedRevision: mealItems.foodAcknowledgedRevision,
-  portionAcknowledgedRevision: mealItems.portionAcknowledgedRevision,
+  reviewedItemRevision: mealItems.reviewedItemRevision,
+  reviewedAuthorityFingerprintVersion: mealItems.reviewedAuthorityFingerprintVersion,
+  reviewedAuthorityFingerprint: mealItems.reviewedAuthorityFingerprint,
+  reviewIdempotencyKey: mealItems.reviewIdempotencyKey,
+  reviewRequestFingerprint: mealItems.reviewRequestFingerprint,
+  reviewedAt: mealItems.reviewedAt,
 };
 const calculationSnapshotSelection = {
   id: calculationSnapshots.id,
@@ -1261,31 +1910,31 @@ const calculationSnapshotSelection = {
   proteinMg: calculationSnapshots.proteinMg,
   fatMg: calculationSnapshots.fatMg,
   fiberMg: calculationSnapshots.fiberMg,
+  confirmationFingerprint: calculationSnapshots.confirmationFingerprint,
   calculationVersion: calculationSnapshots.calculationVersion,
   calculatedAt: calculationSnapshots.calculatedAt,
 };
-function requireCompleteCoreNutrients(
-  nutrients: CalculatedNutritionValues,
-): {
-  energyMillicalories: number;
-  carbohydrateMg: number;
-  proteinMg: number;
-  fatMg: number;
-  fiberMg: number | null;
-} {
-  if (
-    nutrients.energyMillicalories === null ||
-    nutrients.carbohydrateMg === null ||
-    nutrients.proteinMg === null ||
-    nutrients.fatMg === null
-  )
-    throw new Error('Validated nutrient profile produced incomplete core nutrients');
+function confirmedMealSnapshotResponse(mealLog: any, snapshot: any) {
+  const parsed = parseCalculationInputSnapshot(snapshot.inputSnapshot);
+  if (!parsed) return null;
+  const projection = projectCalculationInputSnapshot(parsed);
   return {
-    energyMillicalories: nutrients.energyMillicalories,
-    carbohydrateMg: nutrients.carbohydrateMg,
-    proteinMg: nutrients.proteinMg,
-    fatMg: nutrients.fatMg,
-    fiberMg: nutrients.fiberMg,
+    mealLog: {
+      id: mealLog.id,
+      eatenAt: mealLog.eatenAt,
+      timezone: mealLog.timezone,
+      localDate: mealLog.localDate,
+      mealType: mealLog.mealType,
+      status: mealLog.status,
+      confirmedAt: mealLog.confirmedAt,
+    },
+    items: projection.mealItems,
+    review: {
+      confirmable: false,
+      evidence: projection.reviewEvidence,
+      reasons: [],
+    },
+    nutrition: nutritionSnapshotResponse(snapshot),
   };
 }
 function nutritionSnapshotResponse(
@@ -1302,24 +1951,28 @@ function nutritionSnapshotResponse(
     | 'calculatedAt'
   >,
 ) {
-  const items = snapshot.inputSnapshot.mealItems.map((item) => ({
-    mealItemId: item.mealItemId,
-    amountMilliunits: item.amountMilliunits,
-    unit: item.unit,
-    gramsMg: item.gramsMg,
-    nutrients: item.nutrients,
-    source: {
-      foodId: item.foodId,
-      nutrientProfileId: item.nutrientProfileId,
-      sourceRegistryId: item.sourceRegistryId,
-      sourceItemId: item.sourceItemId,
-      datasetVersion: item.datasetVersion,
-      qualityGrade: item.nutrientProfileQualityGrade,
-      servingId: item.serving?.id ?? null,
-      servingSourceRegistryId: item.serving?.sourceRegistryId ?? null,
-      servingQualityGrade: item.serving?.qualityGrade ?? null,
-    },
-  }));
+  const items = snapshot.inputSnapshot.mealItems.map((item) => {
+    const serving = snapshotServingSource(item.serving);
+    return {
+      mealItemId: item.mealItemId,
+      amountMilliunits: item.amountMilliunits,
+      unit: item.unit,
+      gramsMg: item.gramsMg,
+      nutrients: item.nutrients,
+      calculationPreview: item.calculationPreview ?? null,
+      source: {
+        foodId: item.foodId,
+        nutrientProfileId: item.nutrientProfileId,
+        sourceRegistryId: item.sourceRegistryId,
+        sourceItemId: item.sourceItemId,
+        datasetVersion: item.datasetVersion,
+        qualityGrade: item.nutrientProfileQualityGrade,
+        servingId: serving.id,
+        servingSourceRegistryId: serving.sourceRegistryId,
+        servingQualityGrade: serving.qualityGrade,
+      },
+    };
+  });
   const aggregate = (
     key: 'energyMillicalories' | 'carbohydrateMg' | 'proteinMg' | 'fatMg' | 'fiberMg',
     value: number | null,
@@ -1348,6 +2001,26 @@ function nutritionSnapshotResponse(
       fatMg: aggregate('fatMg', snapshot.fatMg),
       fiberMg: aggregate('fiberMg', snapshot.fiberMg),
     },
+  };
+}
+
+function snapshotServingSource(value: unknown) {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { id: null, sourceRegistryId: null, qualityGrade: null };
+  }
+  const serving = value as Record<string, unknown>;
+  return {
+    id: typeof serving.id === 'string' ? serving.id : null,
+    sourceRegistryId:
+      typeof serving.sourceRegistryId === 'string'
+        ? serving.sourceRegistryId
+        : null,
+    qualityGrade:
+      serving.qualityGrade === 'verified' ||
+      serving.qualityGrade === 'estimated' ||
+      serving.qualityGrade === 'unverified'
+        ? serving.qualityGrade
+        : null,
   };
 }
 
@@ -1395,6 +2068,171 @@ async function findMealItems(database: Database, mealLogId: string) {
     .where(eq(mealItems.mealLogId, mealLogId))
     .orderBy(asc(mealItems.recognitionRegionIndex), asc(mealItems.id));
 }
+
+async function projectCurrentItemAuthority(
+  database: Database,
+  item: Awaited<ReturnType<typeof findMealItems>>[number],
+) {
+  const [active] = await database
+    .select({
+      id: activeCatalogReleasePointers.activationId,
+      catalogReleaseId: releaseActivations.catalogReleaseId,
+    })
+    .from(activeCatalogReleasePointers)
+    .innerJoin(
+      releaseActivations,
+      eq(activeCatalogReleasePointers.activationId, releaseActivations.id),
+    )
+    .limit(1);
+  if (!active) return nullAuthority(item.id, 'STALE_AUTHORITY');
+  const [observation] = await database
+    .select({
+      id: storedObservations.id,
+      canonicalContent: storedObservations.canonicalContent,
+      contentSha256: storedObservations.contentSha256,
+    })
+    .from(storedObservations)
+    .where(eq(storedObservations.mealLogId, item.mealLogId))
+    .orderBy(desc(storedObservations.createdAt), desc(storedObservations.id))
+    .limit(1);
+  const localObservationId =
+    item.origin === 'model_estimate' && item.recognitionRegionIndex !== null
+      ? observationLocalId(observation?.canonicalContent, item.recognitionRegionIndex)
+      : `manual:${item.id}`;
+  if (!observation || !localObservationId) return nullAuthority(item.id);
+  const mappings = await database
+    .select({
+      id: mappingDecisions.id,
+      method: mappingDecisions.method,
+      selectedFoodId: mappingDecisions.selectedFoodId,
+      catalogReleaseId: mappingDecisions.catalogReleaseId,
+      releaseActivationId: mappingDecisions.releaseActivationId,
+      storedObservationId: mappingDecisions.storedObservationId,
+      localObservationId: mappingDecisions.localObservationId,
+    })
+    .from(mappingDecisions)
+    .where(and(
+      eq(mappingDecisions.storedObservationId, observation.id),
+      eq(mappingDecisions.localObservationId, localObservationId),
+    ))
+    .orderBy(desc(mappingDecisions.createdAt), desc(mappingDecisions.id));
+  const mapping = mappings[0];
+  if (!mapping || mapping.selectedFoodId !== item.foodId)
+    return nullAuthority(item.id);
+  if (
+    mapping.catalogReleaseId !== active.catalogReleaseId ||
+    mapping.releaseActivationId !== active.id
+  ) return nullAuthority(item.id, 'STALE_AUTHORITY');
+  const previews = await database
+    .select({
+      id: calculationPreviews.id,
+      contentSha256: calculationPreviews.contentSha256,
+      mealLogId: calculationPreviews.mealLogId,
+      rootMappingDecisionId: calculationPreviews.rootMappingDecisionId,
+      rootRevision: calculationPreviews.rootRevision,
+      catalogReleaseId: calculationPreviews.catalogReleaseId,
+      releaseActivationId: calculationPreviews.releaseActivationId,
+      identity: calculationPreviews.identity,
+    })
+    .from(calculationPreviews)
+    .where(and(
+      eq(calculationPreviews.mealLogId, item.mealLogId),
+      eq(calculationPreviews.rootMappingDecisionId, mapping.id),
+      eq(calculationPreviews.rootRevision, item.itemRevision),
+    ))
+    .orderBy(desc(calculationPreviews.createdAt), desc(calculationPreviews.id));
+  const preview = previews[0];
+  if (
+    !preview ||
+    preview.catalogReleaseId !== active.catalogReleaseId ||
+    preview.releaseActivationId !== active.id
+  ) return nullAuthority(item.id, 'STALE_AUTHORITY');
+  const decompositions = await database
+    .select({
+      id: mealDecompositionRevisions.id,
+      mealLogId: mealDecompositionRevisions.mealLogId,
+      rootMappingDecisionId: mealDecompositionRevisions.rootMappingDecisionId,
+      rootCalculationPreviewId: mealDecompositionRevisions.rootCalculationPreviewId,
+    })
+    .from(mealDecompositionRevisions)
+    .where(and(
+      eq(mealDecompositionRevisions.mealLogId, item.mealLogId),
+      eq(mealDecompositionRevisions.rootMappingDecisionId, mapping.id),
+      eq(mealDecompositionRevisions.rootCalculationPreviewId, preview.id),
+    ))
+    .orderBy(desc(mealDecompositionRevisions.revision), desc(mealDecompositionRevisions.id));
+  const decomposition = decompositions[0];
+  if (
+    !isPreviewIdentityCurrent(
+      preview.identity,
+      mapping.id,
+      item.itemRevision,
+      active.catalogReleaseId,
+      active.id,
+    ) ||
+    !await previewAuthorityFactsMatch(
+      database,
+      preview.identity,
+      active.catalogReleaseId,
+      active.id,
+      decomposition,
+    )
+  ) return nullAuthority(item.id, 'STALE_AUTHORITY');
+  const resolutions = await resolveCurrentMealItems(database, [item]);
+  const resolution = resolutions[0];
+  const gramsMg = item.gramsMg ??
+    (item.unit === 'g'
+      ? item.amountMilliunits
+      : resolution?.serving
+        ? servingAmountToGrams(
+            item.amountMilliunits,
+            resolution.serving.amountMilliunits,
+            resolution.serving.gramsMg,
+          )
+        : null);
+  if (!gramsMg) return nullAuthority(item.id, 'STALE_AUTHORITY');
+  return projectMealItemAuthority(catalogEligibilityAdapter(database), {
+    item: {
+      id: item.id,
+      revision: item.itemRevision,
+      foodId: item.foodId,
+      amountMilliunits: item.amountMilliunits,
+      unit: item.unit,
+      gramsMg,
+    },
+    activation: active,
+    mapping: {
+      method: mapping.method,
+      decisionId: mapping.id,
+      contentSha256: observation.contentSha256,
+    },
+    calculation: {
+      version: 'meal-nutrition-v1',
+      previewId: preview.id,
+      previewSha256: preview.contentSha256,
+      mealDecompositionRevisionId: decomposition?.id ?? null,
+      mealDecompositionSha256: null,
+    },
+  });
+}
+
+function nullAuthority(
+  itemId: string,
+  invalidReason: 'MISSING_FOOD_MAPPING' | 'STALE_AUTHORITY' = 'MISSING_FOOD_MAPPING',
+) {
+  return {
+    version: 'meal-item-authority-projection-v1' as const,
+    itemId,
+    selected: null,
+    officialSource: null,
+    invalidReason,
+    calculationIdentity: null,
+    canonicalFingerprintInput: null,
+    fingerprintVersion: MEAL_ITEM_REVIEW_FINGERPRINT_VERSION,
+    fingerprint: null,
+    canonicalFingerprintHash: null,
+  };
+}
 async function findOwnedDraftMealLogByImage(
   database: Database,
   imageAssetId: string,
@@ -1431,19 +2269,26 @@ async function buildMealLogResponse(
   database: Database,
   mealLog: any,
   items: any[],
-  reviewPolicy: ReviewPolicyConfig,
+  _reviewPolicy: ApiEnvironment['mealRecognition']['reviewPolicy'],
 ) {
   const resolutions = await resolveCurrentMealItems(database, items);
   const resolutionByItemId = new Map(resolutions.map((resolution) => [resolution.itemId, resolution]));
-  const recognition = isRecognitionResultV2(mealLog.recognitionResult)
+  const authorities = await Promise.all(
+    items.map((item) => projectCurrentItemAuthority(database, item)),
+  );
+  const authorityByItemId = new Map(
+    authorities.map((authority) => [authority.itemId, authority]),
+  );
+  const isV3Recognition = mealLog.recognitionResult?.version === 3;
+  const resolutionMetadata = isV3Recognition
+    ? await loadResolutionMetadata(database, mealLog.id, items)
+    : emptyResolutionMetadata();
+  const recognition = (
+    isRecognitionResultV2(mealLog.recognitionResult) ||
+    isRecognitionResultV3(mealLog.recognitionResult)
+  )
     ? mealLog.recognitionResult
     : null;
-  const imageQualityConfidenceBps = recognition?.imageQualityConfidenceBps ?? null;
-  const policy = {
-    version: MEAL_ESTIMATE_REVIEW_POLICY_VERSION,
-    activation: reviewPolicy.mode,
-    ...MEAL_ESTIMATE_REVIEW_THRESHOLDS,
-  } as const;
   const responseItems = items.map((item) => {
     const resolution = resolutionByItemId.get(item.id);
     const hardReasons = resolution?.reason ? [resolverReasonToReviewReason(resolution.reason)] : [];
@@ -1456,17 +2301,30 @@ async function buildMealLogResponse(
       hasTrustedServingConversion: item.unit === 'g' || !!resolution?.serving,
       hasCoreNutrients: !!resolution?.profile,
     };
-    const review = deriveItemReviewState({
-      origin: item.origin,
+    const authority = authorityByItemId.get(item.id)!;
+    const reviewed =
+      authority.fingerprint !== null &&
+      item.reviewedItemRevision === item.itemRevision &&
+      item.reviewedAuthorityFingerprintVersion === authority.fingerprintVersion &&
+      item.reviewedAuthorityFingerprint === authority.fingerprint;
+    const checkpoint = deriveCurrentItemReviewCheckpoint({
+      itemId: item.id,
       itemRevision: item.itemRevision,
-      foodRevision: item.foodRevision,
-      portionRevision: item.portionRevision,
-      foodAcknowledgedRevision: item.foodAcknowledgedRevision,
-      portionAcknowledgedRevision: item.portionAcknowledgedRevision,
-      initialEstimateAssessment: item.initialEstimateAssessment,
-      currentResolution,
-      imageQualityConfidenceBps,
-      policy,
+      selectedFoodId:
+        authority.invalidReason === 'MISSING_FOOD_MAPPING' ? null : item.foodId,
+      officialSourceRevision:
+        authority.invalidReason === 'STALE_AUTHORITY'
+          ? 1
+          : authority.officialSource
+            ? 1
+            : null,
+      currentOfficialSourceRevision:
+        authority.invalidReason === 'STALE_AUTHORITY'
+          ? 1
+          : authority.officialSource
+            ? 1
+            : null,
+      reviewedItemRevision: reviewed ? item.reviewedItemRevision : null,
     });
     return {
       ...item,
@@ -1483,43 +2341,42 @@ async function buildMealLogResponse(
         profile: resolution?.profile ?? null,
         serving: resolution?.serving ?? null,
       },
-      itemReview: review,
+      checkpoint,
     };
   });
-  const mealReview = deriveMealReviewState({
-    recognition,
-    recognitionStatus: mealLog.recognitionStatus,
-    manualOverride: mealLog.recognitionManualOverride ?? null,
-    items: responseItems.map((item) => ({ origin: item.origin, review: item.itemReview })),
-    policy,
-  });
-  const requiredReviewFields = responseItems.flatMap((item) => {
-    const fields = new Set<'food' | 'portion'>();
-    if (item.itemReview.foodReasons.length > 0) fields.add('food');
-    if (item.itemReview.portionReasons.length > 0) fields.add('portion');
-    if (policy.activation !== 'quick_confirm' && item.origin === 'model_estimate') {
-      if (!item.itemReview.foodAcknowledged) fields.add('food');
-      if (!item.itemReview.portionAcknowledged) fields.add('portion');
-    }
-    return fields.size === 0
-      ? []
-      : [{ itemId: item.id, fields: [...fields] }];
+  const mealCheckpoint = deriveMealConfirmability({
+    items: responseItems.map((item) => item.checkpoint),
   });
   const preview = await calculateResolvedMealNutrition(database, items, resolutions);
   const nutritionPreview = 'details' in preview
     ? null
     : nutritionPreviewResponse(preview.nutrition, resolutionByItemId);
-  type RecognizedFood =
-    Extract<RecognitionResultV2, { outcome: 'recognized' }>['foods'][number];
-  const recognizedFoodByRegion = new Map<number, RecognizedFood>(
-    recognition?.outcome === 'recognized'
-      ? recognition.foods.map(
-          (food: RecognizedFood) =>
-            [food.regionIndex, food] as const,
-        )
-      : [],
+  type RecognizedEstimate = {
+    regionIndex: number;
+    amountMilliunits: number;
+    unit: 'g' | 'ml' | 'serving' | 'bowl' | 'piece';
+  };
+  const recognizedEstimates: RecognizedEstimate[] =
+    recognition?.outcome !== 'recognized'
+      ? []
+      : isRecognitionResultV2(recognition)
+        ? recognition.foods
+        : recognition.observations
+            .filter(
+              (observation: { parentRegionIndex: number | null }) =>
+                observation.parentRegionIndex === null,
+            );
+  const recognizedFoodByRegion = new Map<number, RecognizedEstimate>(
+    recognizedEstimates.map((food) => [food.regionIndex, food] as const),
   );
   const publicItems = responseItems.map((item) => {
+    const authority = authorityByItemId.get(item.id)!;
+    const reviewed =
+      authority.fingerprint !== null &&
+      item.reviewedItemRevision === item.itemRevision &&
+      item.reviewedAuthorityFingerprintVersion === authority.fingerprintVersion &&
+      item.reviewedAuthorityFingerprint === authority.fingerprint;
+    const metadata = resolutionMetadata.byItemId.get(item.id);
     const originalEstimate =
       item.origin === 'model_estimate' && item.recognitionRegionIndex !== null
         ? recognizedFoodByRegion.get(item.recognitionRegionIndex)
@@ -1545,14 +2402,45 @@ async function buildMealLogResponse(
       itemRevision: item.itemRevision,
       foodRevision: item.foodRevision,
       portionRevision: item.portionRevision,
-      foodAcknowledgedRevision: item.foodAcknowledgedRevision,
-      portionAcknowledgedRevision: item.portionAcknowledgedRevision,
+      review: {
+        status: reviewed ? 'current' as const : 'required' as const,
+        checkpointStatus: item.checkpoint,
+        checkpoint: item.reviewedAt
+          ? {
+              reviewedItemRevision: item.reviewedItemRevision,
+              authorityFingerprintVersion: item.reviewedAuthorityFingerprintVersion,
+              authorityFingerprint: item.reviewedAuthorityFingerprint,
+              reviewedAt: item.reviewedAt,
+            }
+          : null,
+        authority: {
+          fingerprintVersion: authority.fingerprintVersion,
+          fingerprint: authority.fingerprint,
+          officialSource: authority.officialSource,
+          invalidReason: authority.invalidReason,
+        },
+        nextAction: reviewed ? null : 'review_item',
+      },
       currentResolution: {
         status: item.currentResolution.status,
         reason: item.currentResolution.reason,
+        observationId: metadata?.observationId ?? null,
+        decisionId: metadata?.decisionId ?? null,
+        previewId: metadata?.previewId ?? null,
+        decompositionRevisionId: metadata?.decompositionRevisionId ?? null,
+        composition: metadata?.decompositionRevisionId
+          ? 'meal_decomposition'
+          : metadata?.previewId
+            ? 'finished_profile'
+            : null,
+        resolutionStatus: metadata?.resolutionStatus ?? null,
+        resolutionReason: metadata?.resolutionReason ?? null,
+        resolutionRetryAt: metadata?.resolutionRetryAt ?? null,
+        candidates: metadata?.candidates ?? [],
       },
     };
   });
+  const reviewedNutrition = reviewedNutritionSummary(items, authorityByItemId);
   return {
     mealLog: {
       id: mealLog.id,
@@ -1590,38 +2478,340 @@ async function buildMealLogResponse(
             changedFields: mealLog.recognitionManualOverride.changedFields,
           }
         : null,
+      observationId: resolutionMetadata.observationId,
+      resolutionStatus: resolutionMetadata.status,
+      resolutionReason: resolutionMetadata.reason,
+      resolutionRetryAt: resolutionMetadata.retryAt,
     },
     items: publicItems,
+    recommendedNextItemId:
+      publicItems.find((item) => item.review.status !== 'current')?.id ?? null,
     review: {
-      confirmable: mealReview.reasons.length === 0,
-      reasons: [
-        ...mealReview.reasons
-          .filter((code) =>
-            code === 'NO_FOOD_DETECTED' ||
-            code === 'INSUFFICIENT_IMAGE_EVIDENCE' ||
-            code === 'QUICK_CONFIRM_POLICY_DISABLED' ||
-            code === 'EMPTY_MEAL')
-          .map((code) => ({ code, itemId: null })),
-        ...responseItems.flatMap((item) =>
-          item.itemReview.reasons.map((code: string) => ({ code, itemId: item.id }))),
-      ],
-      requiredReviewFields,
+      confirmable: mealCheckpoint.confirmable,
+      nextAction: mealCheckpoint.nextAction,
+      nextItemId: mealCheckpoint.nextItemId,
+      reasons: responseItems.flatMap((item) => {
+        if (item.checkpoint.nextAction === 'none') return [];
+        return [{
+          code: item.checkpoint.nextAction === 'select_item'
+            ? 'FOOD_MAPPING_MISSING'
+            : item.checkpoint.nextAction === 'refresh_official_source'
+              ? 'OFFICIAL_SOURCE_MISSING'
+              : authorityByItemId.get(item.id)?.invalidReason === 'STALE_AUTHORITY'
+                ? 'MEAL_ITEM_AUTHORITY_STALE'
+                : 'MEAL_ITEM_REVIEW_REQUIRED',
+          itemId: item.id,
+        }];
+      }),
       nutrition: nutritionPreview,
+      reviewedNutrition,
     },
   };
+}
+
+function reviewedNutritionSummary(
+  items: Awaited<ReturnType<typeof findMealItems>>,
+  authorityByItemId: Map<string, Awaited<ReturnType<typeof projectCurrentItemAuthority>>>,
+) {
+  const inputs = items.map((item) => {
+    const authority = authorityByItemId.get(item.id);
+    const reviewed =
+      authority !== undefined &&
+      item.reviewedItemRevision === item.itemRevision &&
+      item.reviewedAuthorityFingerprintVersion === authority.fingerprintVersion &&
+      item.reviewedAuthorityFingerprint === authority.fingerprint;
+    if (!authority?.selected) {
+      return {
+        mealItemId: item.id,
+        amountMilliunits: 1,
+        unit: 'g' as const,
+        nutrientProfile: {
+          basisAmountMg: 1,
+          energyMillicalories: null,
+          carbohydrateMg: null,
+          proteinMg: null,
+          fatMg: null,
+          fiberMg: null,
+        },
+        userReview: 'unreviewed' as const,
+      };
+    }
+    return {
+      mealItemId: item.id,
+      amountMilliunits: item.amountMilliunits,
+      unit: item.unit,
+      nutrientProfile: {
+        basisAmountMg: authority.selected.profile.basisAmountMg,
+        energyMillicalories: authority.selected.profile.energyMillicalories,
+        carbohydrateMg: authority.selected.profile.carbohydrateMg,
+        proteinMg: authority.selected.profile.proteinMg,
+        fatMg: authority.selected.profile.fatMg,
+        fiberMg: authority.selected.profile.fiberMg,
+      },
+      ...(authority.selected.serving &&
+      authority.selected.serving.unit !== 'g'
+        ? {
+            serving: {
+              ...authority.selected.serving,
+              unit: authority.selected.serving.unit,
+            },
+          }
+        : {}),
+      userReview: reviewed ? 'current' as const : 'unreviewed' as const,
+    };
+  });
+  return calculateReviewedMealNutrition(inputs);
+}
+
+type ResolutionMetadata = {
+  observationId: string | null;
+  status: 'pending' | 'processing' | 'resolved' | 'failed' | null;
+  reason: string | null;
+  retryAt: Date | null;
+  byItemId: Map<string, {
+    observationId: string;
+    decisionId: string | null;
+    previewId: string | null;
+    decompositionRevisionId: string | null;
+    resolutionStatus: 'pending' | 'processing' | 'resolved' | 'failed' | null;
+    resolutionReason: string | null;
+    resolutionRetryAt: Date | null;
+    candidates: Array<{
+      foodId: string;
+      labelKo: string;
+      scoreBps: number;
+      availability: 'available' | 'unavailable' | 'unknown';
+      reason: string | null;
+    }>;
+  }>;
+};
+
+function emptyResolutionMetadata(): ResolutionMetadata {
+  return {
+    observationId: null,
+    status: null,
+    reason: null,
+    retryAt: null,
+    byItemId: new Map(),
+  };
+}
+
+/** Read-only hydration of immutable V3 resolution provenance for draft responses. */
+async function loadResolutionMetadata(
+  database: Database,
+  mealLogId: string,
+  items: Array<{ id: string; recognitionRegionIndex: number | null }>,
+): Promise<ResolutionMetadata> {
+  const [observation] = await database
+    .select({ id: storedObservations.id, canonicalContent: storedObservations.canonicalContent })
+    .from(storedObservations)
+    .where(eq(storedObservations.mealLogId, mealLogId))
+    .limit(1);
+  if (!observation) return emptyResolutionMetadata();
+
+  const [attempt] = await database
+    .select({
+      status: resolutionAttempts.status,
+      lastErrorCode: resolutionAttempts.lastErrorCode,
+      nextAttemptAt: resolutionAttempts.nextAttemptAt,
+    })
+    .from(resolutionAttempts)
+    .where(eq(resolutionAttempts.storedObservationId, observation.id))
+    .limit(1);
+  const decisions = await database
+    .select({
+      id: mappingDecisions.id,
+      localObservationId: mappingDecisions.localObservationId,
+      candidates: mappingDecisions.candidates,
+      evidence: mappingDecisions.evidence,
+      createdAt: mappingDecisions.createdAt,
+    })
+    .from(mappingDecisions)
+    .where(eq(mappingDecisions.storedObservationId, observation.id))
+    .orderBy(desc(mappingDecisions.createdAt), desc(mappingDecisions.id));
+  const latestDecisionByLocalId = new Map<string, (typeof decisions)[number]>();
+  for (const decision of decisions) {
+    if (!latestDecisionByLocalId.has(decision.localObservationId)) {
+      latestDecisionByLocalId.set(decision.localObservationId, decision);
+    }
+  }
+  const decisionIds = [...latestDecisionByLocalId.values()].map((decision) => decision.id);
+  const previews = decisionIds.length === 0
+    ? []
+    : await database
+      .select({
+        id: calculationPreviews.id,
+        rootMappingDecisionId: calculationPreviews.rootMappingDecisionId,
+        createdAt: calculationPreviews.createdAt,
+      })
+      .from(calculationPreviews)
+      .where(inArray(calculationPreviews.rootMappingDecisionId, decisionIds))
+      .orderBy(desc(calculationPreviews.createdAt), desc(calculationPreviews.id));
+  const previewByDecisionId = new Map<string, string>();
+  for (const preview of previews) {
+    if (!previewByDecisionId.has(preview.rootMappingDecisionId)) {
+      previewByDecisionId.set(preview.rootMappingDecisionId, preview.id);
+    }
+  }
+  const previewIds = [...previewByDecisionId.values()];
+  const decompositions = previewIds.length === 0
+    ? []
+    : await database
+      .select({
+        id: mealDecompositionRevisions.id,
+        rootCalculationPreviewId: mealDecompositionRevisions.rootCalculationPreviewId,
+        revision: mealDecompositionRevisions.revision,
+      })
+      .from(mealDecompositionRevisions)
+      .where(and(
+        eq(mealDecompositionRevisions.mealLogId, mealLogId),
+        inArray(mealDecompositionRevisions.rootCalculationPreviewId, previewIds),
+      ))
+      .orderBy(desc(mealDecompositionRevisions.revision));
+  const decompositionByPreviewId = new Map<string, string>();
+  for (const decomposition of decompositions) {
+    if (!decompositionByPreviewId.has(decomposition.rootCalculationPreviewId))
+      decompositionByPreviewId.set(decomposition.rootCalculationPreviewId, decomposition.id);
+  }
+  const status = attempt?.status ?? null;
+  const reason = attempt?.lastErrorCode ?? null;
+  const retryAt = attempt?.nextAttemptAt ?? null;
+  const localIdByRegion = new Map<number, string>();
+  const canonical = observation.canonicalContent as {
+    version?: number;
+    observations?: Array<{ regionIndex: number; localObservationId: string }>;
+  };
+  if (canonical.version === 3) {
+    for (const entry of canonical.observations ?? []) localIdByRegion.set(entry.regionIndex, entry.localObservationId);
+  }
+  return {
+    observationId: observation.id,
+    status,
+    reason,
+    retryAt,
+    byItemId: new Map(items.map((item) => {
+      const localObservationId =
+        item.recognitionRegionIndex === null
+          ? `manual:${item.id}`
+          : localIdByRegion.get(item.recognitionRegionIndex) ?? '';
+      const decision =
+        latestDecisionByLocalId.get(localObservationId) ?? null;
+      return [item.id, {
+        observationId: observation.id,
+        decisionId: decision?.id ?? null,
+        previewId: decision ? previewByDecisionId.get(decision.id) ?? null : null,
+        decompositionRevisionId: decision
+          ? decompositionByPreviewId.get(previewByDecisionId.get(decision.id) ?? '') ?? null
+          : null,
+        resolutionStatus: status,
+        resolutionReason: reason,
+        resolutionRetryAt: retryAt,
+        candidates: decision ? publicResolutionCandidates(decision) : [],
+      }];
+    })),
+  };
+}
+
+function publicResolutionCandidates(decision: {
+  candidates: unknown;
+  evidence: unknown;
+}): Array<{
+  foodId: string;
+  labelKo: string;
+  scoreBps: number;
+  availability: 'available' | 'unavailable' | 'unknown';
+  reason: string | null;
+}> {
+  const candidates = Array.isArray(decision.candidates)
+    ? decision.candidates
+    : [];
+  const assessments =
+    decision.evidence &&
+    typeof decision.evidence === 'object' &&
+    !Array.isArray(decision.evidence) &&
+    Array.isArray(
+      (decision.evidence as { candidateAssessment?: unknown })
+        .candidateAssessment,
+    )
+      ? (decision.evidence as { candidateAssessment: unknown[] })
+          .candidateAssessment
+      : [];
+  return candidates.flatMap((candidate) => {
+    if (
+      !candidate ||
+      typeof candidate !== 'object' ||
+      Array.isArray(candidate)
+    )
+      return [];
+    const value = candidate as Record<string, unknown>;
+    if (
+      typeof value.foodId !== 'string' ||
+      typeof value.displayTextKo !== 'string' ||
+      !Number.isInteger(value.scoreBps)
+    )
+      return [];
+    const assessment = assessments.find(
+      (entry) =>
+        entry !== null &&
+        typeof entry === 'object' &&
+        !Array.isArray(entry) &&
+        (entry as { foodId?: unknown }).foodId === value.foodId,
+    ) as
+      | {
+          availability?: unknown;
+          reason?: unknown;
+        }
+      | undefined;
+    const availability: 'available' | 'unavailable' | 'unknown' =
+      assessment?.availability === 'available' ||
+      assessment?.availability === 'unavailable'
+        ? assessment.availability
+        : 'unknown';
+    return [{
+      foodId: value.foodId,
+      labelKo: value.displayTextKo,
+      scoreBps: value.scoreBps as number,
+      availability,
+      reason:
+        availability === 'unavailable' &&
+        typeof assessment?.reason === 'string'
+          ? assessment.reason
+          : null,
+    }];
+  }).slice(0, 8);
 }
 async function calculateResolvedMealNutrition(
   database: Parameters<typeof resolveCurrentMealItems>[0],
   items: any[],
   resolvedItems?: Awaited<ReturnType<typeof resolveCurrentMealItems>>,
+  previewsByItemId = new Map<string, unknown>(),
 ) {
   const resolutions = resolvedItems ?? await resolveCurrentMealItems(database, items);
   const details = resolutions.flatMap((resolution) =>
-    resolution.reason === null ? [] : [{ itemId: resolution.itemId, code: resolution.reason }],
+    resolution.reason === null ||
+      isCalculationPreviewIdentity(previewsByItemId.get(resolution.itemId))
+      ? []
+      : [{ itemId: resolution.itemId, code: resolution.reason }],
   );
   if (details.length > 0) return { details };
   const resolutionsByItemId = new Map(resolutions.map((resolution) => [resolution.itemId, resolution]));
-  const inputs: MealNutritionInput[] = items.map((item) => {
+  const compositeRoots = new Map<string, Array<{ mealItemId: string; amountMilliunits: number; unit: 'g'; nutrientProfile: any }>>();
+  const inputs: MealNutritionInput[] = items.flatMap((item) => {
+    const identity = previewsByItemId.get(item.id);
+    if (isCalculationPreviewIdentity(identity)) {
+      const leaves = identity.leaves.map((leaf) => ({
+        mealItemId:
+          identity.basis === 'finished_profile'
+            ? item.id
+            : `${item.id}:${leaf.ordinal}`,
+        amountMilliunits: leaf.edibleAmountMg,
+        unit: 'g' as const,
+        nutrientProfile: leaf.nutrientProfile,
+      }));
+      if (identity.basis !== 'finished_profile')
+        compositeRoots.set(item.id, leaves);
+      return leaves;
+    }
     const resolution = resolutionsByItemId.get(item.id)!;
     const profile = resolution.profile!;
     const base = {
@@ -1637,9 +2827,9 @@ async function calculateResolvedMealNutrition(
         fiberMg: profile.fiberMg,
       },
     };
-    if (item.unit === 'g') return base;
+    if (item.unit === 'g') return [base];
     const serving = resolution.serving!;
-    return {
+    return [{
       ...base,
       serving: {
         id: serving.id,
@@ -1649,10 +2839,31 @@ async function calculateResolvedMealNutrition(
         sourceRegistryId: serving.sourceRegistryId,
         qualityGrade: serving.qualityGrade,
       },
-    };
+    }];
   });
   try {
-    return { nutrition: calculateMealNutrition(inputs), resolutionsByItemId };
+    const leafNutrition = calculateMealNutrition(inputs);
+    if (compositeRoots.size === 0)
+      return { nutrition: leafNutrition, resolutionsByItemId };
+    const byLeafId = new Map(leafNutrition.items.map((item) => [item.mealItemId, item]));
+    const rootItems = items.map((item) => {
+      const leaves = compositeRoots.get(item.id);
+      if (!leaves) return byLeafId.get(item.id)!;
+      const leafValues = leaves.map((leaf) => byLeafId.get(leaf.mealItemId)!);
+      return {
+        mealItemId: item.id,
+        gramsMg: leafValues.reduce((total, leaf) => total + leaf.gramsMg, 0),
+        nutrients: Object.fromEntries(nutritionKeysForComposition.map((key) => {
+          const values = leafValues.map((leaf) => leaf.nutrients[key]);
+          if (values.some((value) => value === null)) return [key, null];
+          return [
+            key,
+            values.reduce<number>((total, value) => total + (value ?? 0), 0),
+          ];
+        })) as any,
+      };
+    });
+    return { nutrition: { ...leafNutrition, items: rootItems }, resolutionsByItemId };
   } catch (error) {
     return {
       details: [{
@@ -1660,6 +2871,525 @@ async function calculateResolvedMealNutrition(
       }],
     };
   }
+}
+
+const nutritionKeysForComposition = [
+  'energyMillicalories',
+  'carbohydrateMg',
+  'proteinMg',
+  'fatMg',
+  'fiberMg',
+] as const;
+
+function isCompositePreviewIdentity(value: unknown): value is {
+  basis: 'source_recipe' | 'meal_decomposition';
+  leaves: Array<{
+    ordinal: number;
+    foodId: string;
+    edibleAmountMg: number;
+    nutrientProfile: MealNutritionInput['nutrientProfile'];
+  }>;
+} {
+  return !!value &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    (((value as { basis?: unknown }).basis === 'source_recipe') ||
+      ((value as { basis?: unknown }).basis === 'meal_decomposition')) &&
+    Array.isArray((value as { leaves?: unknown }).leaves);
+}
+
+function isCalculationPreviewIdentity(
+  value: unknown,
+): value is CalculationPreviewIdentity {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    ['finished_profile', 'source_recipe', 'meal_decomposition'].includes(
+      String((value as { basis?: unknown }).basis),
+    ) &&
+    Array.isArray((value as { leaves?: unknown }).leaves)
+  );
+}
+
+function confirmationFingerprint(input: z.infer<typeof confirmMealSchema>): string {
+  const items = [...input.items]
+    .map((item) => ({
+      itemId: item.itemId,
+      expectedItemRevision: item.expectedItemRevision,
+      mappingDecisionId: item.mappingDecisionId ?? null,
+      calculationPreviewId: item.calculationPreviewId ?? null,
+      decompositionRevisionId: item.decompositionRevisionId ?? null,
+    }))
+    .sort((left, right) => left.itemId.localeCompare(right.itemId));
+  return createHash('sha256')
+    .update(JSON.stringify({ expectedDraftRevision: input.expectedDraftRevision, items }))
+    .digest('hex');
+}
+
+function hash(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function observationLocalId(content: unknown, regionIndex: number): string | null {
+  if (!content || typeof content !== 'object' || Array.isArray(content)) return null;
+  const canonical = content as { version?: unknown; observations?: unknown };
+  if (canonical.version !== 3 || !Array.isArray(canonical.observations)) return null;
+  const observation = canonical.observations.find((entry) =>
+    entry !== null &&
+    typeof entry === 'object' &&
+    !Array.isArray(entry) &&
+    (entry as { regionIndex?: unknown }).regionIndex === regionIndex,
+  ) as { localObservationId?: unknown } | undefined;
+  return typeof observation?.localObservationId === 'string'
+    ? observation.localObservationId
+    : null;
+}
+
+function previewLeaf(
+  componentIdentity: string,
+  ordinal: number,
+  edibleAmountMg: number,
+  unit: 'g' | 'ml' | 'serving' | 'bowl' | 'piece',
+  selection: Awaited<ReturnType<typeof selectTrustedNutrition>> & { kind: 'selected' },
+) {
+  return {
+    ordinal,
+    componentIdentity,
+    foodId: selection.food.id,
+    edibleAmountMg,
+    unit,
+    nutrientProfileId: selection.profile.id,
+    sourceItemId: selection.profile.sourceItemId,
+    profileQualityGrade: selection.profile.qualityGrade,
+    servingId: unit === 'g' ? null : selection.serving?.id ?? null,
+    servingAmountMilliunits:
+      unit === 'g' ? null : selection.serving?.amountMilliunits ?? null,
+    servingGramsMg:
+      unit === 'g' ? null : selection.serving?.gramsMg ?? null,
+    servingSourceRegistryId:
+      unit === 'g' ? null : selection.serving?.sourceRegistryId ?? null,
+    servingQualityGrade:
+      unit === 'g' ? null : selection.serving?.qualityGrade ?? null,
+    sourceRegistryId: selection.profile.sourceRegistryId,
+    sourceReleaseId: selection.provenance.sourceReleaseId,
+    sourceReleaseVersion: selection.provenance.sourceReleaseVersion,
+    catalogReleaseId: selection.provenance.catalogReleaseId,
+    catalogManifestSha256: selection.provenance.catalogManifestSha256,
+    nutrientProfile: {
+      basisAmountMg: selection.profile.basisAmountMg,
+      energyMillicalories: selection.profile.energyMillicalories,
+      carbohydrateMg: selection.profile.carbohydrateMg,
+      proteinMg: selection.profile.proteinMg,
+      fatMg: selection.profile.fatMg,
+      fiberMg: selection.profile.fiberMg,
+    },
+  };
+}
+
+function servingAmountToGrams(
+  amountMilliunits: number,
+  servingAmountMilliunits: number | undefined,
+  servingGramsMg: number | undefined,
+): number | null {
+  if (!servingAmountMilliunits || !servingGramsMg) return null;
+  const value = (BigInt(amountMilliunits) * BigInt(servingGramsMg) + BigInt(servingAmountMilliunits) / 2n)
+    / BigInt(servingAmountMilliunits);
+  return value > 0n && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : null;
+}
+
+/**
+ * V3 resolution artifacts are immutable, but their IDs alone are not a
+ * confirmation contract.  Re-read the exact root tuple while the draft and
+ * roots are locked.  Legacy/manual rows have no V3 root decision and continue
+ * through the existing persisted food/profile tuple.
+ */
+async function revalidateConfirmationResolutionTuples(
+  database: Database,
+  mealLogId: string,
+  roots: Array<{ id: string; recognitionRegionIndex: number | null; itemRevision: number }>,
+  requested: Array<{
+    itemId: string;
+    mappingDecisionId?: string | undefined;
+    calculationPreviewId?: string | undefined;
+    decompositionRevisionId?: string | undefined;
+  }>,
+) {
+  const details: Array<{ itemId: string; code: string }> = [];
+  const previewsByItemId = new Map<string, unknown>();
+  const requestedByItemId = new Map(requested.map((item) => [item.itemId, item]));
+  const [observation] = await database
+    .select({
+      id: storedObservations.id,
+      canonicalContent: storedObservations.canonicalContent,
+      contentSha256: storedObservations.contentSha256,
+    })
+    .from(storedObservations)
+    .where(eq(storedObservations.mealLogId, mealLogId))
+    .for('update')
+    .limit(1);
+  const localIdByRegion = new Map<number, string>();
+  const canonical = observation?.canonicalContent as {
+    version?: number;
+    observations?: Array<{ regionIndex: number; localObservationId: string }>;
+  } | undefined;
+  if (canonical?.version === 3) {
+    for (const entry of canonical.observations ?? [])
+      localIdByRegion.set(entry.regionIndex, entry.localObservationId);
+  } else {
+    return {
+      details,
+      previewsByItemId,
+      stale: roots.length > 0,
+    };
+  }
+  const [active] = await database
+    .select({ activationId: activeCatalogReleasePointers.activationId })
+    .from(activeCatalogReleasePointers)
+    .for('update')
+    .limit(1);
+  if (!active) return { details, previewsByItemId, stale: true };
+  const localIdForRoot = (root: (typeof roots)[number]) =>
+    root.recognitionRegionIndex === null
+      ? `manual:${root.id}`
+      : localIdByRegion.get(root.recognitionRegionIndex) ?? null;
+  if (roots.some((root) => localIdForRoot(root) === null))
+    return { details, previewsByItemId, stale: true };
+  const rootLocalIds = roots.map((root) => localIdForRoot(root)!);
+  if (rootLocalIds.length === 0) return { details, previewsByItemId, stale: false };
+  const decisions = await database
+    .select({
+      id: mappingDecisions.id,
+      localObservationId: mappingDecisions.localObservationId,
+      catalogReleaseId: mappingDecisions.catalogReleaseId,
+      releaseActivationId: mappingDecisions.releaseActivationId,
+      selectedFoodId: mappingDecisions.selectedFoodId,
+      status: mappingDecisions.status,
+    })
+    .from(mappingDecisions)
+    .innerJoin(storedObservations, eq(mappingDecisions.storedObservationId, storedObservations.id))
+    .where(and(
+      eq(storedObservations.mealLogId, mealLogId),
+      inArray(mappingDecisions.localObservationId, rootLocalIds),
+    ))
+    .orderBy(desc(mappingDecisions.createdAt), desc(mappingDecisions.id))
+    .for('update');
+  const decisionByLocalId = new Map<string, (typeof decisions)[number]>();
+  for (const decision of decisions) {
+    // A newer decision supersedes the tuple visible to the user.  Multiple
+    // historical decisions are therefore stale rather than interchangeable.
+    if (!decisionByLocalId.has(decision.localObservationId))
+      decisionByLocalId.set(decision.localObservationId, decision);
+  }
+  for (const root of roots) {
+    const decision = decisionByLocalId.get(localIdForRoot(root)!);
+    if (
+      !decision ||
+      decision.status !== 'selected' ||
+      !decision.selectedFoodId ||
+      decision.releaseActivationId !== active.activationId
+    )
+      return { details, previewsByItemId, stale: true };
+    const tuple = requestedByItemId.get(root.id);
+    if (
+      !tuple?.mappingDecisionId ||
+      !tuple.calculationPreviewId ||
+      tuple.mappingDecisionId !== decision.id
+    ) {
+      details.push({ itemId: root.id, code: 'RESOLUTION_TUPLE_STALE' });
+      continue;
+    }
+    const [preview] = await database
+      .select({
+        id: calculationPreviews.id,
+        rootMappingDecisionId: calculationPreviews.rootMappingDecisionId,
+        rootRevision: calculationPreviews.rootRevision,
+        catalogReleaseId: calculationPreviews.catalogReleaseId,
+        releaseActivationId: calculationPreviews.releaseActivationId,
+        discriminant: calculationPreviews.discriminant,
+        identity: calculationPreviews.identity,
+      })
+      .from(calculationPreviews)
+      .where(and(
+        eq(calculationPreviews.id, tuple.calculationPreviewId),
+        eq(calculationPreviews.mealLogId, mealLogId),
+        eq(calculationPreviews.rootMappingDecisionId, decision.id),
+      ))
+      .for('update')
+      .limit(1);
+    if (
+      !preview ||
+      !isPreviewIdentityCurrent(preview.identity, decision.id, root.itemRevision, decision.catalogReleaseId, decision.releaseActivationId) ||
+      preview.rootRevision !== root.itemRevision ||
+      preview.catalogReleaseId !== decision.catalogReleaseId ||
+      preview.releaseActivationId !== decision.releaseActivationId
+    ) {
+      details.push({ itemId: root.id, code: 'CALCULATION_PREVIEW_STALE' });
+      continue;
+    }
+    const currentPreview = await database
+      .select({ id: calculationPreviews.id })
+      .from(calculationPreviews)
+      .where(and(
+        eq(calculationPreviews.mealLogId, mealLogId),
+        eq(calculationPreviews.rootMappingDecisionId, decision.id),
+        eq(calculationPreviews.rootRevision, root.itemRevision),
+      ))
+      .orderBy(desc(calculationPreviews.createdAt), desc(calculationPreviews.id))
+      .for('update')
+      .limit(1);
+    if (currentPreview[0]?.id !== preview.id) {
+      return { details, previewsByItemId, stale: true };
+    }
+    const previewIdentity = preview.identity as { basis?: string };
+    if (
+      (previewIdentity.basis === 'meal_decomposition' && !tuple.decompositionRevisionId) ||
+      (previewIdentity.basis !== 'meal_decomposition' && tuple.decompositionRevisionId)
+    ) {
+      return { details, previewsByItemId, stale: true };
+    }
+    if (isCompositePreviewIdentity(preview.identity))
+      previewsByItemId.set(root.id, preview.identity);
+    if (!tuple.decompositionRevisionId) continue;
+    const [decomposition] = await database
+      .select({
+        id: mealDecompositionRevisions.id,
+        rootMappingDecisionId: mealDecompositionRevisions.rootMappingDecisionId,
+        rootCalculationPreviewId: mealDecompositionRevisions.rootCalculationPreviewId,
+      })
+      .from(mealDecompositionRevisions)
+      .where(and(
+        eq(mealDecompositionRevisions.id, tuple.decompositionRevisionId),
+        eq(mealDecompositionRevisions.mealLogId, mealLogId),
+      ))
+      .orderBy(desc(mealDecompositionRevisions.revision), desc(mealDecompositionRevisions.id))
+      .for('update')
+      .limit(1);
+    if (
+      !decomposition ||
+      decomposition.rootMappingDecisionId !== decision.id ||
+      decomposition.rootCalculationPreviewId !== preview.id
+    ) {
+      details.push({ itemId: root.id, code: 'MEAL_DECOMPOSITION_STALE' });
+      continue;
+    }
+  }
+  return { details, previewsByItemId, stale: details.length > 0 };
+}
+
+async function selectPreviewLeaves(
+  database: Database,
+  identity: unknown,
+  catalogReleaseId: string,
+) {
+  if (!identity || typeof identity !== 'object' || Array.isArray(identity))
+    return null;
+  const leaves = (identity as { leaves?: unknown }).leaves;
+  if (!Array.isArray(leaves) || leaves.length === 0) return null;
+  const adapter = catalogEligibilityAdapter(database);
+  const selected = [];
+  for (const leaf of leaves) {
+    if (!leaf || typeof leaf !== 'object' || Array.isArray(leaf)) return null;
+    const value = leaf as { foodId?: unknown; unit?: unknown };
+    if (typeof value.foodId !== 'string' ||
+      !['g', 'ml', 'serving', 'bowl', 'piece'].includes(String(value.unit)))
+      return null;
+    const result = await selectTrustedNutrition(adapter, {
+      catalogReleaseId,
+      foodId: value.foodId,
+      unit: value.unit as 'g' | 'ml' | 'serving' | 'bowl' | 'piece',
+    });
+    if (result.kind !== 'selected') return null;
+    selected.push(result);
+  }
+  return selected;
+}
+
+/** Compares the immutable preview's complete authority tuple with fresh selector output. */
+function previewFactsMatch(selected: Awaited<ReturnType<typeof selectPreviewLeaves>>, identity: unknown) {
+  if (!selected || !identity || typeof identity !== 'object' || Array.isArray(identity))
+    return false;
+  const leaves = (identity as { leaves?: unknown }).leaves;
+  if (!Array.isArray(leaves) || leaves.length !== selected.length) return false;
+  return leaves.every((leaf, index) => {
+    if (!leaf || typeof leaf !== 'object' || Array.isArray(leaf)) return false;
+    const actual = leaf as Record<string, unknown>;
+    const fresh = selected[index]!;
+    return actual.foodId === fresh.food.id &&
+      actual.nutrientProfileId === fresh.profile.id &&
+      actual.sourceItemId === fresh.profile.sourceItemId &&
+      actual.profileQualityGrade === fresh.profile.qualityGrade &&
+      actual.servingId === (fresh.serving?.id ?? null) &&
+      actual.servingAmountMilliunits ===
+        (fresh.serving?.amountMilliunits ?? null) &&
+      actual.servingGramsMg === (fresh.serving?.gramsMg ?? null) &&
+      actual.servingSourceRegistryId ===
+        (fresh.serving?.sourceRegistryId ?? null) &&
+      actual.servingQualityGrade === (fresh.serving?.qualityGrade ?? null) &&
+      actual.sourceRegistryId === fresh.profile.sourceRegistryId &&
+      actual.sourceReleaseId === fresh.provenance.sourceReleaseId &&
+      actual.sourceReleaseVersion === fresh.provenance.sourceReleaseVersion &&
+      actual.catalogReleaseId === fresh.provenance.catalogReleaseId &&
+      actual.catalogManifestSha256 ===
+        fresh.provenance.catalogManifestSha256 &&
+      JSON.stringify(actual.nutrientProfile) === JSON.stringify({
+        basisAmountMg: fresh.profile.basisAmountMg,
+        energyMillicalories: fresh.profile.energyMillicalories,
+        carbohydrateMg: fresh.profile.carbohydrateMg,
+        proteinMg: fresh.profile.proteinMg,
+        fatMg: fresh.profile.fatMg,
+        fiberMg: fresh.profile.fiberMg,
+      });
+  });
+}
+
+async function previewAuthorityFactsMatch(
+  database: Database,
+  identity: unknown,
+  catalogReleaseId: string,
+  releaseActivationId: string,
+  decomposition: {
+    id: string;
+    rootMappingDecisionId: string;
+    rootCalculationPreviewId: string;
+  } | undefined,
+) {
+  if (!previewFactsMatch(
+    await selectPreviewLeaves(database, identity, catalogReleaseId),
+    identity,
+  )) return false;
+  const basis = identity && typeof identity === 'object' && !Array.isArray(identity)
+    ? (identity as { basis?: unknown }).basis
+    : null;
+  if (basis !== 'meal_decomposition') return !decomposition;
+  if (!decomposition) return false;
+  const decompositionLeaves = (identity as { leaves?: unknown }).leaves;
+  const components = await database
+    .select({
+      ordinal: mealDecompositionComponents.ordinal,
+      mappingDecisionId: mealDecompositionComponents.mappingDecisionId,
+      calculationPreviewId: mealDecompositionComponents.calculationPreviewId,
+      edibleAmountMg: mealDecompositionComponents.edibleAmountMg,
+    })
+    .from(mealDecompositionComponents)
+    .where(eq(mealDecompositionComponents.mealDecompositionRevisionId, decomposition.id))
+    .orderBy(asc(mealDecompositionComponents.ordinal));
+  if (
+    components.length === 0 ||
+    components.length > 12 ||
+    !Array.isArray(decompositionLeaves) ||
+    decompositionLeaves.length !== components.length ||
+    components.some((component, index) => component.ordinal !== index)
+  ) return false;
+  for (const [index, component] of components.entries()) {
+    const [componentDecision] = await database
+      .select({
+        id: mappingDecisions.id,
+        catalogReleaseId: mappingDecisions.catalogReleaseId,
+        releaseActivationId: mappingDecisions.releaseActivationId,
+        selectedFoodId: mappingDecisions.selectedFoodId,
+        status: mappingDecisions.status,
+      })
+      .from(mappingDecisions)
+      .where(eq(mappingDecisions.id, component.mappingDecisionId))
+      .limit(1);
+    const [componentPreview] = await database
+      .select({
+        id: calculationPreviews.id,
+        rootMappingDecisionId: calculationPreviews.rootMappingDecisionId,
+        catalogReleaseId: calculationPreviews.catalogReleaseId,
+        releaseActivationId: calculationPreviews.releaseActivationId,
+        identity: calculationPreviews.identity,
+      })
+      .from(calculationPreviews)
+      .where(eq(calculationPreviews.id, component.calculationPreviewId))
+      .limit(1);
+    if (
+      !componentDecision ||
+      componentDecision.status !== 'selected' ||
+      !componentDecision.selectedFoodId ||
+      !componentPreview ||
+      !isComponentPreviewIdentityCurrent(
+        componentPreview.identity,
+        componentDecision.id,
+        catalogReleaseId,
+        releaseActivationId,
+      ) ||
+      componentPreview.rootMappingDecisionId !== componentDecision.id ||
+      componentDecision.catalogReleaseId !== catalogReleaseId ||
+      componentDecision.releaseActivationId !== releaseActivationId ||
+      componentPreview.catalogReleaseId !== catalogReleaseId ||
+      componentPreview.releaseActivationId !== releaseActivationId
+    ) return false;
+    const componentLeaf = componentPreview.identity &&
+      typeof componentPreview.identity === 'object' &&
+      !Array.isArray(componentPreview.identity)
+      ? (componentPreview.identity as { leaves?: Array<Record<string, unknown>> }).leaves?.[0]
+      : null;
+    const decompositionLeaf = decompositionLeaves[index];
+    if (
+      !decompositionLeaf ||
+      typeof decompositionLeaf !== 'object' ||
+      Array.isArray(decompositionLeaf) ||
+      (decompositionLeaf as Record<string, unknown>).componentIdentity !== component.mappingDecisionId ||
+      (decompositionLeaf as Record<string, unknown>).foodId !== componentDecision.selectedFoodId ||
+      (decompositionLeaf as Record<string, unknown>).edibleAmountMg !== component.edibleAmountMg ||
+      !componentLeaf ||
+      JSON.stringify(decompositionLeaf) !== JSON.stringify({ ...componentLeaf, ordinal: index }) ||
+      !previewFactsMatch(
+        await selectPreviewLeaves(database, componentPreview.identity, catalogReleaseId),
+        componentPreview.identity,
+      )
+    ) return false;
+  }
+  return true;
+}
+
+function isPreviewIdentityCurrent(
+  identity: unknown,
+  rootMappingDecisionId: string,
+  rootRevision: number,
+  catalogReleaseId: string,
+  releaseActivationId: string,
+) {
+  if (!identity || typeof identity !== 'object' || Array.isArray(identity)) return false;
+  const value = identity as Record<string, unknown>;
+  if (
+    value.rootMappingDecisionId !== rootMappingDecisionId ||
+    value.rootRevision !== rootRevision ||
+    value.catalogReleaseId !== catalogReleaseId ||
+    value.releaseActivationId !== releaseActivationId ||
+    !Array.isArray(value.leaves) ||
+    value.leaves.length === 0
+  ) return false;
+  return value.leaves.every((leaf, ordinal) => {
+    if (!leaf || typeof leaf !== 'object' || Array.isArray(leaf)) return false;
+    const provenance = leaf as Record<string, unknown>;
+    return provenance.ordinal === ordinal &&
+      provenance.catalogReleaseId === catalogReleaseId &&
+      typeof provenance.foodId === 'string' &&
+      typeof provenance.nutrientProfileId === 'string' &&
+      typeof provenance.sourceReleaseId === 'string' &&
+      typeof provenance.edibleAmountMg === 'number' &&
+      provenance.edibleAmountMg > 0;
+  });
+}
+
+function isComponentPreviewIdentityCurrent(
+  identity: unknown,
+  rootMappingDecisionId: string,
+  catalogReleaseId: string,
+  releaseActivationId: string,
+) {
+  if (!identity || typeof identity !== 'object' || Array.isArray(identity)) return false;
+  const value = identity as Record<string, unknown>;
+  return value.rootMappingDecisionId === rootMappingDecisionId &&
+    typeof value.rootRevision === 'number' &&
+    value.rootRevision > 0 &&
+    value.catalogReleaseId === catalogReleaseId &&
+    value.releaseActivationId === releaseActivationId &&
+    Array.isArray(value.leaves) &&
+    value.leaves.length > 0;
 }
 function nutritionPreviewResponse(
   nutrition: ReturnType<typeof calculateMealNutrition>,
@@ -1671,7 +3401,7 @@ function nutritionPreviewResponse(
     return {
       mealItemId: item.mealItemId,
       gramsMg: item.gramsMg,
-      nutrients: requireCompleteCoreNutrients(item.nutrients),
+      nutrients: item.nutrients,
       source: {
         foodId: resolution.food!.id,
         nutrientProfileId: profile.id,
@@ -1785,6 +3515,35 @@ async function requireUserId(
   return null;
 }
 
+function applyMealConfirmationCutover(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  options: MealLogRouteOptions,
+) {
+  const protocol = request.headers['x-nueat-meal-confirmation-protocol'];
+  const decision = classifyMealConfirmationCutover(
+    typeof protocol === 'string' ? protocol : undefined,
+    options.mealConfirmationCutover,
+  );
+  if (decision.action === 'proceed') return true;
+  if (decision.statusCode === 503)
+    reply.header('Retry-After', String(decision.retryAfterSeconds));
+  reply.status(decision.statusCode).send({
+    error: {
+      code: decision.errorCode,
+      message:
+        decision.statusCode === 426
+          ? '식사 확인 프로토콜을 업데이트해야 합니다.'
+          : '식사 확인 기능을 점검 중입니다.',
+      ...(decision.statusCode === 426
+        ? { details: { requiredProtocol: decision.requiredProtocol } }
+        : {}),
+      requestId: request.id,
+    },
+  });
+  return false;
+}
+
 function invalidRequest(reply: FastifyReply, request: FastifyRequest) {
   return reply.status(400).send({
     error: {
@@ -1814,6 +3573,15 @@ function invalidMealLogState(reply: FastifyReply, request: FastifyRequest) {
     },
   });
 }
+function staleMealConfirmation(reply: FastifyReply, request: FastifyRequest) {
+  return reply.status(409).send({
+    error: {
+      code: 'STALE_MEAL_CONFIRMATION',
+      message: '식사 초안 또는 영양 근거가 변경되어 확인할 수 없습니다.',
+      requestId: request.id,
+    },
+  });
+}
 function invalidMealConfirmation(
   reply: FastifyReply,
   request: FastifyRequest,
@@ -1839,24 +3607,17 @@ function mealConfirmationRetryable(reply: FastifyReply, request: FastifyRequest)
     },
   });
 }
-function foodNotFound(reply: FastifyReply, request: FastifyRequest) {
-  return reply.status(404).send({
-    error: {
-      code: 'FOOD_NOT_FOUND',
-      message: '음식을 찾을 수 없습니다.',
-      requestId: request.id,
-    },
-  });
-}
 
 function foodNutrientProfileUnavailable(
   reply: FastifyReply,
   request: FastifyRequest,
+  reason?: string,
 ) {
   return reply.status(409).send({
     error: {
       code: 'FOOD_NUTRIENT_PROFILE_UNAVAILABLE',
       message: '사용 가능한 영양 정보를 찾을 수 없습니다.',
+      ...(reason ? { details: { reason } } : {}),
       requestId: request.id,
     },
   });
@@ -1873,7 +3634,7 @@ function imageUnavailable(reply: FastifyReply, request: FastifyRequest) {
 }
 async function sendStaleMealResponse(
   database: Database,
-  reviewPolicy: ReviewPolicyConfig,
+  reviewPolicy: ApiEnvironment['mealRecognition']['reviewPolicy'],
   reply: FastifyReply,
   request: FastifyRequest,
   code: 'MEAL_DRAFT_STALE' | 'MEAL_ITEM_STALE',

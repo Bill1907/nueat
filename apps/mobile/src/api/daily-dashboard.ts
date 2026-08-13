@@ -10,15 +10,17 @@ export type DailyNutritionTarget = {
   fiberMg: number;
 };
 
-export type DailyNutritionTotals = {
-  energyMillicalories: number;
-  carbohydrateMg: number;
-  proteinMg: number;
-  fatMg: number;
-  fiberMg: number | null;
-  fiberKnownMg: number;
-  fiberComplete: boolean;
+export type DailyNutrientTotal = {
+  value: number | null;
+  knownValue: number;
+  missingItemCount: number;
+  completeness: 'complete' | 'partial';
 };
+
+export type DailyNutritionTotals = Record<
+  'energyMillicalories' | 'carbohydrateMg' | 'proteinMg' | 'fatMg' | 'fiberMg',
+  DailyNutrientTotal
+>;
 
 export type DailyMeal = {
   id: string;

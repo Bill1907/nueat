@@ -4,7 +4,7 @@ import type { FastifyInstance } from 'fastify';
 
 import type { Auth } from '../src/auth/auth';
 import { parseEnvironment } from '../src/config/env';
-import { buildServer } from '../src/server';
+import { buildServer, materializeAutoSelectionPolicy } from '../src/server';
 
 const environment = parseEnvironment({
   NODE_ENV: 'test',
@@ -26,6 +26,43 @@ afterEach(async () => {
 });
 
 describe('NUEAT API server', () => {
+  test('materializes only a complete signed auto-selection policy carrier', () => {
+    const policy = {
+      version: 'catalog-auto-selection-policy-v1' as const,
+      comparatorVersion: 'catalog-auto-selection-comparator-v1' as const,
+      minimumWinnerScoreBps: 9_000,
+      minimumMarginBps: 1_000,
+      identitySha256: 'a'.repeat(64),
+    };
+    const autoEnvironment = {
+      ...environment,
+      mealRecognition: {
+        ...environment.mealRecognition,
+        reviewPolicy: {
+          ...environment.mealRecognition.reviewPolicy,
+          mode: 'auto_selection' as const,
+          mappingMode: 'hybrid_auto' as const,
+          approvedReportReceipt: { autoSelectionPolicy: policy },
+        },
+      },
+    };
+
+    expect(materializeAutoSelectionPolicy(autoEnvironment)).toEqual({
+      policy,
+      verifiedPolicyIdentitySha256: policy.identitySha256,
+    });
+    expect(() => materializeAutoSelectionPolicy({
+      ...autoEnvironment,
+      mealRecognition: {
+        ...autoEnvironment.mealRecognition,
+        reviewPolicy: {
+          ...autoEnvironment.mealRecognition.reviewPolicy,
+          approvedReportReceipt: { autoSelectionPolicy: { ...policy, minimumMarginBps: 10_001 } },
+        },
+      },
+    })).toThrow('MEAL_RECOGNITION_AUTO_SELECTION_VERIFICATION_FAILED');
+  });
+
   test('reports liveness without touching the database', async () => {
     let databaseCalls = 0;
     const server = await createTestServer({
@@ -43,7 +80,9 @@ describe('NUEAT API server', () => {
   });
 
   test('reports readiness only when Neon is reachable', async () => {
-    const readyServer = await createTestServer({ execute: async () => [] });
+    const readyServer = await createTestServer({
+      execute: async () => [{ ready: true }],
+    });
     const unavailableServer = await createTestServer({
       execute: async () => {
         throw new Error('database unavailable');
@@ -54,9 +93,87 @@ describe('NUEAT API server', () => {
     const unavailable = await unavailableServer.inject({ method: 'GET', url: '/health/ready' });
 
     expect(ready.statusCode).toBe(200);
-    expect(JSON.parse(ready.body).dependencies.database).toBe('up');
+    expect(JSON.parse(ready.body)).toMatchObject({
+      dependencies: { database: 'up' },
+      mealConfirmation: {
+        identity: 'meal-confirmation-cutover-v1',
+        mode: 'normal',
+        protocol: 'meal-confirmation-safe-review-v1',
+        barrier: 'required',
+      },
+    });
     expect(unavailable.statusCode).toBe(503);
-    expect(JSON.parse(unavailable.body).dependencies.database).toBe('down');
+    expect(JSON.parse(unavailable.body)).toMatchObject({
+      dependencies: { database: 'down' },
+      mealConfirmation: {
+        identity: 'meal-confirmation-cutover-v1',
+        mode: 'normal',
+        protocol: 'meal-confirmation-safe-review-v1',
+        barrier: 'required',
+      },
+    });
+  });
+
+  test('safe-review readiness requires the 0022 checkpoint column and guard', async () => {
+    const oldSchemaServer = await createTestServer(
+      { execute: async () => [{ ready: false }] },
+      createAuthMock(async () => Response.json({ ok: true })),
+      'safe_review_maintenance',
+    );
+    const readyServer = await createTestServer(
+      { execute: async () => [{ ready: true }] },
+      createAuthMock(async () => Response.json({ ok: true })),
+      'safe_review_maintenance',
+    );
+
+    const oldSchema = await oldSchemaServer.inject({ method: 'GET', url: '/health/ready' });
+    const ready = await readyServer.inject({ method: 'GET', url: '/health/ready' });
+
+    expect(oldSchema.statusCode).toBe(503);
+    expect(JSON.parse(oldSchema.body)).toMatchObject({
+      dependencies: { database: 'up', mealConfirmationSafeReview: 'down' },
+    });
+    expect(ready.statusCode).toBe(200);
+  });
+
+  test('normal readiness requires the 0022 checkpoint column and guard', async () => {
+    const server = await createTestServer(
+      { execute: async () => [{ ready: false }] },
+      createAuthMock(async () => Response.json({ ok: true })),
+      'normal',
+    );
+
+    const response = await server.inject({ method: 'GET', url: '/health/ready' });
+
+    expect(response.statusCode).toBe(503);
+    expect(JSON.parse(response.body)).toMatchObject({
+      dependencies: { database: 'up', mealConfirmationSafeReview: 'down' },
+    });
+  });
+
+  test('bridge startup skips invalid auto-selection policy materialization', async () => {
+    const server = await buildServer({
+      environment: {
+        ...environment,
+        mealConfirmationCutover: {
+          ...environment.mealConfirmationCutover,
+          mode: 'maintenance_bridge',
+        },
+        mealRecognition: {
+          ...environment.mealRecognition,
+          reviewPolicy: {
+            ...environment.mealRecognition.reviewPolicy,
+            mode: 'auto_selection',
+            approvedReportReceipt: null,
+          },
+        },
+      },
+      database: { execute: async () => [] } as unknown as Database,
+      auth: createAuthMock(async () => Response.json({ ok: true })),
+    });
+    openServers.push(server);
+
+    expect(server).toBeDefined();
   });
 
   test('forwards Better Auth responses and multiple session cookies', async () => {
@@ -95,9 +212,16 @@ describe('NUEAT API server', () => {
 async function createTestServer(
   database: { execute: () => Promise<unknown> },
   auth = createAuthMock(async () => Response.json({ ok: true })),
+  cutoverMode: 'normal' | 'maintenance_bridge' | 'safe_review_maintenance' = 'normal',
 ) {
   const server = await buildServer({
-    environment,
+    environment: {
+      ...environment,
+      mealConfirmationCutover: {
+        ...environment.mealConfirmationCutover,
+        mode: cutoverMode,
+      },
+    },
     database: database as unknown as Database,
     auth,
   });

@@ -7,7 +7,10 @@ import {
   sourceRegistries,
 } from '@nueat/database';
 
-import { calculateCatalogRegistrySha256 } from '../src/services/catalog-registry-verifier';
+import {
+  calculateCatalogReleaseIdentity,
+  calculateCatalogRegistrySha256,
+} from '../src/services/catalog-registry-verifier';
 
 describe('catalog registry verifier', () => {
   test('hashes authoritative catalog rows deterministically and detects drift', async () => {
@@ -26,6 +29,17 @@ describe('catalog registry verifier', () => {
 
     rows.get(foodAliases)![0]!.normalizedAliasKo = '배추김치';
     expect(await calculateCatalogRegistrySha256(database as never)).not.toBe(first);
+  });
+
+  test('derives stable release IDs bound to the same authoritative registry digest', async () => {
+    const rows = new Map<unknown, Record<string, unknown>[]>([
+      [sourceRegistries, [{ id: 'registry-1', code: 'official', kind: 'public_dataset', datasetVersion: '2026-01', licenseReference: 'official', publishedAt: new Date('2026-01-01T00:00:00Z') }]],
+      [foods, []], [foodAliases, []], [nutrientProfiles, []], [foodServings, []],
+    ]);
+    const database = fakeDatabase(rows);
+    const identity = await calculateCatalogReleaseIdentity(database as never);
+    expect(identity.releaseIds).toEqual(['official@2026-01']);
+    expect(identity.registrySha256).toBe(await calculateCatalogRegistrySha256(database as never));
   });
 });
 

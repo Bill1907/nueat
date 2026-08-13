@@ -1,3 +1,5 @@
+import type { UserReviewStatus } from './meal-estimate-review';
+
 export type ServingUnit = 'g' | 'ml' | 'serving' | 'bowl' | 'piece';
 export type NutritionValueKey =
   | 'energyMillicalories'
@@ -56,6 +58,27 @@ export interface NutrientAggregate {
 export interface MealNutritionResult {
   items: CalculatedMealItem[];
   totals: Record<NutritionValueKey, NutrientAggregate>;
+}
+
+export type ReviewedNutritionStatus = 'pending' | 'subtotal' | 'complete';
+
+export interface ReviewedMealNutritionInput extends MealNutritionInput {
+  userReview: UserReviewStatus;
+}
+
+export interface ReviewedNutrientAggregate {
+  value: number | null;
+  knownValue: number;
+  missingItemCount: number;
+  status: ReviewedNutritionStatus;
+}
+
+export interface ReviewedMealNutritionResult {
+  status: ReviewedNutritionStatus;
+  reviewedItemCount: number;
+  unreviewedItemCount: number;
+  items: CalculatedMealItem[];
+  totals: Record<NutritionValueKey, ReviewedNutrientAggregate>;
 }
 
 export type NutritionCalculationErrorCode =
@@ -169,6 +192,56 @@ export function calculateMealNutrition(inputs: MealNutritionInput[]): MealNutrit
   ) as unknown as Record<NutritionValueKey, NutrientAggregate>;
 
   return { items, totals };
+}
+
+/**
+ * Calculates totals only from items reviewed at their current revision.
+ * `knownValue` remains zero for known-zero nutrients; it is never used to
+ * represent an unavailable nutrient.
+ */
+export function calculateReviewedMealNutrition(
+  inputs: readonly ReviewedMealNutritionInput[],
+): ReviewedMealNutritionResult {
+  const reviewedInputs = inputs.filter((input) => input.userReview === 'current');
+  const nutrition = calculateMealNutrition(reviewedInputs);
+  const reviewedItemCount = reviewedInputs.length;
+  const unreviewedItemCount = inputs.length - reviewedItemCount;
+
+  const totals = Object.fromEntries(
+    NUTRIENT_KEYS.map((key) => {
+      const aggregate = nutrition.totals[key];
+      const status: ReviewedNutritionStatus =
+        reviewedItemCount === 0
+          ? 'pending'
+          : unreviewedItemCount === 0 && aggregate.missingItemCount === 0
+            ? 'complete'
+            : 'subtotal';
+
+      return [
+        key,
+        {
+          value: status === 'complete' ? aggregate.knownValue : null,
+          knownValue: aggregate.knownValue,
+          missingItemCount: aggregate.missingItemCount,
+          status,
+        },
+      ];
+    }),
+  ) as unknown as Record<NutritionValueKey, ReviewedNutrientAggregate>;
+  const status: ReviewedNutritionStatus =
+    reviewedItemCount === 0
+      ? 'pending'
+      : unreviewedItemCount === 0 && Object.values(totals).every((total) => total.missingItemCount === 0)
+        ? 'complete'
+        : 'subtotal';
+
+  return {
+    status,
+    reviewedItemCount,
+    unreviewedItemCount,
+    items: nutrition.items,
+    totals,
+  };
 }
 
 function divideAndRoundHalfUp(numerator: bigint, denominator: bigint) {

@@ -28,6 +28,10 @@ const snapshotInputSchema = z
             nutrientProfileQualityGrade: z.enum(['verified', 'estimated', 'unverified']),
             nutrients: z
               .object({
+                energyMillicalories: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
+                carbohydrateMg: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
+                proteinMg: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
+                fatMg: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).nullable(),
                 fiberMg: z
                   .number()
                   .int()
@@ -152,6 +156,7 @@ export const dailyDashboardRoutes: FastifyPluginAsync<DailyDashboardRouteOptions
           carbohydrateMg: calculationSnapshots.carbohydrateMg,
           proteinMg: calculationSnapshots.proteinMg,
           fatMg: calculationSnapshots.fatMg,
+          fiberMg: calculationSnapshots.fiberMg,
           calculationVersion: calculationSnapshots.calculationVersion,
           calculatedAt: calculationSnapshots.calculatedAt,
         })
@@ -221,72 +226,81 @@ export const dailyDashboardRoutes: FastifyPluginAsync<DailyDashboardRouteOptions
   });
 };
 
-interface DashboardTotals {
-  energyMillicalories: number;
-  carbohydrateMg: number;
-  proteinMg: number;
-  fatMg: number;
-  fiberMg: number | null;
-  fiberKnownMg: number;
-  fiberComplete: boolean;
+interface NutrientTotal {
+  value: number | null;
+  knownValue: number;
+  missingItemCount: number;
+  completeness: 'complete' | 'partial';
 }
+
+type DashboardTotals = Record<
+  'energyMillicalories' | 'carbohydrateMg' | 'proteinMg' | 'fatMg' | 'fiberMg',
+  NutrientTotal
+>;
+
+const nutrientKeys = [
+  'energyMillicalories',
+  'carbohydrateMg',
+  'proteinMg',
+  'fatMg',
+  'fiberMg',
+] as const;
 
 function snapshotTotals(snapshot: {
   inputSnapshot: z.infer<typeof snapshotInputSchema>;
-  energyMillicalories: number;
-  carbohydrateMg: number;
-  proteinMg: number;
-  fatMg: number;
+  energyMillicalories: number | null;
+  carbohydrateMg: number | null;
+  proteinMg: number | null;
+  fatMg: number | null;
+  fiberMg: number | null;
 }) {
-  const fiberComplete = snapshot.inputSnapshot.mealItems.every(
-    (item) => item.nutrients.fiberMg !== null,
-  );
-  const fiberKnownMg = snapshot.inputSnapshot.mealItems.reduce(
-    (total, item) => safeAdd(total, item.nutrients.fiberMg ?? 0),
-    0,
-  );
-  return {
-    energyMillicalories: snapshot.energyMillicalories,
-    carbohydrateMg: snapshot.carbohydrateMg,
-    proteinMg: snapshot.proteinMg,
-    fatMg: snapshot.fatMg,
-    fiberMg: fiberComplete ? fiberKnownMg : null,
-    fiberKnownMg,
-    fiberComplete,
-  };
+  return Object.fromEntries(nutrientKeys.map((key) => {
+    const missingItemCount = snapshot.inputSnapshot.mealItems.filter(
+      (item) => item.nutrients[key] === null,
+    ).length;
+    const knownValue = snapshot.inputSnapshot.mealItems.reduce(
+      (total, item) => safeAdd(total, item.nutrients[key] ?? 0),
+      0,
+    );
+    const complete = missingItemCount === 0 && snapshot[key] !== null;
+    return [key, {
+      value: complete ? snapshot[key] : null,
+      knownValue,
+      missingItemCount,
+      completeness: complete ? 'complete' : 'partial',
+    }];
+  })) as DashboardTotals;
 }
 
 function emptyTotals(): DashboardTotals {
-  return {
-    energyMillicalories: 0,
-    carbohydrateMg: 0,
-    proteinMg: 0,
-    fatMg: 0,
-    fiberMg: 0,
-    fiberKnownMg: 0,
-    fiberComplete: true,
-  };
+  return Object.fromEntries(nutrientKeys.map((key) => [key, {
+    value: 0,
+    knownValue: 0,
+    missingItemCount: 0,
+    completeness: 'complete',
+  }])) as DashboardTotals;
 }
 
 function sumTotals(totals: DashboardTotals[]) {
   const result = emptyTotals();
   for (const total of totals) {
-    result.energyMillicalories = safeAdd(result.energyMillicalories, total.energyMillicalories);
-    result.carbohydrateMg = safeAdd(result.carbohydrateMg, total.carbohydrateMg);
-    result.proteinMg = safeAdd(result.proteinMg, total.proteinMg);
-    result.fatMg = safeAdd(result.fatMg, total.fatMg);
-    result.fiberKnownMg = safeAdd(result.fiberKnownMg, total.fiberKnownMg);
-    result.fiberComplete &&= total.fiberComplete;
+    for (const key of nutrientKeys) {
+      result[key].knownValue = safeAdd(result[key].knownValue, total[key].knownValue);
+      result[key].missingItemCount += total[key].missingItemCount;
+      result[key].completeness = result[key].missingItemCount === 0 ? 'complete' : 'partial';
+      result[key].value = result[key].completeness === 'complete'
+        ? result[key].knownValue
+        : null;
+    }
   }
-  result.fiberMg = result.fiberComplete ? result.fiberKnownMg : null;
   return result;
 }
 function safeAdd(left: number, right: number) {
-  const result = left + right;
-  if (!Number.isSafeInteger(result) || result < 0) {
+  const result = BigInt(left) + BigInt(right);
+  if (result > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new Error('DASHBOARD_TOTAL_OUT_OF_RANGE');
   }
-  return result;
+  return Number(result);
 }
 
 

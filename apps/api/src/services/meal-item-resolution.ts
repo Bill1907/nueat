@@ -47,7 +47,11 @@ export type CurrentMealItemResolution = {
   reason: string | null;
 };
 
-/** Resolves all persisted selections from the current authoritative catalog in bounded bulk queries. */
+/**
+ * Resolves persisted references only. It deliberately does not decide release,
+ * source, profile, or serving eligibility; MealItemAuthorityProjection is the
+ * release-scoped authority for those decisions.
+ */
 export async function resolveCurrentMealItems(
   database: DatabaseExecutor,
   items: ResolutionItem[],
@@ -62,13 +66,12 @@ export async function resolveCurrentMealItems(
       qualityGrade: nutrientProfiles.qualityGrade, basisAmountMg: nutrientProfiles.basisAmountMg,
       energyMillicalories: nutrientProfiles.energyMillicalories, carbohydrateMg: nutrientProfiles.carbohydrateMg,
       proteinMg: nutrientProfiles.proteinMg, fatMg: nutrientProfiles.fatMg, fiberMg: nutrientProfiles.fiberMg,
-      sourceKind: sourceRegistries.kind,
-    }).from(nutrientProfiles).innerJoin(sourceRegistries, eq(nutrientProfiles.sourceRegistryId, sourceRegistries.id)).where(inArray(nutrientProfiles.id, profileIds)),
+    }).from(nutrientProfiles).where(inArray(nutrientProfiles.id, profileIds)),
     foodIds.length === 0 ? [] : database.select({
       id: foodServings.id, foodId: foodServings.foodId, sourceRegistryId: foodServings.sourceRegistryId, unit: foodServings.unit,
       amountMilliunits: foodServings.amountMilliunits, gramsMg: foodServings.gramsMg,
-      qualityGrade: foodServings.qualityGrade, sourceKind: sourceRegistries.kind,
-    }).from(foodServings).innerJoin(sourceRegistries, eq(foodServings.sourceRegistryId, sourceRegistries.id)).where(inArray(foodServings.foodId, foodIds)),
+      qualityGrade: foodServings.qualityGrade,
+    }).from(foodServings).where(inArray(foodServings.foodId, foodIds)),
   ]);
   const foodById = new Map(selectedFoods.map((food) => [food.id, food]));
   const profileById = new Map(profiles.map((profile) => [profile.id, profile]));
@@ -80,22 +83,14 @@ export async function resolveCurrentMealItems(
     const profile = profileById.get(item.nutrientProfileId);
     if (!profile) return { itemId: item.id, food: { id: food.id, canonicalNameKo: food.canonicalNameKo }, profile: null, serving: null, reason: 'MISSING_PROFILE' };
     if (profile.foodId !== item.foodId) return { itemId: item.id, food: { id: food.id, canonicalNameKo: food.canonicalNameKo }, profile: null, serving: null, reason: 'MISMATCHED_PROFILE' };
-    if ((profile.qualityGrade !== 'verified' && profile.qualityGrade !== 'estimated') || !trustedSourceKinds.includes(profile.sourceKind as typeof trustedSourceKinds[number])) return { itemId: item.id, food: { id: food.id, canonicalNameKo: food.canonicalNameKo }, profile: null, serving: null, reason: 'UNTRUSTED_PROFILE_SOURCE' };
-    if (profile.energyMillicalories === null || profile.carbohydrateMg === null || profile.proteinMg === null || profile.fatMg === null) return { itemId: item.id, food: { id: food.id, canonicalNameKo: food.canonicalNameKo }, profile: null, serving: null, reason: 'INCOMPLETE_PROFILE' };
     const publicProfile = { ...profile, qualityGrade: profile.qualityGrade as 'verified' | 'estimated' | 'unverified' };
     if (item.unit === 'g') return { itemId: item.id, food: { id: food.id, canonicalNameKo: food.canonicalNameKo }, profile: publicProfile, serving: null, reason: null };
     const unitServings = servings.filter(
       (serving) => serving.foodId === item.foodId && serving.unit === item.unit,
     );
     if (unitServings.length === 0) return { itemId: item.id, food: { id: food.id, canonicalNameKo: food.canonicalNameKo }, profile: publicProfile, serving: null, reason: 'MISSING_SERVING_CONVERSION' };
-    const matchingServings = unitServings.filter(
-      (serving) =>
-        (serving.qualityGrade === 'verified' || serving.qualityGrade === 'estimated') &&
-        trustedSourceKinds.includes(serving.sourceKind as typeof trustedSourceKinds[number]),
-    );
-    if (matchingServings.length === 0) return { itemId: item.id, food: { id: food.id, canonicalNameKo: food.canonicalNameKo }, profile: publicProfile, serving: null, reason: 'UNTRUSTED_SERVING_SOURCE' };
-    if (matchingServings.length > 1) return { itemId: item.id, food: { id: food.id, canonicalNameKo: food.canonicalNameKo }, profile: publicProfile, serving: null, reason: 'AMBIGUOUS_SERVING_CONVERSION' };
-    const serving = matchingServings[0]!;
+    if (unitServings.length > 1) return { itemId: item.id, food: { id: food.id, canonicalNameKo: food.canonicalNameKo }, profile: publicProfile, serving: null, reason: 'AMBIGUOUS_SERVING_CONVERSION' };
+    const serving = unitServings[0]!;
     return {
       itemId: item.id,
       food: { id: food.id, canonicalNameKo: food.canonicalNameKo },
@@ -112,59 +107,8 @@ export async function resolveCurrentMealItems(
     };
   });
 }
-export async function resolveFoodSelection(
-  database: DatabaseExecutor,
-  foodId: string,
-) {
-  const [food] = await database
-    .select({
-      id: foods.id,
-      canonicalNameKo: foods.canonicalNameKo,
-      isDeprecated: foods.isDeprecated,
-    })
-    .from(foods)
-    .where(eq(foods.id, foodId))
-    .limit(1);
-  if (!food || food.isDeprecated) return { kind: 'food_not_found' as const };
-  const profiles = await database
-    .select({
-      id: nutrientProfiles.id,
-      foodId: nutrientProfiles.foodId,
-      qualityGrade: nutrientProfiles.qualityGrade,
-      datasetVersion: nutrientProfiles.datasetVersion,
-      sourceKind: sourceRegistries.kind,
-      energyMillicalories: nutrientProfiles.energyMillicalories,
-      carbohydrateMg: nutrientProfiles.carbohydrateMg,
-      proteinMg: nutrientProfiles.proteinMg,
-      fatMg: nutrientProfiles.fatMg,
-    })
-    .from(nutrientProfiles)
-    .innerJoin(
-      sourceRegistries,
-      eq(nutrientProfiles.sourceRegistryId, sourceRegistries.id),
-    )
-    .where(eq(nutrientProfiles.foodId, food.id));
-  const profile = profiles
-    .filter(
-      (candidate) =>
-        (candidate.qualityGrade === 'verified' || candidate.qualityGrade === 'estimated') &&
-        trustedSourceKinds.includes(candidate.sourceKind as typeof trustedSourceKinds[number]) &&
-        candidate.energyMillicalories !== null &&
-        candidate.carbohydrateMg !== null &&
-        candidate.proteinMg !== null &&
-        candidate.fatMg !== null,
-    )
-    .sort(compareProfiles)[0];
-  return profile
-    ? {
-        kind: 'resolved' as const,
-        food: { id: food.id, canonicalNameKo: food.canonicalNameKo },
-        nutrientProfileId: profile.id,
-      }
-    : { kind: 'profile_unavailable' as const };
-}
 
-/** Maps recognition labels through canonical aliases and the same eligible profile policy used by every route. */
+/** Maps recognition labels to draft candidates. These are discovery hints, never meal-item authority. */
 export async function resolveRecognitionCandidates(
   database: Database,
   candidates: Array<{

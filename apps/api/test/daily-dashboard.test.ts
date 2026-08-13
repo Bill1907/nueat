@@ -71,13 +71,11 @@ describe('daily dashboard route', () => {
       timezone: 'Pacific/Honolulu',
       target: null,
       totals: {
-        energyMillicalories: 0,
-        carbohydrateMg: 0,
-        proteinMg: 0,
-        fatMg: 0,
-        fiberMg: 0,
-        fiberKnownMg: 0,
-        fiberComplete: true,
+        energyMillicalories: completeTotal(0),
+        carbohydrateMg: completeTotal(0),
+        proteinMg: completeTotal(0),
+        fatMg: completeTotal(0),
+        fiberMg: completeTotal(0),
       },
       meals: [],
     });
@@ -143,13 +141,11 @@ describe('daily dashboard route', () => {
         fiberMg: 25000,
       },
       totals: {
-        energyMillicalories: 1200,
-        carbohydrateMg: 120,
-        proteinMg: 50,
-        fatMg: 30,
-        fiberMg: null,
-        fiberKnownMg: 7,
-        fiberComplete: false,
+        energyMillicalories: completeTotal(1200),
+        carbohydrateMg: completeTotal(120),
+        proteinMg: completeTotal(50),
+        fatMg: completeTotal(30),
+        fiberMg: partialTotal(7, 1),
       },
       meals: [
         {
@@ -158,13 +154,11 @@ describe('daily dashboard route', () => {
           mealType: 'breakfast',
           itemLabels: ['현재 아침'],
           totals: {
-            energyMillicalories: 500,
-            carbohydrateMg: 50,
-            proteinMg: 20,
-            fatMg: 10,
-            fiberMg: null,
-            fiberKnownMg: 3,
-            fiberComplete: false,
+            energyMillicalories: completeTotal(500),
+            carbohydrateMg: completeTotal(50),
+            proteinMg: completeTotal(20),
+            fatMg: completeTotal(10),
+            fiberMg: partialTotal(3, 1),
           },
           qualityGrade: 'verified',
           calculationVersion: 'meal-nutrition-v1',
@@ -176,13 +170,11 @@ describe('daily dashboard route', () => {
           mealType: 'dinner',
           itemLabels: ['현재 저녁'],
           totals: {
-            energyMillicalories: 700,
-            carbohydrateMg: 70,
-            proteinMg: 30,
-            fatMg: 20,
-            fiberMg: 4,
-            fiberKnownMg: 4,
-            fiberComplete: true,
+            energyMillicalories: completeTotal(700),
+            carbohydrateMg: completeTotal(70),
+            proteinMg: completeTotal(30),
+            fatMg: completeTotal(20),
+            fiberMg: completeTotal(4),
           },
           qualityGrade: 'estimated',
           calculationVersion: 'meal-nutrition-v1',
@@ -331,7 +323,13 @@ function profile(id: string, effectiveFrom: string, effectiveTo: string | null, 
 function itemNutrients(fiberMg: number | null, nutrientProfileQualityGrade = 'verified') {
   return {
     nutrientProfileQualityGrade,
-    nutrients: { fiberMg },
+    nutrients: {
+      energyMillicalories: 0,
+      carbohydrateMg: 0,
+      proteinMg: 0,
+      fatMg: 0,
+      fiberMg,
+    },
   };
 }
 
@@ -347,12 +345,34 @@ function snapshot(
   return {
     mealLogId,
     sequence,
-    inputSnapshot: { mealItems },
+    inputSnapshot: {
+      mealItems: mealItems.map((item, index) => ({
+        ...item,
+        nutrients: {
+          ...item.nutrients,
+          energyMillicalories: index === 0 ? energyMillicalories : 0,
+          carbohydrateMg: index === 0 ? carbohydrateMg : 0,
+          proteinMg: index === 0 ? proteinMg : 0,
+          fatMg: index === 0 ? fatMg : 0,
+        },
+      })),
+    },
     energyMillicalories,
     carbohydrateMg,
     proteinMg,
     fatMg,
+    fiberMg: mealItems.every((item) => item.nutrients.fiberMg !== null)
+      ? mealItems.reduce((sum, item) => sum + (item.nutrients.fiberMg ?? 0), 0)
+      : null,
     calculationVersion: 'meal-nutrition-v1',
     calculatedAt: new Date('2026-08-11T07:01:00.000Z'),
   };
+}
+
+function completeTotal(value: number) {
+  return { value, knownValue: value, missingItemCount: 0, completeness: 'complete' };
+}
+
+function partialTotal(knownValue: number, missingItemCount: number) {
+  return { value: null, knownValue, missingItemCount, completeness: 'partial' };
 }

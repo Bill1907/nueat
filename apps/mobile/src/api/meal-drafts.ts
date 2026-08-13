@@ -9,13 +9,12 @@ import type { RecognitionStatus } from '@/meals/meal-recognition-policy';
 export { inferMealType };
 export type { MealType, MealUnit };
 
-export interface MealDraft {
+interface MealLogBase {
   id: string;
   eatenAt: string;
   timezone: string;
   localDate: string;
   mealType: MealType;
-  status: 'draft' | 'confirmed';
   imageAssetId: string | null;
   recognitionStatus: RecognitionStatus;
   recognitionProvider: string | null;
@@ -27,7 +26,6 @@ export interface MealDraft {
   recognitionAttemptCount: number;
   recognitionNextAttemptAt: string | null;
   draftRevision: number;
-  confirmedAt: string | null;
   recognitionOutcome: 'recognized' | 'no_food' | 'insufficient_evidence' | null;
   recognitionEvidenceReason: string | null;
   recognitionManualOverride: {
@@ -41,6 +39,44 @@ export interface MealDraft {
     decidedAt: string;
     changedFields: string[];
   } | null;
+  observationId: string | null;
+  resolutionStatus: 'pending' | 'processing' | 'resolved' | 'failed' | null;
+  resolutionReason: string | null;
+  resolutionRetryAt: string | null;
+}
+
+export interface DraftMealLog extends MealLogBase {
+  status: 'draft';
+  confirmedAt: null;
+}
+
+export interface ConfirmedMealLog {
+  id: string;
+  eatenAt: string;
+  timezone: string;
+  localDate: string;
+  mealType: MealType;
+  status: 'confirmed';
+  confirmedAt: string | null;
+}
+
+export type MealDraft = DraftMealLog | ConfirmedMealLog;
+
+export interface MealDraftItemReview {
+  status: 'current' | 'required';
+  checkpoint: {
+    reviewedItemRevision: number;
+    authorityFingerprintVersion: string;
+    authorityFingerprint: string;
+    reviewedAt: string;
+  } | null;
+  authority: {
+    fingerprintVersion: string;
+    fingerprint: string | null;
+    officialSource: unknown | null;
+    invalidReason: string | null;
+  };
+  nextAction: 'review_item' | null;
 }
 
 export interface MealDraftItem {
@@ -67,18 +103,32 @@ export interface MealDraftItem {
   itemRevision: number;
   foodRevision: number;
   portionRevision: number;
-  foodAcknowledgedRevision: number | null;
-  portionAcknowledgedRevision: number | null;
   origin: 'model_estimate' | 'manual_entry' | 'user_added' | 'legacy_unknown';
   initialAssessment: unknown | null;
+  review: MealDraftItemReview;
   currentResolution: {
     status: 'resolved' | 'unresolved';
     reason: string | null;
+    observationId: string | null;
+    decisionId: string | null;
+    previewId: string | null;
+    decompositionRevisionId: string | null;
+    composition: 'finished_profile' | 'source_recipe' | 'meal_decomposition' | null;
+    resolutionStatus: 'pending' | 'processing' | 'resolved' | 'failed' | null;
+    resolutionReason: string | null;
+    resolutionRetryAt: string | null;
+    candidates: {
+      foodId: string;
+      labelKo: string;
+      scoreBps: number;
+      availability: 'available' | 'unavailable' | 'unknown';
+      reason: string | null;
+    }[];
   } | null;
 }
 
-export interface MealDraftResponse {
-  mealLog: MealDraft;
+export interface DraftMealDraftResponse {
+  mealLog: DraftMealLog;
   items: MealDraftItem[];
   review: MealDraftReview;
 }
@@ -86,7 +136,7 @@ export type MealReviewReason =
   | 'NO_FOOD_DETECTED'
   | 'INSUFFICIENT_IMAGE_EVIDENCE'
   | 'IMAGE_QUALITY_LOW'
-  | 'QUICK_CONFIRM_POLICY_DISABLED'
+
   | 'FOOD_CONFIDENCE_LOW'
   | 'FOOD_CANDIDATE_MARGIN_LOW'
   | 'MODEL_FOOD_QUESTION'
@@ -110,11 +160,22 @@ export type MealReviewReason =
 export interface MealDraftReview {
   confirmable: boolean;
   reasons: { code: MealReviewReason | string; itemId: string | null }[];
-  requiredReviewFields: {
-    itemId: string;
-    fields: ('food' | 'portion')[];
-  }[];
-  nutrition: ConfirmedMealNutrition | null;
+  nutrition: ReviewedMealNutrition;
+}
+export interface ReviewedNutrientValue {
+  value: number | null;
+  knownValue: number;
+  missingItemCount: number;
+  status: 'pending' | 'subtotal' | 'complete';
+}
+export interface ReviewedMealNutrition {
+  status: 'pending' | 'subtotal' | 'complete';
+  reviewedItemCount: number;
+  unreviewedItemCount: number;
+  totals: Record<
+    'energyMillicalories' | 'carbohydrateMg' | 'proteinMg' | 'fatMg' | 'fiberMg',
+    ReviewedNutrientValue
+  >;
 }
 export interface ConfirmedNutrientValue {
   value: number | null;
@@ -125,6 +186,8 @@ export interface ConfirmedNutrientValue {
 
 export interface ConfirmedMealNutritionItem {
   mealItemId: string;
+  amountMilliunits: number;
+  unit: MealUnit;
   gramsMg: number;
   nutrients: {
     energyMillicalories: number | null;
@@ -133,13 +196,14 @@ export interface ConfirmedMealNutritionItem {
     fatMg: number | null;
     fiberMg: number | null;
   };
+  calculationPreview: unknown | null;
   source: {
     foodId: string;
-    nutrientProfileId: string;
-    sourceRegistryId: string;
-    sourceItemId: string;
-    datasetVersion: string;
-    qualityGrade: string;
+    nutrientProfileId: string | null;
+    sourceRegistryId: string | null;
+    sourceItemId: string | null;
+    datasetVersion: string | null;
+    qualityGrade: string | null;
     servingId: string | null;
     servingSourceRegistryId: string | null;
     servingQualityGrade: string | null;
@@ -157,11 +221,51 @@ export interface ConfirmedMealNutrition {
   >;
 }
 
-export interface ConfirmMealDraftResponse {
-  mealLog: MealDraft;
-  items: MealDraftItem[];
+export interface ConfirmedMealDraftItem {
+  mealItemId: string;
+  foodId: string;
+  nutrientProfileId: string | null;
+  nutrients: ConfirmedMealNutritionItem['nutrients'];
+  provenance: {
+    calculationVersion: string;
+    sourceRegistryId: string | null;
+    sourceItemId: string | null;
+    datasetVersion: string | null;
+    nutrientProfileId: string | null;
+  };
+  checkpoint: {
+    reviewedItemRevision: number;
+    reviewedAuthorityFingerprintVersion: string;
+    reviewedAuthorityFingerprint: string;
+    reviewIdempotencyKey: string;
+    reviewRequestFingerprint: string;
+    reviewedAt: string;
+  } | null;
+  authority: {
+    fingerprintVersion: string;
+    fingerprint: string;
+  } | null;
+}
+
+export interface ConfirmedMealDraftReview {
+  confirmable: false;
+  evidence: 'legacy_unknown' | 'explicit_v2';
+  reasons: [];
+}
+
+export interface ConfirmedMealDraftResponse {
+  mealLog: ConfirmedMealLog;
+  items: ConfirmedMealDraftItem[];
+  review: ConfirmedMealDraftReview;
   nutrition: ConfirmedMealNutrition;
 }
+
+/** GET returns either an editable draft review or an immutable nutrition snapshot. */
+export type MealDraftResponse =
+  | DraftMealDraftResponse
+  | ConfirmedMealDraftResponse;
+
+export type ConfirmMealDraftResponse = ConfirmedMealDraftResponse;
 
 export interface CreateMealDraftInput {
   imageAssetId: string;
@@ -177,7 +281,7 @@ export interface MealDraftItemInput {
 }
 
 export function createMealDraft(input: CreateMealDraftInput) {
-  return apiRequest<MealDraftResponse>('/api/meal-logs', {
+  return apiRequest<DraftMealDraftResponse>('/api/meal-logs', {
     method: 'POST',
     body: JSON.stringify(input),
   });
@@ -257,29 +361,38 @@ export function mapMealDraftItemFood(
     },
   );
 }
-export function reviewMealDraft(
+export function reviewMealDraftItem(
   mealLogId: string,
+  itemId: string,
   input: {
     expectedDraftRevision: number;
-    items: {
-      itemId: string;
-      expectedItemRevision: number;
-      foodAcknowledgedRevision?: number;
-      portionAcknowledgedRevision?: number;
-    }[];
+    expectedItemRevision: number;
+    idempotencyKey: string;
+    displayedAuthorityFingerprintVersion: string;
+    displayedAuthorityFingerprint: string;
   },
 ) {
-  return apiRequest<MealDraftResponse>(`/api/meal-logs/${mealLogId}/review`, {
-    method: 'POST',
-    body: JSON.stringify(input),
-  });
+  return apiRequest<MealDraftResponse>(
+    `/api/meal-logs/${mealLogId}/items/${itemId}/review`,
+    {
+      method: 'POST',
+      body: JSON.stringify(input),
+    },
+  );
 }
 
 export function confirmMealDraft(
   mealLogId: string,
   input: {
     expectedDraftRevision: number;
-    items: { itemId: string; expectedItemRevision: number }[];
+    idempotencyKey: string;
+    items: {
+      itemId: string;
+      expectedItemRevision: number;
+      mappingDecisionId?: string;
+      calculationPreviewId?: string;
+      decompositionRevisionId?: string;
+    }[];
   },
 ) {
   return apiRequest<ConfirmMealDraftResponse>(

@@ -10,6 +10,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
+import { randomUUID } from 'expo-crypto';
 
 import {
   addMealDraftItem,
@@ -20,9 +21,10 @@ import {
   mapMealDraftItemFood,
   retryMealDraftRecognition,
   startManualMealDraftEntry,
-  reviewMealDraft,
+  reviewMealDraftItem,
   type ConfirmedNutrientValue,
   type ConfirmedMealNutrition,
+  type DraftMealDraftResponse,
   type MealDraftItem,
   type MealDraftResponse,
   type MealUnit,
@@ -35,10 +37,10 @@ import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import {
-  createNutritionPreview,
   decimalToMilliunits,
   formatNutritionValue,
   hasUnsavedMealDraftItemForms,
+  mealCalculationBasisLabel,
   mealUnitLabel,
   nutritionKeys,
 } from '@/meals/meal-draft-policy';
@@ -48,18 +50,17 @@ import {
 } from '@/meals/food-selection-policy';
 import {
   RECOGNITION_MAX_ELAPSED_MS,
-  areReviewReasonsAcknowledgeable,
   canAddMealDraftItem,
-  deriveMealConfirmationActions,
-  isExactFoodMappingTransition,
-  isExactItemDeleteTransition,
-  isExactItemUpdateTransition,
-  isExactReviewTransition,
   isRetakeReason,
   recognitionPollDelay,
-  reviewReasonCopy,
   type RecognitionStatus,
 } from '@/meals/meal-recognition-policy';
+import {
+  deriveMealConfirmationReviewPolicy,
+  deriveMealItemAuthorityRecovery,
+  deriveReviewNutritionCopy,
+  isConfirmedMealResponseProjection,
+} from '@/meals/meal-confirmation-review-policy';
 
 const units: MealUnit[] = ['g', 'ml', 'serving', 'bowl', 'piece'];
 
@@ -112,19 +113,6 @@ export function MealConfirmationModal({
     new Set(),
   );
   const [hydrationErrors, setHydrationErrors] = useState<Record<string, string>>({});
-  const [confirmationState, setConfirmationState] = useState<{
-    mealLogId: string;
-    nutrition: ConfirmedMealNutrition | null;
-    errors: string[];
-  } | null>(null);
-  const confirmedNutrition =
-    confirmationState?.mealLogId === mealLogId
-      ? confirmationState.nutrition
-      : null;
-  const confirmationErrors =
-    confirmationState?.mealLogId === mealLogId
-      ? confirmationState.errors
-      : [];
   const foodSearchRequest = useRef(0);
   const mounted = useRef(true);
   const visibleRef = useRef(visible);
@@ -155,18 +143,26 @@ export function MealConfirmationModal({
       generation: number,
     ) => {
       if (!isCurrent(mealId, generation) || response.mealLog.id !== mealId) return;
-      itemsRef.current = response.items;
       setData(response);
       setLoadedMealLogId(response.mealLog.id);
-      setForms(formsFromItems(response.items));
-      setMappedFoods((current) =>
-        Object.fromEntries(
-          response.items.flatMap((item) => {
-            const food = current[item.id];
-            return item.foodId === food?.id ? [[item.id, food]] : [];
-          }),
-        ),
-      );
+      if (isDraftMealDraftResponse(response)) {
+        itemsRef.current = response.items;
+        setForms(formsFromItems(response.items));
+        setMappedFoods((current) =>
+          Object.fromEntries(
+            response.items.flatMap((item) => {
+              const food = current[item.id];
+              return item.foodId === food?.id ? [[item.id, food]] : [];
+            }),
+          ),
+        );
+      } else {
+        itemsRef.current = [];
+        setForms({});
+        setMappedFoods({});
+        setHydrationErrors({});
+        setImageUrl(null);
+      }
     },
     [isCurrent],
   );
@@ -232,6 +228,8 @@ export function MealConfirmationModal({
         setRecognitionTimedOut(false);
         applyResponse(mealDraft, mealLogId, generation);
 
+        if (isConfirmedMealResponseProjection(mealDraft)) return;
+
         if (mealDraft.items.some((item) => item.foodId)) {
           const { foods: mapped, errors } = await loadMappedFoods(
             mealDraft.items,
@@ -258,7 +256,11 @@ export function MealConfirmationModal({
         }
 
         if (loadImage) setImageUrl(null);
-        if (loadImage && mealDraft.mealLog.imageAssetId) {
+        if (
+          loadImage &&
+          mealDraft.mealLog.status === 'draft' &&
+          mealDraft.mealLog.imageAssetId
+        ) {
           setImageUrl(null);
           try {
             const intent = await getMealImageDownloadIntent(
@@ -437,10 +439,12 @@ export function MealConfirmationModal({
   }
 
   function startManualEntry() {
+    if (!data || !isDraftMealDraftResponse(data)) return;
+    const draftRevision = data.mealLog.draftRevision;
     enqueueMutation('recognition', async (scopedMealId, generation) => {
       const response = await startManualMealDraftEntry(
         scopedMealId,
-        data?.mealLog.draftRevision ?? 0,
+        draftRevision,
       );
       if (!isCurrent(scopedMealId, generation)) return;
       applyResponse(response, scopedMealId, generation);
@@ -466,14 +470,6 @@ export function MealConfirmationModal({
 
   function selectFood(item: MealDraftItem, food: CanonicalFood) {
     if (!isEditable || !data) return;
-    const baseline = data;
-    const transitionInput = {
-      itemId: item.id,
-      expectedItemRevision: item.itemRevision,
-      foodId: food.id,
-      recognizedLabel: food.canonicalNameKo,
-      nutrientProfileId: food.nutrientProfile.id,
-    };
     enqueueMutation(
       item.id,
       async (scopedMealId, generation) => {
@@ -506,8 +502,35 @@ export function MealConfirmationModal({
         setFoodSearchItemId(null);
         setFoodQuery('');
       },
-      (latest) => isExactFoodMappingTransition(latest, baseline, transitionInput),
     );
+  }
+
+  function selectResolutionCandidate(item: MealDraftItem, foodId: string) {
+    if (!isEditable || !data) return;
+    enqueueMutation(item.id, async (scopedMealId, generation) => {
+      const food = await getFood(foodId);
+      const response = await mapMealDraftItemFood(
+        scopedMealId,
+        item.id,
+        food.id,
+        item.itemRevision,
+      );
+      if (!isCurrent(scopedMealId, generation)) return;
+      setMappedFoods((current) => ({ ...current, [item.id]: food }));
+      setInvalidatedMappings((current) => {
+        const next = new Set(current);
+        next.delete(item.id);
+        return next;
+      });
+      applyResponse(response, scopedMealId, generation);
+      setForms((current) => ({
+        ...current,
+        [item.id]: {
+          ...current[item.id],
+          recognizedLabel: food.canonicalNameKo,
+        },
+      }));
+    });
   }
 
   function updateForm(itemId: string, update: Partial<ItemForm>) {
@@ -536,12 +559,6 @@ export function MealConfirmationModal({
       ...(form.unit === item.unit ? {} : { unit: form.unit }),
     };
     if (Object.keys(changes).length === 0 || !data) return;
-    const baseline = data;
-    const transitionInput = {
-      itemId: item.id,
-      expectedItemRevision: item.itemRevision,
-      ...changes,
-    };
     enqueueMutation(
       item.id,
       async (scopedMealId, generation) => {
@@ -551,48 +568,37 @@ export function MealConfirmationModal({
         });
         applyResponse(response, scopedMealId, generation);
       },
-      (latest) => isExactItemUpdateTransition(latest, baseline, transitionInput),
     );
   }
-  function requiredReviewInput() {
-    if (!data || data.review.requiredReviewFields.length === 0) return null;
-    return {
-      expectedDraftRevision: data.mealLog.draftRevision,
-      items: data.review.requiredReviewFields.flatMap((field) => {
-        const item = data.items.find((current) => current.id === field.itemId);
-        if (!item) return [];
-        return [{
-          itemId: item.id,
-          expectedItemRevision: item.itemRevision,
-          ...(field.fields.includes('food')
-            ? { foodAcknowledgedRevision: item.foodRevision }
-            : {}),
-          ...(field.fields.includes('portion')
-            ? { portionAcknowledgedRevision: item.portionRevision }
-            : {}),
-        }];
-      }),
-    };
-  }
-  function acknowledgeRequiredReview() {
-    const input = requiredReviewInput();
-    const baseline = data;
-    if (!input || !baseline) return;
+  function reviewItem(item: MealDraftItem) {
+    if (
+      !data ||
+      !isDraftMealDraftResponse(data) ||
+      item.review.status !== 'required' ||
+      item.review.authority.fingerprint === null
+    ) {
+      return;
+    }
     enqueueMutation(
-      'review',
+      item.id,
       async (scopedMealId, generation) => {
-        const response = await reviewMealDraft(scopedMealId, input);
+        const response = await reviewMealDraftItem(scopedMealId, item.id, {
+          expectedDraftRevision: data.mealLog.draftRevision,
+          expectedItemRevision: item.itemRevision,
+          idempotencyKey: randomUUID(),
+          displayedAuthorityFingerprintVersion:
+            item.review.authority.fingerprintVersion,
+          displayedAuthorityFingerprint: item.review.authority.fingerprint!,
+        });
         applyResponse(response, scopedMealId, generation);
       },
-      (latest) => isExactReviewTransition(latest, baseline, input),
     );
   }
 
   function removeItem(itemId: string) {
-    if (!isEditable || !data) return;
+    if (!isEditable || !data || !isDraftMealDraftResponse(data)) return;
     const item = itemsRef.current.find((current) => current.id === itemId);
     if (!item) return;
-    const baseline = data;
     const transitionInput = {
       itemId,
       expectedDraftRevision: data.mealLog.draftRevision,
@@ -607,7 +613,6 @@ export function MealConfirmationModal({
         });
         applyResponse(response, scopedMealId, generation);
       },
-      (latest) => isExactItemDeleteTransition(latest, baseline, transitionInput),
     );
   }
 
@@ -616,7 +621,7 @@ export function MealConfirmationModal({
   }
 
   function saveManualItem() {
-    if (!manualForm || !isEditable) return;
+    if (!manualForm || !isEditable || !data || !isDraftMealDraftResponse(data)) return;
     const recognizedLabel = manualForm.recognizedLabel.trim();
     const amountMilliunits = decimalToMilliunits(manualForm.amount);
     const unit = manualForm.unit;
@@ -626,7 +631,7 @@ export function MealConfirmationModal({
     }
     enqueueMutation('new', async (scopedMealId, generation) => {
       const response = await addMealDraftItem(scopedMealId, {
-        expectedDraftRevision: data?.mealLog.draftRevision ?? 0,
+        expectedDraftRevision: data.mealLog.draftRevision,
         recognizedLabel,
         amountMilliunits,
         unit,
@@ -637,97 +642,52 @@ export function MealConfirmationModal({
     });
   }
   const currentData = loadedMealLogId === mealLogId ? data : null;
+  const draftData =
+    currentData && isDraftMealDraftResponse(currentData) ? currentData : null;
+  const confirmedNutrition =
+    currentData && isConfirmedMealResponseProjection(currentData)
+      ? currentData.nutrition
+      : null;
   const currentError = loadErrorMealLogId === mealLogId ? loadError : null;
   const isEditable =
-    !confirmedNutrition &&
-    currentData?.mealLog.status === 'draft' &&
-    (currentData.mealLog.recognitionStatus === 'ready' ||
-      currentData.mealLog.recognitionStatus === 'manual');
+    draftData !== null &&
+    (draftData.mealLog.recognitionStatus === 'ready' ||
+      draftData.mealLog.recognitionStatus === 'manual');
   const canRecoverRecognition =
-    currentData?.mealLog.recognitionStatus === 'failed' || recognitionTimedOut;
+    draftData?.mealLog.recognitionStatus === 'failed' || recognitionTimedOut;
   const canOverrideZeroItemRecognition =
-    currentData?.mealLog.recognitionStatus === 'ready' &&
-    currentData.items.length === 0 &&
-    currentData.mealLog.recognitionOutcome !== null &&
-    isRetakeReason(currentData.mealLog.recognitionOutcome);
+    draftData?.mealLog.recognitionStatus === 'ready' &&
+    draftData.items.length === 0 &&
+    draftData.mealLog.recognitionOutcome !== null &&
+    isRetakeReason(draftData.mealLog.recognitionOutcome);
   const canAddDirectItem =
-    currentData !== null &&
+    draftData !== null &&
     canAddMealDraftItem(
-      currentData.mealLog.recognitionStatus,
-      currentData.mealLog.recognitionOutcome,
+      draftData.mealLog.recognitionStatus,
+      draftData.mealLog.recognitionOutcome,
     );
-  const requiredReviewFields = new Map(
-    currentData?.review.requiredReviewFields.map((field) => [
-      field.itemId,
-      field.fields,
-    ]) ?? [],
-  );
-  const nutritionPreview = createNutritionPreview(
-    currentData?.items.map((item) => {
-      const food = mappedFoods[item.id];
-      const form = forms[item.id];
-      const mappingCurrent =
-        !invalidatedMappings.has(item.id) &&
-        isFoodMappingCurrent(item.currentResolution);
-      return {
-        ...item,
-        amountMilliunits:
-          form ? (decimalToMilliunits(form.amount) ?? 0) : item.amountMilliunits,
-        unit: form?.unit ?? item.unit,
-        food: mappingCurrent ? food : null,
-      };
-    }) ?? [],
-  );
-  const aiEstimateNutritionPreview = createNutritionPreview(
-    currentData?.items.flatMap((item) => {
-      if (
-        item.origin !== 'model_estimate' ||
-        item.estimatedAmountMilliunits === null ||
-        item.estimatedUnit === null
-      ) {
-        return [];
-      }
-      const food = mappedFoods[item.id];
-      const mappingCurrent =
-        !invalidatedMappings.has(item.id) &&
-        isFoodMappingCurrent(item.currentResolution);
-      return [{
-        ...item,
-        amountMilliunits: item.estimatedAmountMilliunits,
-        unit: item.estimatedUnit,
-        food: mappingCurrent ? food : null,
-      }];
-    }) ?? [],
-  );
-  const hasAiEstimate = aiEstimateNutritionPreview.items.length > 0;
   const hasUnsavedItemForms =
-    currentData !== null &&
-    hasUnsavedMealDraftItemForms(currentData.items, forms);
-  const confirmationActions = currentData
-    ? deriveMealConfirmationActions({
-        reasonCodes: currentData.review.reasons.map((reason) => reason.code),
-        reviewConfirmable: currentData.review.confirmable,
-        itemCount: currentData.items.length,
-        allItemsResolved: currentData.items.every(
-          (item) => item.currentResolution?.status === 'resolved',
-        ),
-        hasUnsavedItemForms,
-        hasManualForm: Boolean(manualForm),
+    draftData !== null &&
+    hasUnsavedMealDraftItemForms(draftData.items, forms);
+  const reviewPolicy = draftData
+    ? deriveMealConfirmationReviewPolicy({
+        items: draftData.items.map((item) => ({
+          itemId: item.id,
+          review: item.review,
+        })),
+        serverConfirmable: draftData.review.confirmable,
+        hasUnsavedChanges: hasUnsavedItemForms || Boolean(manualForm),
+        hasPendingMutation: savingItemId !== null,
       })
-    : {
-        hasCorrectionReasons: false,
-        hasPolicyAcknowledgementOnly: false,
-        canConfirmMeal: false,
-      };
-  const { canConfirmMeal } = confirmationActions;
-  const hasAcknowledgeableReview = areReviewReasonsAcknowledgeable(
-    currentData?.review.reasons.map((reason) => reason.code) ?? [],
-  );
+    : null;
+  const canConfirmMeal = reviewPolicy?.canConfirmMeal ?? false;
 
   function confirmMeal() {
     const { mealLogId: scopedMealId, generation } = scopeRef.current;
+    const confirmationDraft = draftData;
     if (
       !scopedMealId ||
+      !confirmationDraft ||
       !canConfirmMeal ||
       mutationInFlight.current ||
       confirmationInFlight.current ||
@@ -741,30 +701,7 @@ export function MealConfirmationModal({
     scopeRequestController.current.abort();
     const token = ++confirmationToken.current;
     setSavingItemId('confirmation');
-    setConfirmationState({
-      mealLogId: scopedMealId,
-      nutrition: null,
-      errors: [],
-    });
-    const reviewInput = requiredReviewInput();
-    const preparedDraft = reviewInput
-      ? reviewMealDraft(scopedMealId, reviewInput).catch((cause) => {
-          const latest = staleLatest(cause);
-          if (
-            latest &&
-            currentData &&
-            isExactReviewTransition(latest, currentData, reviewInput)
-          ) {
-            return latest;
-          }
-          if (latest) {
-            applyResponse(latest, scopedMealId, generation);
-            setLoadError('다른 곳에서 변경되었습니다. 최신 내용을 확인해 주세요.');
-          }
-          throw cause;
-        })
-      : Promise.resolve(currentData!);
-    void preparedDraft
+    void Promise.resolve(confirmationDraft)
       .then((draftResponse) => {
         if (!isCurrent(scopedMealId, generation)) {
           throw new Error('STALE_CONFIRMATION_SCOPE');
@@ -775,32 +712,54 @@ export function MealConfirmationModal({
         }
         return confirmMealDraft(scopedMealId, {
           expectedDraftRevision: draftResponse.mealLog.draftRevision,
+          idempotencyKey: randomUUID(),
           items: draftResponse.items.map((item) => ({
             itemId: item.id,
             expectedItemRevision: item.itemRevision,
+            ...(item.currentResolution?.decisionId
+              ? { mappingDecisionId: item.currentResolution.decisionId }
+              : {}),
+            ...(item.currentResolution?.previewId
+              ? { calculationPreviewId: item.currentResolution.previewId }
+              : {}),
+            ...(item.currentResolution?.decompositionRevisionId
+              ? {
+                  decompositionRevisionId:
+                    item.currentResolution.decompositionRevisionId,
+                }
+              : {}),
           })),
         });
       })
       .then((response) => {
         if (!isCurrent(scopedMealId, generation)) return;
-        setConfirmationState({
-          mealLogId: scopedMealId,
-          nutrition: response.nutrition,
-          errors: [],
-        });
+        applyResponse(response, scopedMealId, generation);
         try {
           onConfirmed?.();
         } catch {
           // A consumer refresh failure must not rewrite a successful confirmation.
         }
       })
-      .catch((cause) => {
+      .catch(async (cause) => {
         if (!isCurrent(scopedMealId, generation)) return;
-        setConfirmationState({
-          mealLogId: scopedMealId,
-          nutrition: null,
-          errors: confirmationErrorMessages(cause, itemsRef.current),
-        });
+        try {
+          const reconciled = await getMealDraft(scopedMealId);
+          if (!isCurrent(scopedMealId, generation)) return;
+          if (isConfirmedMealResponseProjection(reconciled)) {
+            applyResponse(reconciled, scopedMealId, generation);
+            try {
+              onConfirmed?.();
+            } catch {
+              // A consumer refresh failure must not rewrite a successful confirmation.
+            }
+            return;
+          }
+          applyResponse(reconciled, scopedMealId, generation);
+          setLoadError(errorMessage(cause));
+        } catch {
+          if (isCurrent(scopedMealId, generation))
+            setLoadError(errorMessage(cause));
+        }
       })
       .finally(() => {
         if (confirmationToken.current !== token) return;
@@ -819,7 +778,6 @@ export function MealConfirmationModal({
     foodSearchController.current?.abort();
     setSavingItemId(null);
     setManualForm(null);
-    setConfirmationState(null);
     onClose();
   }
 
@@ -837,7 +795,9 @@ export function MealConfirmationModal({
           <View style={styles.headerCopy}>
             <ThemedText type="subtitle">음식 확인</ThemedText>
             <ThemedText type="small" themeColor="textSecondary">
-              저장된 초안은 섭취 또는 영양 기록으로 확정되지 않아요.
+              {confirmedNutrition
+                ? '확정된 식사 기록은 수정할 수 없어요.'
+                : '저장된 초안은 섭취 또는 영양 기록으로 확정되지 않아요.'}
             </ThemedText>
           </View>
           <ModalButton
@@ -887,16 +847,16 @@ export function MealConfirmationModal({
                 style={styles.image}
               />
             )}
-            <View style={styles.recognition}>
+            {draftData && <View style={styles.recognition}>
               <ThemedText type="smallBold">인식 결과</ThemedText>
               <ThemedText type="small" themeColor="textSecondary">
-                {currentData.mealLog.recognitionStatus === 'pending' ||
-                currentData.mealLog.recognitionStatus === 'processing'
+                {draftData.mealLog.recognitionStatus === 'pending' ||
+                draftData.mealLog.recognitionStatus === 'processing'
                   ? '사진에서 음식을 인식하고 있어요. 완료될 때까지 잠시만 기다려 주세요.'
-                  : `상태: ${currentData.mealLog.recognitionStatus} · 제공자: ${currentData.mealLog.recognitionProvider ?? '알 수 없음'} · 모델: ${currentData.mealLog.recognitionModel ?? '알 수 없음'}`}
+                  : `상태: ${draftData.mealLog.recognitionStatus} · 제공자: ${draftData.mealLog.recognitionProvider ?? '알 수 없음'} · 모델: ${draftData.mealLog.recognitionModel ?? '알 수 없음'}`}
               </ThemedText>
-              {(currentData.mealLog.recognitionStatus === 'pending' ||
-                currentData.mealLog.recognitionStatus === 'processing') && (
+              {(draftData.mealLog.recognitionStatus === 'pending' ||
+                draftData.mealLog.recognitionStatus === 'processing') && (
                 <View
                   accessibilityLabel="AI 음식 인식 진행 중"
                   accessibilityLiveRegion="polite"
@@ -908,11 +868,11 @@ export function MealConfirmationModal({
                   </ThemedText>
                 </View>
               )}
-              {(currentData.mealLog.recognitionStatus === 'pending' ||
-                currentData.mealLog.recognitionStatus === 'processing') &&
-                currentData.mealLog.recognitionNextAttemptAt && (
+              {(draftData.mealLog.recognitionStatus === 'pending' ||
+                draftData.mealLog.recognitionStatus === 'processing') &&
+                draftData.mealLog.recognitionNextAttemptAt && (
                   <ThemedText type="small" themeColor="textSecondary">
-                    다음 확인: {currentData.mealLog.recognitionNextAttemptAt}
+                    다음 확인: {draftData.mealLog.recognitionNextAttemptAt}
                   </ThemedText>
                 )}
               {canRecoverRecognition && (
@@ -948,29 +908,8 @@ export function MealConfirmationModal({
                   />
                 </View>
               )}
-            </View>
-            {isEditable && hasAiEstimate && (
-              <View style={styles.nutritionCard}>
-                <ThemedText type="smallBold">AI가 본 사진 전체 기준</ThemedText>
-                <ThemedText type="small" themeColor="textSecondary">
-                  사진에서 추정한 음식과 전체 양을 공식 음식 DB에 연결해 계산했어요.
-                  실제로 먹은 양은 아래에서 수정해 주세요.
-                </ThemedText>
-                {nutritionKeys.map((key) => {
-                  const total = aiEstimateNutritionPreview.totals[key];
-                  return (
-                    <ThemedText key={key} type="small">
-                      {nutritionLabel(key)}:{' '}
-                      {total.knownValue === null
-                        ? '계산 필요'
-                        : formatNutritionValue(total.knownValue, key)}
-                      {total.completeness === 'partial' ? ' · 일부 음식 미확인' : ''}
-                    </ThemedText>
-                  );
-                })}
-              </View>
-            )}
-            {isEditable && currentData.items.map((item) => {
+            </View>}
+            {draftData && isEditable && draftData.items.map((item) => {
               const form = forms[item.id];
               if (!form) return null;
               const saving = savingItemId !== null;
@@ -979,13 +918,9 @@ export function MealConfirmationModal({
                 item.foodId !== null &&
                 (invalidatedMappings.has(item.id) ||
                   !isFoodMappingCurrent(item.currentResolution));
-              const hasItemCorrectionReason = currentData.review.reasons.some(
-                (reason) =>
-                  reason.itemId === item.id &&
-                  reason.code !== 'QUICK_CONFIRM_POLICY_DISABLED',
-              );
+              const authorityRecovery = deriveMealItemAuthorityRecovery(item.review);
               const isExpanded =
-                (requiredReviewFields.has(item.id) && hasItemCorrectionReason) ||
+                reviewPolicy?.recommendedNextItemId === item.id ||
                 item.currentResolution?.status !== 'resolved' ||
                 expandedItemIds.has(item.id);
               if (!isExpanded) {
@@ -995,6 +930,11 @@ export function MealConfirmationModal({
                     <ThemedText type="small" themeColor="textSecondary">
                       {form.amount} {mealUnitLabel(form.unit)} · 공식 DB 연결됨
                     </ThemedText>
+                    {item.currentResolution?.composition === 'meal_decomposition' && (
+                      <ThemedText type="small" themeColor="textSecondary">
+                        {mealCalculationBasisLabel(item.currentResolution.composition)}
+                      </ThemedText>
+                    )}
                     <ModalButton
                       disabled={saving}
                       label="수정"
@@ -1007,12 +947,14 @@ export function MealConfirmationModal({
                 );
               }
               const searchOpen = foodSearchItemId === item.id;
-              const nutritionItem = nutritionPreview.items.find(
-                (previewItem) => previewItem.itemId === item.id,
-              );
               return (
                 <View key={item.id} style={styles.itemCard}>
                   <ThemedText type="smallBold">음식</ThemedText>
+                  {item.currentResolution?.composition === 'meal_decomposition' && (
+                    <ThemedText type="small" themeColor="textSecondary">
+                      이 음식은 완성 음식 영양과 합산하지 않고, {mealCalculationBasisLabel(item.currentResolution.composition)}만 계산합니다.
+                    </ThemedText>
+                  )}
                   <TextInput
                     accessibilityLabel="음식 이름"
                     editable={!saving}
@@ -1052,15 +994,30 @@ export function MealConfirmationModal({
                       다시 연결 필요
                     </ThemedText>
                   )}
-                  {nutritionItem?.status === 'needs-review' && (
-                    <ThemedText
-                      accessibilityRole="alert"
-                      type="smallBold"
-                      style={styles.mappingInvalid}
-                    >
-                      영양 계산: 확인 필요
-                    </ThemedText>
-                  )}
+                  {(item.currentResolution?.candidates ?? [])
+                    .filter((candidate) => candidate.availability === 'available')
+                    .map((candidate) => (
+                      <Pressable
+                        key={candidate.foodId}
+                        accessibilityLabel={`${candidate.labelKo}, 공식 DB 검색 후보 일치도 ${Math.round(candidate.scoreBps / 100)}퍼센트, 선택`}
+                        accessibilityRole="button"
+                        disabled={saving}
+                        onPress={() =>
+                          selectResolutionCandidate(item, candidate.foodId)
+                        }
+                        style={({ pressed }) => [
+                          styles.foodResult,
+                          (pressed || saving) && styles.pressed,
+                        ]}
+                      >
+                        <ThemedText type="smallBold">
+                          {candidate.labelKo}
+                        </ThemedText>
+                        <ThemedText type="small" themeColor="textSecondary">
+                          공식 DB 검색 후보 · 일치도 {Math.round(candidate.scoreBps / 100)}%
+                        </ThemedText>
+                      </Pressable>
+                    ))}
                   <ModalButton
                     disabled={saving}
                     label={searchOpen ? '음식 검색 닫기' : '한국 음식 DB 검색'}
@@ -1210,6 +1167,42 @@ export function MealConfirmationModal({
                       onPress={() => void removeItem(item.id)}
                       secondary
                     />
+                    {item.review.status === 'required' && authorityRecovery && (
+                      <View style={styles.itemActions}>
+                        <ThemedText type="small" themeColor="textSecondary">
+                          {authorityRecovery.instruction}
+                        </ThemedText>
+                        <ModalButton
+                          disabled={saving}
+                          label={authorityRecovery.label}
+                          onPress={() => {
+                            if (authorityRecovery.kind === 'search_food') {
+                              setFoodSearchItemId(item.id);
+                              setFoodSearchState({ status: 'idle', foods: [] });
+                              setFoodQuery(form.recognizedLabel);
+                              return;
+                            }
+                            setPollGeneration((current) => current + 1);
+                          }}
+                          secondary
+                        />
+                      </View>
+                    )}
+                    {item.review.status === 'required' && !authorityRecovery && (
+                      <ModalButton
+                        disabled={
+                          saving ||
+                          hasUnsavedItemForms
+                        }
+                        label={
+                          savingItemId === item.id
+                            ? '확인 중'
+                            : '확인하고 다음'
+                        }
+                        onPress={() => reviewItem(item)}
+                        secondary
+                      />
+                    )}
                   </View>
                 </View>
               );
@@ -1294,39 +1287,28 @@ export function MealConfirmationModal({
                 secondary
               />
             )}
-            {isEditable && !confirmedNutrition && (
+            {isEditable && draftData && (
               <View style={styles.nutritionCard}>
-                <ThemedText type="smallBold">내가 먹은 양 기준 영양</ThemedText>
+                <ThemedText type="smallBold">서버 검토 영양</ThemedText>
+                <ThemedText type="small" themeColor="textSecondary">
+                  검토 완료 {draftData.review.nutrition.reviewedItemCount}개 · 미검토{' '}
+                  {draftData.review.nutrition.unreviewedItemCount}개
+                </ThemedText>
                 {nutritionKeys.map((key) => {
-                  const total = nutritionPreview.totals[key];
+                  const total = draftData.review.nutrition?.totals[key] ?? null;
+                  const copy = deriveReviewNutritionCopy(
+                    total,
+                    draftData.review.nutrition.reviewedItemCount,
+                  );
                   return (
                     <ThemedText key={key} type="small" themeColor="textSecondary">
-                      {nutritionLabel(key)}:{' '}
-                      {total.knownValue === null
-                        ? '확인 필요'
-                        : formatNutritionValue(total.knownValue, key)}
-                      {total.completeness === 'partial' ? ' · 일부 항목 미확인' : ''}
+                      {nutritionLabel(key)} {copy.label}:{' '}
+                      {copy.value === '—'
+                        ? copy.value
+                        : formatNutritionValue(total!.knownValue!, key)}
                     </ThemedText>
                   );
                 })}
-                {currentData.review.reasons.map((reason) => (
-                  <ThemedText
-                    key={`${reason.code}-${reason.itemId ?? 'meal'}`}
-                    accessibilityRole="alert"
-                    type="small"
-                    style={styles.mappingInvalid}
-                  >
-                    {reviewReasonCopy(reason.code)}
-                  </ThemedText>
-                ))}
-                {hasAcknowledgeableReview && currentData.review.requiredReviewFields.length > 0 && (
-                  <ModalButton
-                    disabled={savingItemId !== null || hasUnsavedItemForms}
-                    label={savingItemId === 'review' ? '확인 중' : '추정값 확인'}
-                    onPress={acknowledgeRequiredReview}
-                    secondary
-                  />
-                )}
                 <ModalButton
                   disabled={!canConfirmMeal || savingItemId !== null}
                   label={savingItemId === 'confirmation' ? '기록 중' : '이대로 기록'}
@@ -1334,16 +1316,6 @@ export function MealConfirmationModal({
                 />
               </View>
             )}
-            {confirmationErrors.map((message) => (
-              <ThemedText
-                key={message}
-                accessibilityRole="alert"
-                type="small"
-                style={styles.errorText}
-              >
-                {message}
-              </ThemedText>
-            ))}
             {confirmedNutrition && (
               <View style={styles.recognition}>
                 <ThemedText type="smallBold">확정된 영양</ThemedText>
@@ -1364,9 +1336,6 @@ export function MealConfirmationModal({
                   >
                     {confirmedItemSourceLabel(
                       item,
-                      currentData?.items.find(
-                        (draftItem) => draftItem.id === item.mealItemId,
-                      )?.recognizedLabel,
                     )}
                   </ThemedText>
                 ))}
@@ -1402,6 +1371,12 @@ function formsFromItems(items: MealDraftItem[]) {
       },
     ]),
   );
+}
+
+function isDraftMealDraftResponse(
+  response: MealDraftResponse,
+): response is DraftMealDraftResponse {
+  return response.mealLog.status === 'draft';
 }
 
 async function loadMappedFoods(
@@ -1473,7 +1448,6 @@ function formatConfirmedNutritionValue(
 
 function confirmedItemSourceLabel(
   item: ConfirmedMealNutrition['items'][number],
-  recognizedLabel: string | undefined,
 ) {
   const serving = item.source.servingId
     ? ` · 제공량 ${item.source.servingId} (${item.source.servingQualityGrade ?? '품질 정보 없음'}${
@@ -1482,60 +1456,9 @@ function confirmedItemSourceLabel(
           : ''
       })`
     : '';
-  return `출처 · ${recognizedLabel ?? '알 수 없는 음식'} · 프로필 ${item.source.qualityGrade} · ${
+  return `출처 · 음식 ${item.source.foodId} · 프로필 ${item.source.qualityGrade} · ${
     item.source.sourceRegistryId
   } · ${item.source.sourceItemId} · ${item.source.datasetVersion}${serving}`;
-}
-
-function confirmationErrorMessages(cause: unknown, items: MealDraftItem[]) {
-  const details = (
-    cause instanceof ApiError
-      ? (cause as ApiError & { details?: unknown }).details
-      : undefined
-  ) as { items?: unknown } | undefined;
-  if (!Array.isArray(details?.items)) {
-    return [cause instanceof Error ? cause.message : errorMessage(cause)];
-  }
-
-  const messages = details.items.flatMap((detail) => {
-    if (!detail || typeof detail !== 'object' || !('code' in detail) || typeof detail.code !== 'string') {
-      return [];
-    }
-    const itemId =
-      'itemId' in detail && typeof detail.itemId === 'string'
-        ? detail.itemId
-        : undefined;
-    const label = itemId
-      ? items.find((item) => item.id === itemId)?.recognizedLabel
-      : undefined;
-    return [`${label ? `${label}: ` : ''}${confirmationCodeMessage(detail.code)}`];
-  });
-  return messages.length > 0
-    ? messages
-    : [cause instanceof Error ? cause.message : errorMessage(cause)];
-}
-
-function confirmationCodeMessage(code: string) {
-  switch (code) {
-    case 'MISSING_MAPPING':
-      return '공식 음식 DB 연결이 필요합니다.';
-    case 'MISSING_FOOD':
-    case 'DEPRECATED_FOOD':
-      return '선택한 음식 정보를 다시 연결해 주세요.';
-    case 'MISSING_PROFILE':
-    case 'MISMATCHED_PROFILE':
-    case 'UNTRUSTED_PROFILE_SOURCE':
-    case 'INCOMPLETE_PROFILE':
-      return '신뢰할 수 있는 영양 정보를 다시 선택해 주세요.';
-    case 'MISSING_SERVING_CONVERSION':
-      return '선택한 단위의 제공량 변환이 필요합니다.';
-    case 'AMBIGUOUS_SERVING_CONVERSION':
-      return '제공량 변환이 하나로 결정되지 않습니다. 단위를 바꿔 주세요.';
-    case 'UNTRUSTED_SERVING_SOURCE':
-      return '신뢰할 수 있는 제공량 정보를 다시 선택해 주세요.';
-    default:
-      return '식사 항목을 확인해 주세요.';
-  }
 }
 
 function confidenceLabel(basisPoints: number | null) {

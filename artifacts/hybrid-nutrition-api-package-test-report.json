@@ -1,0 +1,32 @@
+{
+  "kind": "api-package-test-report",
+  "runId": "019ff3e2-ad7d-7000-9ddb-b4b1c793a4c2-G007-generation-5",
+  "sourceHash": "sha256:5143749d7f494c351bab13426fd1523a9c121a2c7446892a0dcfcbd2ea6e6f68",
+  "sourceHashScope": "tracked binary diff plus sorted untracked source/migration files; excludes this self-referential receipt",
+  "approvedPlan": {
+    "path": ".gjc/_session-019ff3e2-ad7d-7000-9ddb-b4b1c793a4c2/plans/ralplan/019ff3e2-ad7d-7000-9ddb-b4b1c793a4c2/pending-approval.md",
+    "sha256": "6681dabece0a89da46370cb54c585da8dd297a07986ba7634a54a14849ea9434"
+  },
+  "status": "passed-local",
+  "commands": [
+    {"command":"bun test","exitStatus":0,"result":"269 pass, 0 fail, 1178 assertions"},
+    {"command":"bun run typecheck","exitStatus":0,"result":"domain, database, mobile, and API passed"},
+    {"command":"bun run lint","exitStatus":0,"result":"mobile lint passed with zero warnings"},
+    {"command":"bun run --cwd packages/database db:check","exitStatus":0,"result":"Drizzle schema and committed migrations through 0020 passed"},
+    {"command":"git diff --check","exitStatus":0,"result":"no whitespace errors"},
+    {"command":"complete change-set SHA-256 (tracked binary diff + sorted untracked files, excluding this receipt)","exitStatus":0,"result":"5143749d7f494c351bab13426fd1523a9c121a2c7446892a0dcfcbd2ea6e6f68"}
+  ],
+  "contractCoverage": [
+    {"contract":"recognition V3 and provider-once resolution retry","status":"covered-local","evidence":"Strict recognizer and coordinator suites cover persisted observation ownership, lease fencing, retry isolation, sparse region identity, and forbidden provider authority."},
+    {"contract":"active-release selection for V3 and manual roots","status":"covered-local","evidence":"Food/meal route tests pass; explicit selection creates release-bound observation, MappingDecision, and CalculationPreview and no longer falls through to mutable legacy selection. Trusted partial profiles are accepted."},
+    {"contract":"stale confirmation and immutable idempotency","status":"covered-local","evidence":"Current decision/preview/activation/selector drift routes to STALE_MEAL_CONFIRMATION; changed key reuse returns IDEMPOTENCY_KEY_REUSED without sequence two."},
+    {"contract":"composite provenance and no double count","status":"covered-local","evidence":"Confirmed snapshots retain every ordered revalidated leaf and calculation basis; no synthetic profile is created; domain composition tests cover multiple-basis rejection and deterministic scaling."},
+    {"contract":"guarded catalog publication","status":"implemented-and-statically-verified","evidence":"0020 adds durable keyset checkpoints; exact profile/serving/source-policy membership is canonically hashed; legacy profiles/servings are bound to exact SourceRelease before membership; index command verifies exact valid/ready GIN indexes with approved timeouts. Shared-Neon execution was not performed."},
+    {"contract":"source recipe product availability","status":"explicitly unavailable","evidence":"Runtime/docs state source_recipe remains dark until immutable recipe release membership exists; no fallback or readiness claim is made."},
+    {"contract":"vector and hybrid_auto activation","status":"fail-closed","evidence":"Vector requires verified pinned local E5 artifacts/backend; legacy aggregate evaluator cannot issue V3 auto activation evidence."}
+  ],
+  "limitations": [
+    "No shared Neon migration/control-plane request, production activation, external provider call, or device/simulator run was performed.",
+    "Source-recipe and vector/auto product modes remain deliberately unavailable behind their approved dependency gates."
+  ]
+}

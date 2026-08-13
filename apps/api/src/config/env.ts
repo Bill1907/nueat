@@ -1,12 +1,17 @@
 import { createHash, createPublicKey, verify as verifySignature } from 'node:crypto';
 import { z } from 'zod';
-import { MEAL_ESTIMATE_REVIEW_POLICY_VERSION } from '@nueat/domain';
+import { MEAL_REVIEW_POLICY_VERSION } from '@nueat/domain';
 
 import { MEAL_ITEM_RESOLVER_VERSION } from '../services/meal-item-resolution';
 import {
-  MEAL_RECOGNITION_PROMPT_VERSION,
-  MEAL_RECOGNITION_SCHEMA_VERSION,
+  MEAL_RECOGNITION_V3_PROMPT_VERSION,
+  MEAL_RECOGNITION_V3_SCHEMA_VERSION,
 } from '../services/meal-recognizer';
+import { MEAL_CONFIRMATION_CUTOVER_MODES } from '../services/meal-confirmation-cutover';
+import {
+  CATALOG_AUTO_SELECTION_COMPARATOR_VERSION,
+  CATALOG_AUTO_SELECTION_POLICY_VERSION,
+} from '../services/catalog-auto-selection-policy';
 
 const environmentSchema = z
   .object({
@@ -59,6 +64,7 @@ const environmentSchema = z
       .min(1_000_000)
       .max(10_000_000)
       .default(10_000_000),
+    VECTOR_SHADOW_MODE: z.enum(['off', 'shadow']).default('off'),
     MEAL_RECOGNITION_MODE: z.enum(['mock', 'openai']).default('mock'),
     OPENAI_API_KEY: z
       .string()
@@ -96,9 +102,13 @@ const environmentSchema = z
       .min(1)
       .max(100)
       .default(20),
-    MEAL_RECOGNITION_REVIEW_POLICY: z
-      .enum(['review_only', 'quick_confirm'])
-      .default('review_only'),
+    MEAL_RECOGNITION_MAPPING_MODE: z
+      .enum(['exact_review', 'hybrid_review', 'vector_shadow', 'hybrid_auto'])
+      .default('exact_review'),
+    MEAL_RECOGNITION_EMERGENCY_OVERRIDE: z
+      .enum(['none', 'disabled', 'exact_review', 'hybrid_review', 'vector_shadow'])
+      .default('none'),
+    MEAL_RECOGNITION_ACTIVATION_IDENTITY_JSON: z.string().trim().optional(),
     MEAL_RECOGNITION_APPROVED_REPORT_SHA256: z
       .string()
       .trim()
@@ -110,7 +120,7 @@ const environmentSchema = z
       .regex(/^[a-f0-9]{64}$/, 'MEAL_RECOGNITION_ACTIVE_REPORT_SHA256 must be a lowercase SHA-256 hex digest')
       .optional(),
     MEAL_RECOGNITION_APPROVED_REPORT_VERSION: z
-      .literal('meal-recognition-golden-report-v2')
+      .literal('meal-stack-golden-report-v3')
       .optional(),
     MEAL_RECOGNITION_APPROVED_REPORT_JSON: z.string().trim().optional(),
     MEAL_RECOGNITION_APPROVAL_KEY_ID: z.string().trim().min(1).optional(),
@@ -121,8 +131,22 @@ const environmentSchema = z
       .trim()
       .regex(/^[a-f0-9]{64}$/)
       .optional(),
+    MEAL_CONFIRMATION_CUTOVER_MODE: z
+      .enum(MEAL_CONFIRMATION_CUTOVER_MODES)
+      .default('normal'),
+    MEAL_CONFIRMATION_MAINTENANCE_RETRY_AFTER_SECONDS: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(3_600)
+      .default(60),
   })
   .superRefine((value, context) => {
+    const effectiveMappingMode = value.MEAL_RECOGNITION_EMERGENCY_OVERRIDE === 'none'
+      ? value.MEAL_RECOGNITION_MAPPING_MODE
+      : value.MEAL_RECOGNITION_EMERGENCY_OVERRIDE === 'disabled'
+        ? 'exact_review'
+        : value.MEAL_RECOGNITION_EMERGENCY_OVERRIDE;
     const bucketValues = [
       value.S3_ENDPOINT,
       value.S3_BUCKET,
@@ -145,9 +169,17 @@ const environmentSchema = z
       });
     }
     if (
-      value.NODE_ENV === 'production' &&
-      value.MEAL_RECOGNITION_REVIEW_POLICY === 'quick_confirm'
+      value.VECTOR_SHADOW_MODE === 'shadow' ||
+      effectiveMappingMode === 'vector_shadow'
     ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['VECTOR_SHADOW_MODE'],
+        message:
+          'VECTOR_SHADOW_UNAVAILABLE: the required pinned local ONNX encoder artifact is not deployed',
+      });
+    }
+    if (effectiveMappingMode === 'hybrid_auto') {
       const receipt = parseApprovedGoldenReport(
         value.MEAL_RECOGNITION_APPROVED_REPORT_JSON,
         value.MEAL_RECOGNITION_APPROVAL_KEY_ID,
@@ -160,24 +192,26 @@ const environmentSchema = z
         !value.MEAL_RECOGNITION_APPROVED_REPORT_SHA256 ||
         !value.MEAL_RECOGNITION_ACTIVE_REPORT_SHA256 ||
         value.MEAL_RECOGNITION_APPROVED_REPORT_SHA256 !== value.MEAL_RECOGNITION_ACTIVE_REPORT_SHA256 ||
-        value.MEAL_RECOGNITION_APPROVED_REPORT_VERSION !== 'meal-recognition-golden-report-v2' ||
+        value.MEAL_RECOGNITION_APPROVED_REPORT_VERSION !== 'meal-stack-golden-report-v3' ||
         !receipt ||
         receipt.reportSha256 !== value.MEAL_RECOGNITION_APPROVED_REPORT_SHA256 ||
         !receiptProvenance ||
         receiptProvenance.provider !== 'openai' ||
         receiptProvenance.recognitionModel !== value.OPENAI_MODEL ||
-        receiptProvenance.promptVersion !== MEAL_RECOGNITION_PROMPT_VERSION ||
-        receiptProvenance.schemaVersion !== MEAL_RECOGNITION_SCHEMA_VERSION ||
+        receiptProvenance.promptVersion !== MEAL_RECOGNITION_V3_PROMPT_VERSION ||
+        receiptProvenance.schemaVersion !== MEAL_RECOGNITION_V3_SCHEMA_VERSION ||
         receiptProvenance.resolverVersion !== MEAL_ITEM_RESOLVER_VERSION ||
-        receiptProvenance.reviewPolicyVersion !== MEAL_ESTIMATE_REVIEW_POLICY_VERSION ||
+        receiptProvenance.reviewPolicyVersion !== MEAL_REVIEW_POLICY_VERSION ||
         receiptProvenance.registryVersion !== value.MEAL_RECOGNITION_CATALOG_REGISTRY_VERSION ||
-        receiptProvenance.registrySha256 !== value.MEAL_RECOGNITION_CATALOG_REGISTRY_SHA256
+        receiptProvenance.registrySha256 !== value.MEAL_RECOGNITION_CATALOG_REGISTRY_SHA256 ||
+        !activationIdentityMatches(receiptProvenance.activationIdentity, value.MEAL_RECOGNITION_ACTIVATION_IDENTITY_JSON, effectiveMappingMode) ||
+        (effectiveMappingMode === 'hybrid_auto' && !hasHybridAutoEvidence(receipt))
       ) {
         context.addIssue({
           code: 'custom',
-          path: ['MEAL_RECOGNITION_REVIEW_POLICY'],
+          path: ['MEAL_RECOGNITION_MAPPING_MODE'],
           message:
-            'production quick_confirm requires OpenAI mode and an authority-signed meal-recognition-golden-report-v2 receipt bound to matching report SHA-256 values, the deployed recognition stack, and catalog registry',
+            'automatic mapping requires OpenAI mode and an authority-signed receipt bound to the exact deployed stack with hybrid-auto evidence',
         });
       }
     }
@@ -187,6 +221,11 @@ export type ApiEnvironment = ReturnType<typeof parseEnvironment>;
 
 export function parseEnvironment(input: Record<string, string | undefined>) {
   const parsed = environmentSchema.parse(input);
+  const mappingMode = parsed.MEAL_RECOGNITION_EMERGENCY_OVERRIDE === 'none'
+    ? parsed.MEAL_RECOGNITION_MAPPING_MODE
+    : parsed.MEAL_RECOGNITION_EMERGENCY_OVERRIDE === 'disabled'
+      ? 'exact_review'
+      : parsed.MEAL_RECOGNITION_EMERGENCY_OVERRIDE;
   const imageBucket =
     parsed.S3_ENDPOINT &&
     parsed.S3_BUCKET &&
@@ -223,6 +262,9 @@ export function parseEnvironment(input: Record<string, string | undefined>) {
     corsOrigins,
     healthDbTimeoutMs: parsed.HEALTH_DB_TIMEOUT_MS,
     imageBucket,
+    vectorShadow: {
+      mode: parsed.VECTOR_SHADOW_MODE,
+    },
     mealRecognition: {
       mode: parsed.MEAL_RECOGNITION_MODE,
       apiKey: parsed.OPENAI_API_KEY,
@@ -232,7 +274,11 @@ export function parseEnvironment(input: Record<string, string | undefined>) {
       maxAttempts: parsed.MEAL_RECOGNITION_MAX_ATTEMPTS,
       dailyAttemptQuota: parsed.MEAL_RECOGNITION_DAILY_ATTEMPT_QUOTA,
       reviewPolicy: {
-        mode: parsed.MEAL_RECOGNITION_REVIEW_POLICY,
+        mode:
+          mappingMode === 'hybrid_auto'
+            ? 'auto_selection'
+            : 'review_only',
+        mappingMode,
         approvedReportSha256: parsed.MEAL_RECOGNITION_APPROVED_REPORT_SHA256,
         activeReportSha256: parsed.MEAL_RECOGNITION_ACTIVE_REPORT_SHA256,
         approvedReportVersion: parsed.MEAL_RECOGNITION_APPROVED_REPORT_VERSION,
@@ -245,6 +291,10 @@ export function parseEnvironment(input: Record<string, string | undefined>) {
         ),
       },
     },
+    mealConfirmationCutover: {
+      mode: parsed.MEAL_CONFIRMATION_CUTOVER_MODE,
+      retryAfterSeconds: parsed.MEAL_CONFIRMATION_MAINTENANCE_RETRY_AFTER_SECONDS,
+    },
   } as const;
 }
 function parseApprovedGoldenReport(
@@ -255,7 +305,7 @@ function parseApprovedGoldenReport(
   if (!value || !expectedKeyId || !publicKeyBase64) return null;
   try {
     const receipt: unknown = JSON.parse(value);
-    if (!isRecord(receipt) || receipt.version !== 'meal-recognition-golden-report-v2' || receipt.mode !== 'production' || receipt.result !== 'passed' || receipt.passed !== true || !Array.isArray(receipt.failures) || receipt.failures.length !== 0 || !isRecord(receipt.counts) || !isRecord(receipt.metrics) || !isRecord(receipt.provenance) || !isRecord(receipt.approval) || !isSha256(receipt.reportSha256)) return null;
+    if (!isRecord(receipt) || receipt.version !== 'meal-stack-golden-report-v3' || receipt.mode !== 'production' || receipt.result !== 'passed' || receipt.passed !== true || !Array.isArray(receipt.failures) || receipt.failures.length !== 0 || !isRecord(receipt.counts) || !isRecord(receipt.metrics) || !isRecord(receipt.provenance) || !isRecord(receipt.approval) || !isSha256(receipt.reportSha256)) return null;
     const { reportSha256, approval, ...unsignedReport } = receipt;
     if (canonicalSha256(unsignedReport) !== reportSha256) return null;
     if (
@@ -266,25 +316,28 @@ function parseApprovedGoldenReport(
     const counts = receipt.counts;
     const metrics = receipt.metrics;
     if (
-      !integerAtLeast(counts.consentedKoreanMealPhotos, 120) ||
+      !integerAtLeast(counts.consentedKoreanMealPhotos, 500) ||
       !isRecord(counts.foodGroupCases) ||
       Object.values(counts.foodGroupCases).length !== 6 ||
-      Object.values(counts.foodGroupCases).some((count) => !integerAtLeast(count, 20)) ||
+      Object.values(counts.foodGroupCases).some((count) => !integerAtLeast(count, 50)) ||
       !integerAtLeast(counts.noFood, 10) ||
       !integerAtLeast(counts.insufficientEvidence, 10) ||
-      !integerAtLeast(counts.quickEligibleMeals, 50) ||
-      !integerAtLeast(counts.quickEligibleItems, 100) ||
+      !integerAtLeast(counts.quickEligibleMeals, 381) ||
+      !integerAtLeast(counts.quickEligibleItems, 381) ||
+      !integerAtLeast(counts.eligibleItems, 381) ||
       counts.zeroOutcomeQuickFalsePositives !== 0 ||
       counts.nutritionOrIdErrors !== 0 ||
+      counts.forbiddenSelectionCount !== 0 ||
       counts.untrustedConversionEligible !== 0 ||
+      counts.untrustedSelectionCount !== 0 ||
       counts.sensitiveReportLeakage !== 0 ||
       !bpsAtLeast(metrics.outcomeAccuracyBps, 9_500) ||
-      !bpsAtLeast(metrics.eligibleFoodTop1Wilson95LowerBoundBps, 9_500) ||
+      !bpsAtLeast(metrics.eligibleFoodTop1Wilson95LowerBoundBps, 9_900) ||
       !bpsAtLeast(metrics.portionWithinToleranceWilson95LowerBoundBps, 9_000) ||
       !bpsAtLeast(metrics.jointItemWilson95LowerBoundBps, 9_000) ||
       !bpsAtLeast(metrics.allItemsCorrectEligibleMealWilson95LowerBoundBps, 8_500) ||
       !bpsAtLeast(metrics.eligibleCoverageBps, 1_500) ||
-      !bpsAtLeast(metrics.validV2Bps, 9_900) ||
+      !bpsAtLeast(metrics.validV3Bps, 9_900) ||
       !isSha256(receipt.provenance.manifestSha256) ||
       !isSha256(receipt.provenance.groundTruthSha256) ||
       !isSha256(receipt.provenance.predictionsSha256) ||
@@ -298,12 +351,91 @@ function parseApprovedGoldenReport(
       typeof receipt.provenance.promptVersion !== 'string' ||
       typeof receipt.provenance.schemaVersion !== 'string' ||
       typeof receipt.provenance.resolverVersion !== 'string' ||
-      typeof receipt.provenance.reviewPolicyVersion !== 'string'
+      typeof receipt.provenance.reviewPolicyVersion !== 'string' ||
+      !isRecord(receipt.provenance.activationIdentity) ||
+      !hasMeasuredRolloutEvidence(receipt.rolloutMeasurements)
     ) return null;
     return receipt;
   } catch {
     return null;
   }
+}
+
+function activationIdentityMatches(
+  receiptIdentity: unknown,
+  configuredIdentityJson: string | undefined,
+  mappingMode: string,
+) {
+  if (!configuredIdentityJson || !isRecord(receiptIdentity)) return false;
+  try {
+    const configured: unknown = JSON.parse(configuredIdentityJson);
+    return isRecord(configured) &&
+      canonicalJson(configured) === canonicalJson(receiptIdentity) &&
+      configured.mappingMode === mappingMode;
+  } catch {
+    return false;
+  }
+}
+
+function hasHybridAutoEvidence(receipt: Record<string, unknown>) {
+  const counts = receipt.counts;
+  const metrics = receipt.metrics;
+  return isRecord(counts) &&
+    isRecord(metrics) &&
+    hasExactAutoSelectionPolicy(receipt) &&
+    hasMeasuredRolloutEvidence(receipt.rolloutMeasurements) &&
+    integerAtLeast(counts.eligibleItems, 381) &&
+    counts.eligibleItems === counts.quickEligibleItems &&
+    counts.nutritionOrIdErrors === 0 &&
+    counts.forbiddenSelectionCount === 0 &&
+    counts.untrustedConversionEligible === 0 &&
+    counts.untrustedSelectionCount === 0 &&
+    counts.zeroOutcomeQuickFalsePositives === 0 &&
+    bpsAtLeast(metrics.eligibleFoodTop1Wilson95LowerBoundBps, 9_900);
+}
+
+function hasExactAutoSelectionPolicy(receipt: Record<string, unknown>) {
+  if (!isRecord(receipt.autoSelectionPolicy) || !isRecord(receipt.provenance)) {
+    return false;
+  }
+  const policy = receipt.autoSelectionPolicy;
+  const evidence = receipt.provenance.autoSelectionEvidence;
+  if (!isRecord(evidence) || !isRecord(evidence.selectedSubset)) return false;
+  const selectedSubset = evidence.selectedSubset;
+  return policy.version === CATALOG_AUTO_SELECTION_POLICY_VERSION &&
+    policy.comparatorVersion === CATALOG_AUTO_SELECTION_COMPARATOR_VERSION &&
+    isBps(policy.minimumWinnerScoreBps) &&
+    isBps(policy.minimumMarginBps) &&
+    isSha256(policy.identitySha256) &&
+    evidence.policyVersion === policy.version &&
+    evidence.comparatorVersion === policy.comparatorVersion &&
+    evidence.policySha256 === policy.identitySha256 &&
+    evidence.minimumWinnerScoreBps === policy.minimumWinnerScoreBps &&
+    evidence.minimumMarginBps === policy.minimumMarginBps &&
+    integerAtLeast(selectedSubset.selectedMeals, 1) &&
+    integerAtLeast(selectedSubset.selectedItems, 1) &&
+    integerAtLeast(selectedSubset.foodMatches, 0) &&
+    (selectedSubset.foodMatches as number) <= (selectedSubset.selectedItems as number) &&
+    integerAtLeast(selectedSubset.fullyCorrectMeals, 0) &&
+    (selectedSubset.fullyCorrectMeals as number) <= (selectedSubset.selectedMeals as number);
+}
+
+function hasMeasuredRolloutEvidence(value: unknown) {
+  return isRecord(value) &&
+    integerAtLeast(value.categoryStrataCases, 120) &&
+    integerAtLeast(value.preparationStrataCases, 120) &&
+    integerAtLeast(value.compositeCases, 20) &&
+    integerAtLeast(value.abstentionCases, 20) &&
+    Number.isInteger(value.maxLatencyMs) &&
+    (value.maxLatencyMs as number) >= 0 &&
+    (value.maxLatencyMs as number) <= 2_000 &&
+    bpsAtLeast(value.correctionRateBps, 0) &&
+    (value.correctionRateBps as number) <= 1_000 &&
+    value.blockedViolationCount === 0 &&
+    value.privacyViolationCount === 0 &&
+    value.forbiddenSelectionCount === 0 &&
+    value.untrustedSelectionCount === 0 &&
+    integerAtLeast(value.soakDays, 7);
 }
 
 function verifyReportApproval(
@@ -342,6 +474,10 @@ function integerAtLeast(value: unknown, minimum: number) {
 
 function bpsAtLeast(value: unknown, minimum: number) {
   return integerAtLeast(value, minimum) && (value as number) <= 10_000;
+}
+
+function isBps(value: unknown) {
+  return bpsAtLeast(value, 0);
 }
 
 function canonicalSha256(value: unknown) {

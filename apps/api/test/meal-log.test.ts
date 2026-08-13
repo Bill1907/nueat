@@ -1,22 +1,42 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import {
+  activeCatalogReleasePointers,
+  calculationPreviews,
   calculationSnapshots,
+  catalogReleaseFoodServings,
+  catalogReleaseFoods,
+  catalogReleaseNutrientProfiles,
+  catalogReleaseSources,
+  catalogReleases,
   foods,
   foodServings,
   imageAssets,
   mealItems,
+  mealDecompositionComponents,
+  mealDecompositionRevisions,
   mealLogs,
+  mappingDecisions,
   nutrientProfiles,
+  recognitionAttempts,
+  releaseActivations,
+  sourceReleases,
   sourceRegistries,
+  storedObservations,
   userProfiles,
   type Database,
 } from '@nueat/database';
+import {
+  MEAL_ITEM_REVIEW_FINGERPRINT_VERSION,
+  mealItemReviewFingerprint,
+} from '@nueat/domain';
 import type { FastifyInstance } from 'fastify';
 
 import type { Auth } from '../src/auth/auth';
 import { parseEnvironment } from '../src/config/env';
 import { buildServer } from '../src/server';
 import { calculateCatalogRegistrySha256 } from '../src/services/catalog-registry-verifier';
+import { MEAL_CONFIRMATION_SAFE_REVIEW_PROTOCOL } from '../src/services/meal-confirmation-cutover';
+import type { MealRecognitionCoordinatorResult } from '../src/services/meal-recognition-coordinator';
 
 const environment = parseEnvironment({
   NODE_ENV: 'test',
@@ -33,12 +53,500 @@ const itemId = '00000000-0000-4000-8000-000000000003';
 const foodId = '00000000-0000-4000-8000-000000000010';
 const nutrientProfileId = '00000000-0000-4000-8000-000000000011';
 const sourceRegistryId = '00000000-0000-4000-8000-000000000013';
+const catalogReleaseId = '00000000-0000-4000-8000-000000000020';
+const sourceReleaseId = '00000000-0000-4000-8000-000000000021';
+const activationId = '00000000-0000-4000-8000-000000000022';
 const servers: FastifyInstance[] = [];
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => server.close()));
 });
 
 describe('meal log routes', () => {
+  test('reviews one current authority checkpoint once and replays the same key', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+    const draft = await server.inject({
+      method: 'GET',
+      url: `/api/meal-logs/${mealId}`,
+    });
+    const item = JSON.parse(draft.body).items[0];
+    const payload = {
+      expectedDraftRevision: 1,
+      expectedItemRevision: item.itemRevision,
+      idempotencyKey: 'review-key',
+      displayedAuthorityFingerprintVersion:
+        item.review.authority.fingerprintVersion,
+      displayedAuthorityFingerprint: item.review.authority.fingerprint,
+    };
+
+    const first = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/items/${itemId}/review`,
+      payload,
+    });
+    const replay = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/items/${itemId}/review`,
+      payload,
+    });
+    const reused = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/items/${itemId}/review`,
+      payload: { ...payload, expectedDraftRevision: 2 },
+    });
+
+    expect(first.statusCode).toBe(200);
+    expect(replay.statusCode).toBe(200);
+    expect(reused.statusCode).toBe(409);
+    expect(JSON.parse(reused.body).error.code).toBe('IDEMPOTENCY_KEY_REUSED');
+    expect(state.items[0]!.itemRevision).toBe(1);
+    expect(state.meal!.draftRevision).toBe(2);
+    expect(state.items[0]!.reviewIdempotencyKey).toBe('review-key');
+  });
+
+  test('rejects a historical matching mapping when a newer current decision supersedes it', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+    state.mappingDecisions.unshift({
+      ...state.mappingDecisions[0],
+      id: '00000000-0000-4000-8000-000000000041',
+      selectedFoodId: '00000000-0000-4000-8000-000000000099',
+      createdAt: new Date('2026-08-11T00:00:00.000Z'),
+    });
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/api/meal-logs/${mealId}`,
+    });
+    const body = JSON.parse(response.body);
+
+    expect(response.statusCode).toBe(200);
+    expect(body.items[0].review.authority).toMatchObject({
+      fingerprint: null,
+      invalidReason: 'MISSING_FOOD_MAPPING',
+    });
+    expect(body.review.reasons).toContainEqual({
+      code: 'FOOD_MAPPING_MISSING',
+      itemId,
+    });
+    expect(body.review.nextAction).toBe('select_item');
+  });
+
+  test('blocks GET and review when preview leaf facts are stale', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+    confirmPayload(state);
+    const preview = state.calculationPreviews[0]!;
+    (preview.identity as { leaves: Array<Record<string, unknown>> }).leaves[0]!
+      .nutrientProfileId = '00000000-0000-4000-8000-000000000099';
+
+    const draft = await server.inject({ method: 'GET', url: `/api/meal-logs/${mealId}` });
+    const body = JSON.parse(draft.body);
+    const review = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/items/${itemId}/review`,
+      payload: {
+        expectedDraftRevision: 1,
+        expectedItemRevision: 1,
+        idempotencyKey: 'stale-preview-review',
+        displayedAuthorityFingerprintVersion: MEAL_ITEM_REVIEW_FINGERPRINT_VERSION,
+        displayedAuthorityFingerprint: 'a'.repeat(64),
+      },
+    });
+
+    expect(body.items[0].review.authority).toMatchObject({
+      fingerprint: null,
+      invalidReason: 'STALE_AUTHORITY',
+    });
+    expect(body.review).toMatchObject({
+      confirmable: false,
+      nextAction: 'review_item',
+    });
+    expect(body.review.reasons).toContainEqual({
+      code: 'MEAL_ITEM_AUTHORITY_STALE',
+      itemId,
+    });
+    expect(review.statusCode).toBe(409);
+    expect(JSON.parse(review.body).error.code).toBe('MEAL_ITEM_AUTHORITY_STALE');
+  });
+
+  test('blocks GET and review when decomposition facts are stale', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+    confirmPayload(state);
+    const preview = state.calculationPreviews[0]!;
+    const identity = preview.identity as Record<string, unknown>;
+    identity.basis = 'meal_decomposition';
+    (identity.leaves as Array<Record<string, unknown>>)[0]!.componentIdentity = 'stale-component';
+    state.decompositionRevisions.push({
+      id: '00000000-0000-4000-8000-000000000060',
+      mealLogId: mealId,
+      rootMappingDecisionId: state.mappingDecisions[0]!.id,
+      rootCalculationPreviewId: preview.id,
+    });
+    state.decompositionComponents.push({
+      mealDecompositionRevisionId: state.decompositionRevisions[0]!.id,
+      ordinal: 0,
+      mappingDecisionId: state.mappingDecisions[0]!.id,
+      calculationPreviewId: preview.id,
+      edibleAmountMg: (identity.leaves as Array<Record<string, unknown>>)[0]!.edibleAmountMg,
+    });
+
+    const draft = await server.inject({ method: 'GET', url: `/api/meal-logs/${mealId}` });
+    const review = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/items/${itemId}/review`,
+      payload: {
+        expectedDraftRevision: 1,
+        expectedItemRevision: 1,
+        idempotencyKey: 'stale-decomposition-review',
+        displayedAuthorityFingerprintVersion: MEAL_ITEM_REVIEW_FINGERPRINT_VERSION,
+        displayedAuthorityFingerprint: 'a'.repeat(64),
+      },
+    });
+
+    expect(JSON.parse(draft.body).items[0].review.authority).toMatchObject({
+      fingerprint: null,
+      invalidReason: 'STALE_AUTHORITY',
+    });
+    expect(review.statusCode).toBe(409);
+    expect(JSON.parse(review.body).error.code).toBe('MEAL_ITEM_AUTHORITY_STALE');
+  });
+
+  test('reports only the reviewed item as a subtotal when another item is unmapped', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+    confirmPayload(state);
+    state.items.push({
+      id: '00000000-0000-4000-8000-000000000004',
+      mealLogId: mealId,
+      recognizedLabel: '미매핑 음식',
+      amountMilliunits: 1_000,
+      unit: 'g',
+      recognitionRegionIndex: null,
+      recognitionConfidenceBps: null,
+      portionConfidenceBps: null,
+      mappingConfidenceBps: null,
+      gramsMg: null,
+      userCorrected: true,
+      origin: 'user_added',
+      initialEstimateAssessment: null,
+      currentResolutionSource: 'user_selected',
+      itemRevision: 1,
+      foodRevision: 1,
+      portionRevision: 1,
+    });
+
+    const response = await server.inject({
+      method: 'GET',
+      url: `/api/meal-logs/${mealId}`,
+    });
+    const reviewedNutrition = JSON.parse(response.body).review.reviewedNutrition;
+
+    expect(response.statusCode).toBe(200);
+    expect(reviewedNutrition).toMatchObject({
+      status: 'subtotal',
+      reviewedItemCount: 1,
+      unreviewedItemCount: 1,
+      totals: {
+        energyMillicalories: {
+          value: null,
+          knownValue: 300,
+          missingItemCount: 0,
+          status: 'subtotal',
+        },
+        carbohydrateMg: {
+          value: null,
+          knownValue: 45,
+          status: 'subtotal',
+        },
+      },
+    });
+  });
+
+  test('applies the cutover barrier before malformed confirmation bodies or mutations', async () => {
+    const { server, state } = await createServer(true, {
+      clientProtocol: null,
+    });
+    configureConfirmableDraft(state, 'g');
+
+    const response = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+      payload: { malformed: true },
+    });
+
+    expect(response.statusCode).toBe(426);
+    expect(JSON.parse(response.body).error).toMatchObject({
+      code: 'CLIENT_UPGRADE_REQUIRED',
+      details: { requiredProtocol: MEAL_CONFIRMATION_SAFE_REVIEW_PROTOCOL },
+    });
+    expect(state.meal?.status).toBe('draft');
+    expect(state.snapshots).toHaveLength(0);
+  });
+
+  test('blocks exact-protocol confirmation mutations during maintenance without parsing the body', async () => {
+    const { server, state } = await createServer(true, {
+      clientProtocol: MEAL_CONFIRMATION_SAFE_REVIEW_PROTOCOL,
+      cutoverMode: 'maintenance_bridge',
+    });
+    configureConfirmableDraft(state, 'g');
+
+    const response = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+      payload: { malformed: true },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.headers['retry-after']).toBe('60');
+    expect(JSON.parse(response.body).error.code).toBe(
+      'MEAL_CONFIRMATION_MAINTENANCE',
+    );
+    expect(state.meal?.status).toBe('draft');
+    expect(state.snapshots).toHaveLength(0);
+  });
+
+  test('bridge preserves owned legacy reads, including confirmed meals, and blocks root and wildcard writes', async () => {
+    const { server, state } = await createServer(true, {
+      clientProtocol: MEAL_CONFIRMATION_SAFE_REVIEW_PROTOCOL,
+      cutoverMode: 'maintenance_bridge',
+    });
+    configureConfirmableDraft(state, 'g');
+    state.snapshots.push(legacyCalculationSnapshot(itemId));
+
+    const draft = await server.inject({
+      method: 'GET',
+      url: `/api/meal-logs/${mealId}`,
+    });
+    state.snapshots.push({
+      id: '00000000-0000-4000-8000-000000000070',
+      sequence: 1,
+      inputSnapshot: {
+        confirmationDecision: {
+          originalRecognition: null,
+          manualOverride: null,
+          policy: {
+            version: 'meal-estimate-review-v1',
+            activation: 'review_only',
+            approvedReportSha256: null,
+            activeReportSha256: null,
+            approvedReportVersion: null,
+          },
+        },
+        mealItems: [{
+          mealItemId: itemId,
+          origin: 'legacy_unknown',
+          initialEstimateAssessment: null,
+          currentResolutionSource: 'legacy_existing',
+          itemRevision: 1,
+          foodRevision: 1,
+          portionRevision: 1,
+          foodAcknowledgedRevision: null,
+          portionAcknowledgedRevision: null,
+          foodId,
+          nutrientProfileId,
+          amountMilliunits: 1_500,
+          unit: 'g',
+          gramsMg: 1_500,
+          sourceRegistryId,
+          sourceItemId: 'test-source-item',
+          datasetVersion: '2026-08',
+          nutrientProfileQualityGrade: 'verified',
+          nutrientProfile: { basisAmountMg: 100_000 },
+          serving: null,
+          nutrients: {
+            energyMillicalories: 300,
+            carbohydrateMg: 45,
+            proteinMg: 15,
+            fatMg: 8,
+            fiberMg: null,
+          },
+        }],
+      },
+      energyMillicalories: 300,
+      carbohydrateMg: 45,
+      proteinMg: 15,
+      fatMg: 8,
+      fiberMg: null,
+      calculationVersion: 'meal-nutrition-v1',
+      calculatedAt: new Date(),
+    });
+    state.meal!.status = 'confirmed';
+    const confirmed = await server.inject({
+      method: 'GET',
+      url: `/api/meal-logs/${mealId}`,
+    });
+    const rootWrite = await server.inject({
+      method: 'POST',
+      url: '/api/meal-logs',
+      payload: { malformed: true },
+    });
+    const wildcardWrite = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+      payload: { malformed: true },
+    });
+
+    expect(draft.statusCode).toBe(200);
+    expect(JSON.parse(draft.body)).toEqual({
+      mealLog: {
+        id: mealId,
+        eatenAt: '2026-08-10T03:00:00.000Z',
+        timezone: 'Asia/Seoul',
+        localDate: '2026-08-10',
+        mealType: 'lunch',
+        status: 'draft',
+        imageAssetId: imageId,
+        recognitionStatus: 'ready',
+        recognitionProvider: 'mock',
+        recognitionModel: 'mock-recognition-v2',
+        recognitionPromptVersion: 'meal-recognition-prompt-v1',
+        recognitionSchemaVersion: 'meal-recognition-schema-v1',
+        recognitionCompletedAt: '2026-08-10T03:00:01.000Z',
+        recognitionLastErrorCode: null,
+        recognitionAttemptCount: 1,
+        recognitionNextAttemptAt: null,
+        draftRevision: 1,
+        confirmedAt: null,
+        recognitionOutcome: null,
+        recognitionEvidenceReason: null,
+        recognitionManualOverride: null,
+        observationId: null,
+        resolutionStatus: null,
+        resolutionReason: null,
+        resolutionRetryAt: null,
+      },
+      items: [{
+        id: itemId,
+        recognizedLabel: '테스트 음식',
+        amountMilliunits: 1_500,
+        unit: 'g',
+        estimatedAmountMilliunits: null,
+        estimatedUnit: null,
+        recognitionRegionIndex: null,
+        recognitionConfidenceBps: null,
+        portionConfidenceBps: null,
+        userCorrected: true,
+        foodId,
+        nutrientProfileId,
+        mappingConfidenceBps: 10_000,
+        gramsMg: null,
+        currentResolutionSource: 'user_selected',
+        itemRevision: 1,
+        foodRevision: 1,
+        portionRevision: 1,
+        origin: 'user_added',
+        initialAssessment: null,
+        review: {
+          status: 'required',
+          checkpoint: null,
+          authority: {
+            fingerprintVersion: 'legacy-maintenance-bridge-v1',
+            fingerprint: null,
+            officialSource: null,
+            invalidReason: 'LEGACY_MAINTENANCE_UNKNOWN',
+          },
+          nextAction: 'review_item',
+        },
+        currentResolution: {
+          status: 'unresolved',
+          reason: 'LEGACY_MAINTENANCE_UNKNOWN',
+          observationId: null,
+          decisionId: null,
+          previewId: null,
+          decompositionRevisionId: null,
+          composition: null,
+          resolutionStatus: null,
+          resolutionReason: null,
+          resolutionRetryAt: null,
+          candidates: [],
+        },
+      }],
+      review: {
+        confirmable: false,
+        reasons: [{ code: 'LEGACY_REVIEW_REQUIRED', itemId }],
+        nutrition: {
+          status: 'pending',
+          reviewedItemCount: 0,
+          unreviewedItemCount: 1,
+          totals: {
+            energyMillicalories: {
+              value: null,
+              knownValue: 0,
+              missingItemCount: 1,
+              status: 'pending',
+            },
+            carbohydrateMg: {
+              value: null,
+              knownValue: 0,
+              missingItemCount: 1,
+              status: 'pending',
+            },
+            proteinMg: {
+              value: null,
+              knownValue: 0,
+              missingItemCount: 1,
+              status: 'pending',
+            },
+            fatMg: {
+              value: null,
+              knownValue: 0,
+              missingItemCount: 1,
+              status: 'pending',
+            },
+            fiberMg: {
+              value: null,
+              knownValue: 0,
+              missingItemCount: 1,
+              status: 'pending',
+            },
+          },
+        },
+      },
+    });
+    expect(confirmed.statusCode).toBe(200);
+    expect(JSON.parse(confirmed.body)).toMatchObject({
+      mealLog: { id: mealId, status: 'confirmed' },
+      review: { confirmable: false, evidence: 'legacy_unknown', reasons: [] },
+      nutrition: {
+        id: '00000000-0000-4000-8000-000000000014',
+        items: [{
+          mealItemId: itemId,
+          nutrients: { energyMillicalories: 300 },
+        }],
+        totals: { energyMillicalories: { value: 300, completeness: 'complete' } },
+      },
+    });
+    expect(rootWrite.statusCode).toBe(503);
+    expect(wildcardWrite.statusCode).toBe(503);
+    expect(JSON.parse(wildcardWrite.body).error.code).toBe(
+      'MEAL_CONFIRMATION_MAINTENANCE',
+    );
+  });
+
+  test('keeps owned reads available and lets exact normal-protocol requests reach handlers', async () => {
+    const { server, state } = await createServer(true, {
+      clientProtocol: MEAL_CONFIRMATION_SAFE_REVIEW_PROTOCOL,
+    });
+    configureConfirmableDraft(state, 'g');
+
+    const read = await server.inject({
+      method: 'GET',
+      url: `/api/meal-logs/${mealId}`,
+    });
+
+    const mutation = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+      payload: { malformed: true },
+    });
+
+    expect(read.statusCode).toBe(200);
+    expect(mutation.statusCode).toBe(400);
+    expect(JSON.parse(mutation.body).error.code).toBe('INVALID_REQUEST');
+  });
+
   test('rejects unauthenticated access', async () => {
     const { server } = await createServer(false);
     const response = await server.inject({
@@ -87,9 +595,14 @@ describe('meal log routes', () => {
       code: 'FOOD_MAPPING_MISSING',
       itemId,
     });
-    expect(body.review.requiredReviewFields).toContainEqual({
-      itemId,
-      fields: ['food', 'portion'],
+    expect(body.review).toMatchObject({
+      nextAction: 'select_item',
+      nextItemId: itemId,
+      reviewedNutrition: {
+        status: 'pending',
+        reviewedItemCount: 0,
+        unreviewedItemCount: 3,
+      },
     });
   });
   test('derives meal date and type from the persisted profile timezone', async () => {
@@ -125,23 +638,40 @@ describe('meal log routes', () => {
     expect(Array.isArray(body.items)).toBe(true);
   });
 
+  test('returns a retryable 503 when catalog resolution is unavailable', async () => {
+    const { server } = await createServer(true, {
+      recognitionOutcome: {
+        status: 'unavailable',
+        code: 'CATALOG_UNAVAILABLE',
+        retryable: true,
+      },
+    });
+    const response = await server.inject({
+      method: 'POST',
+      url: '/api/meal-logs',
+      payload: createPayload(),
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.headers['retry-after']).toBe('60');
+    expect(JSON.parse(response.body).error).toMatchObject({
+      code: 'CATALOG_UNAVAILABLE',
+    });
+  });
+
 
   test('returns the existing draft when the validated image is retried', async () => {
     const { server, state } = await createServer(true);
-    state.meal = draftMeal();
+    configureConfirmableDraft(state, 'g');
     state.asset.status = 'processed';
-    state.items = [
-      {
-        id: itemId,
-        mealLogId: mealId,
-        recognizedLabel: '흰쌀밥',
-        amountMilliunits: 1000,
-        unit: 'bowl',
-        recognitionConfidenceBps: 9500,
-        portionConfidenceBps: 9200,
-        userCorrected: false,
-      },
-    ];
+    Object.assign(state.items[0]!, {
+      recognizedLabel: '흰쌀밥',
+      amountMilliunits: 1_000,
+      unit: 'bowl',
+      recognitionConfidenceBps: 9_500,
+      portionConfidenceBps: 9_200,
+      userCorrected: false,
+    });
 
     const response = await server.inject({
       method: 'POST',
@@ -207,7 +737,6 @@ describe('meal log routes', () => {
     expect(JSON.parse(edit.body).items[0].foodId).not.toBeNull();
     expect(JSON.parse(edit.body).items[0]).toMatchObject({
       portionRevision: 2,
-      portionAcknowledgedRevision: 2,
     });
 
     const rename = await server.inject({
@@ -226,9 +755,7 @@ describe('meal log routes', () => {
       nutrientProfileId: null,
       mappingConfidenceBps: null,
       foodRevision: 2,
-      foodAcknowledgedRevision: null,
       portionRevision: 2,
-      portionAcknowledgedRevision: 2,
     });
     const remove = await server.inject({
       method: 'DELETE',
@@ -257,93 +784,6 @@ describe('meal log routes', () => {
     });
     expect(state.meal.mealType).toBe('lunch');
   });
-  test('acknowledges only the current low-confidence revisions through review', async () => {
-    const { server, state } = await createServer(true);
-    configureConfirmableDraft(state, 'g');
-    state.items = [{
-      id: itemId,
-      mealLogId: mealId,
-      recognizedLabel: '흰쌀밥',
-      amountMilliunits: 1_000,
-      unit: 'g',
-      foodId,
-      nutrientProfileId,
-      origin: 'model_estimate',
-      itemRevision: 3,
-      foodRevision: 2,
-      portionRevision: 2,
-      foodAcknowledgedRevision: null,
-      portionAcknowledgedRevision: null,
-      currentResolutionSource: 'model_primary',
-      initialEstimateAssessment: {
-        rawLabel: '흰쌀밥',
-        normalizedLabel: '흰쌀밥',
-        foodConfidenceBps: 7_000,
-        portionConfidenceBps: 7_000,
-        foodCandidateMarginBps: null,
-        questions: [],
-        alternatives: [],
-        initialMappingSource: 'model_primary',
-        initialMatchedLabel: '흰쌀밥',
-        policyVersion: 'meal-estimate-review-v1',
-      },
-    }];
-
-    const response = await server.inject({
-      method: 'POST',
-      url: `/api/meal-logs/${mealId}/review`,
-      payload: {
-        expectedDraftRevision: 1,
-        items: [{
-          itemId,
-          expectedItemRevision: 3,
-          foodAcknowledgedRevision: 2,
-          portionAcknowledgedRevision: 2,
-        }],
-      },
-    });
-
-    expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body).items[0]).toMatchObject({
-      foodAcknowledgedRevision: 2,
-      portionAcknowledgedRevision: 2,
-    });
-    const acknowledgedDraftRevision = state.meal!.draftRevision;
-    const acknowledgedItemRevision = state.items[0]!.itemRevision;
-    const noOp = await server.inject({
-      method: 'POST',
-      url: `/api/meal-logs/${mealId}/review`,
-      payload: {
-        expectedDraftRevision: acknowledgedDraftRevision,
-        items: [{
-          itemId,
-          expectedItemRevision: acknowledgedItemRevision,
-          foodAcknowledgedRevision: 2,
-          portionAcknowledgedRevision: 2,
-        }],
-      },
-    });
-    expect(noOp.statusCode).toBe(200);
-    expect(state.meal!.draftRevision).toBe(acknowledgedDraftRevision);
-    expect(state.items[0]!.itemRevision).toBe(acknowledgedItemRevision);
-
-    const staleField = await server.inject({
-      method: 'POST',
-      url: `/api/meal-logs/${mealId}/review`,
-      payload: {
-        expectedDraftRevision: acknowledgedDraftRevision,
-        items: [{
-          itemId,
-          expectedItemRevision: acknowledgedItemRevision,
-          foodAcknowledgedRevision: 1,
-        }],
-      },
-    });
-    expect(staleField.statusCode).toBe(409);
-    expect(JSON.parse(staleField.body).error.code).toBe('MEAL_ITEM_STALE');
-    expect(state.meal!.draftRevision).toBe(acknowledgedDraftRevision);
-    expect(state.items[0]!.itemRevision).toBe(acknowledgedItemRevision);
-  });
   test('rejects a stale food selection with latest item convergence and no mutation', async () => {
     const { server, state } = await createServer(true);
     configureConfirmableDraft(state, 'g');
@@ -365,7 +805,7 @@ describe('meal log routes', () => {
     });
     expect(state.items[0]!.foodId).toBe(foodId);
   });
-  test('keeps PATCH and same-food PUT semantic no-ops revision-neutral', async () => {
+  test('keeps PATCH and an already-authoritative same-food PUT revision-neutral', async () => {
     const { server, state } = await createServer(true);
     configureConfirmableDraft(state, 'g');
     const draftRevision = state.meal!.draftRevision;
@@ -386,9 +826,11 @@ describe('meal log routes', () => {
     });
 
     expect(patch.statusCode).toBe(200);
-    expect(mapping.statusCode).toBe(200);
+    expect(mapping.statusCode, mapping.body).toBe(200);
     expect(state.meal!.draftRevision).toBe(draftRevision);
     expect(state.items[0]!.itemRevision).toBe(itemRevision);
+    expect(state.mappingDecisions).toHaveLength(1);
+    expect(state.calculationPreviews).toHaveLength(1);
   });
 
   test('rejects a stale conditional item delete without mutation', async () => {
@@ -407,7 +849,7 @@ describe('meal log routes', () => {
     expect(state.items).toHaveLength(1);
     expect(state.meal!.draftRevision).toBe(1);
   });
-  test('exposes a resolved mapped draft as a one-CTA confirmable review', async () => {
+  test('requires an explicit item review before final confirmation', async () => {
     const { server, state } = await createServer(true);
     configureConfirmableDraft(state, 'g');
 
@@ -418,9 +860,15 @@ describe('meal log routes', () => {
 
     expect(response.statusCode).toBe(200);
     expect(JSON.parse(response.body).review).toMatchObject({
-      confirmable: true,
-      reasons: [],
-      requiredReviewFields: [],
+      confirmable: false,
+      nextAction: 'review_item',
+      nextItemId: itemId,
+      reasons: [{ code: 'MEAL_ITEM_REVIEW_REQUIRED', itemId }],
+      reviewedNutrition: {
+        status: 'pending',
+        reviewedItemCount: 0,
+        unreviewedItemCount: 1,
+      },
       nutrition: {
         id: 'preview',
         calculationVersion: 'meal-nutrition-v1-preview',
@@ -431,8 +879,8 @@ describe('meal log routes', () => {
       },
     });
   });
-  test('confirms a high-confidence mapped model estimate without review mutation', async () => {
-    const { server, state } = await createServer(true, { reviewMode: 'quick_confirm' });
+  test('requires explicit review for a high-confidence mapped model estimate', async () => {
+    const { server, state } = await createServer(true);
     configureConfirmableDraft(state, 'g');
     state.meal = {
       ...state.meal,
@@ -457,9 +905,8 @@ describe('meal log routes', () => {
       ...state.items[0]!,
       userCorrected: false,
       origin: 'model_estimate',
+      recognitionRegionIndex: 0,
       currentResolutionSource: 'model_primary',
-      foodAcknowledgedRevision: null,
-      portionAcknowledgedRevision: null,
       initialEstimateAssessment: {
         rawLabel: '테스트 음식',
         normalizedLabel: '테스트음식',
@@ -479,25 +926,44 @@ describe('meal log routes', () => {
         policyVersion: 'meal-estimate-review-v1',
       },
     };
-    const before = {
-      draftRevision: state.meal!.draftRevision,
-      itemRevision: state.items[0]!.itemRevision,
-    };
-
+    confirmPayload(state, { populateReviewCheckpoint: false });
     const draft = await server.inject({
       method: 'GET',
       url: `/api/meal-logs/${mealId}`,
     });
-    expect(JSON.parse(draft.body).review.requiredReviewFields).toEqual([]);
+    const draftBody = JSON.parse(draft.body);
+    expect(draftBody.review).toMatchObject({
+      confirmable: false,
+      nextAction: 'review_item',
+      nextItemId: itemId,
+      reasons: [{ code: 'MEAL_ITEM_REVIEW_REQUIRED', itemId }],
+    });
+
+    const review = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/items/${itemId}/review`,
+      payload: {
+        expectedDraftRevision: 1,
+        expectedItemRevision: draftBody.items[0].itemRevision,
+        idempotencyKey: 'high-confidence-review-key',
+        displayedAuthorityFingerprintVersion:
+          draftBody.items[0].review.authority.fingerprintVersion,
+        displayedAuthorityFingerprint:
+          draftBody.items[0].review.authority.fingerprint,
+      },
+    });
+    expect(review.statusCode, review.body).toBe(200);
 
     const response = await server.inject({
       method: 'POST',
       url: `/api/meal-logs/${mealId}/confirm`,
-      payload: confirmPayload(state),
+      payload: {
+        ...confirmPayload(state),
+        expectedDraftRevision: 2,
+      },
     });
 
-    expect(response.statusCode).toBe(200);
-    expect(state.items[0]!.itemRevision).toBe(before.itemRevision);
+    expect(response.statusCode, response.body).toBe(200);
     expect(state.snapshots).toHaveLength(1);
     expect((state.snapshots[0]!.inputSnapshot as {
       mealItems: Record<string, unknown>[];
@@ -509,8 +975,8 @@ describe('meal log routes', () => {
       currentResolutionSource: 'model_primary',
     });
   });
-  test('requires a current review vector before review-only model confirmation', async () => {
-    const { server, state } = await createServer(true, { reviewMode: 'review_only' });
+  test('does not expose legacy bulk review fields for a model estimate', async () => {
+    const { server, state } = await createServer(true);
     configureConfirmableDraft(state, 'g');
     state.meal = {
       ...state.meal,
@@ -534,9 +1000,8 @@ describe('meal log routes', () => {
     Object.assign(state.items[0]!, {
       userCorrected: false,
       origin: 'model_estimate',
+      recognitionRegionIndex: 0,
       currentResolutionSource: 'model_primary',
-      foodAcknowledgedRevision: null,
-      portionAcknowledgedRevision: null,
       initialEstimateAssessment: {
         rawLabel: '테스트 음식',
         normalizedLabel: '테스트음식',
@@ -556,6 +1021,7 @@ describe('meal log routes', () => {
         policyVersion: 'meal-estimate-review-v1',
       },
     });
+    confirmPayload(state, { populateReviewCheckpoint: false });
 
     const draft = await server.inject({
       method: 'GET',
@@ -563,8 +1029,9 @@ describe('meal log routes', () => {
     });
     expect(JSON.parse(draft.body).review).toMatchObject({
       confirmable: false,
-      reasons: [{ code: 'QUICK_CONFIRM_POLICY_DISABLED', itemId: null }],
-      requiredReviewFields: [{ itemId, fields: ['food', 'portion'] }],
+      nextAction: 'review_item',
+      nextItemId: itemId,
+      reasons: [{ code: 'MEAL_ITEM_REVIEW_REQUIRED', itemId }],
     });
     const publicItem = JSON.parse(draft.body).items[0];
     expect(publicItem.itemReview).toBeUndefined();
@@ -577,48 +1044,9 @@ describe('meal log routes', () => {
       estimatedUnit: 'g',
     });
 
-    const directConfirm = await server.inject({
-      method: 'POST',
-      url: `/api/meal-logs/${mealId}/confirm`,
-      payload: confirmPayload(state),
-    });
-    expect(directConfirm.statusCode).toBe(409);
-    expect(JSON.parse(directConfirm.body).error.code).toBe('MEAL_CONFIRMATION_INVALID');
-
-    const review = await server.inject({
-      method: 'POST',
-      url: `/api/meal-logs/${mealId}/review`,
-      payload: {
-        expectedDraftRevision: 1,
-        items: [{
-          itemId,
-          expectedItemRevision: 1,
-          foodAcknowledgedRevision: 1,
-          portionAcknowledgedRevision: 1,
-        }],
-      },
-    });
-    expect(review.statusCode).toBe(200);
-    expect(JSON.parse(review.body).review).toMatchObject({
-      confirmable: true,
-      reasons: [],
-      requiredReviewFields: [],
-    });
-
-    const reviewedDraft = JSON.parse(review.body);
-    const confirmed = await server.inject({
-      method: 'POST',
-      url: `/api/meal-logs/${mealId}/confirm`,
-      payload: {
-        expectedDraftRevision: reviewedDraft.mealLog.draftRevision,
-        items: reviewedDraft.items.map((item: { id: string; itemRevision: number }) => ({
-          itemId: item.id,
-          expectedItemRevision: item.itemRevision,
-        })),
-      },
-    });
-    expect(confirmed.statusCode).toBe(200);
-    expect(state.snapshots).toHaveLength(1);
+    expect(JSON.parse(draft.body).review).not.toHaveProperty(
+      'requiredReviewFields',
+    );
   });
   test('preserves immutable initial mapping and final user-selected resolution in the snapshot', async () => {
     const { server, state } = await createServer(true);
@@ -744,9 +1172,12 @@ describe('meal log routes', () => {
       const confirm = await server.inject({
         method: 'POST',
         url: `/api/meal-logs/${mealId}/confirm`,
-        payload: confirmPayload(state),
+        payload: confirmPayload(state, { populateReviewCheckpoint: false }),
       });
       expect(confirm.statusCode).toBe(409);
+      expect(JSON.parse(confirm.body).error.code).toBe(
+        'MEAL_CONFIRMATION_INVALID',
+      );
       expect(state.snapshots).toHaveLength(0);
     }
   });
@@ -782,7 +1213,7 @@ describe('meal log routes', () => {
     expect(state.meal.status).toBe('draft');
     expect(state.deletionJob).toBeUndefined();
   });
-  test('rejects retry and manual conversion after recognition is ready', async () => {
+  test('allows resolution retry but rejects manual conversion after recognition is ready', async () => {
     const { server, state } = await createServer(true);
     state.meal = draftMeal();
 
@@ -796,7 +1227,7 @@ describe('meal log routes', () => {
       payload: { expectedDraftRevision: 1 },
     });
 
-    expect(retry.statusCode).toBe(409);
+    expect(retry.statusCode).toBe(200);
     expect(manual.statusCode).toBe(409);
     expect(state.meal.recognitionStatus).toBe('ready');
     expect(state.meal.recognitionProvider).toBe('mock');
@@ -924,10 +1355,14 @@ describe('meal log routes', () => {
       missingItemCount: 1,
       completeness: 'partial',
     });
+    const payload = confirmPayload(state);
     const response = await server.inject({
       method: 'POST',
       url: `/api/meal-logs/${mealId}/confirm`,
-      payload: { expectedDraftRevision: 1, items: [{ itemId, expectedItemRevision: 1 }] },
+      payload: {
+        ...payload,
+        idempotencyKey: '00000000-0000-4000-8000-000000000097',
+      },
     });
 
     expect(response.statusCode).toBe(200);
@@ -952,7 +1387,12 @@ describe('meal log routes', () => {
     expect(response.statusCode).toBe(200);
     expect(body).toMatchObject({
       mealLog: { status: 'confirmed' },
-      items: [{ gramsMg: 1_500 }],
+      items: [{
+        mealItemId: itemId,
+        foodId,
+        nutrientProfileId,
+        nutrients: { energyMillicalories: 300 },
+      }],
       nutrition: {
         calculationVersion: 'meal-nutrition-v1',
         items: [{
@@ -968,17 +1408,11 @@ describe('meal log routes', () => {
       },
     });
     expect(state.snapshots).toHaveLength(1);
-    expect(state.snapshots[0]!.inputSnapshot).toEqual({
+    expect(state.snapshots[0]!.inputSnapshot).toMatchObject({
       confirmationDecision: {
         originalRecognition: null,
         manualOverride: null,
-        policy: {
-          version: 'meal-estimate-review-v1',
-          activation: 'review_only',
-          approvedReportSha256: null,
-          activeReportSha256: null,
-          approvedReportVersion: null,
-        },
+        reviewProtocol: MEAL_CONFIRMATION_SAFE_REVIEW_PROTOCOL,
       },
       mealItems: [{
         mealItemId: itemId,
@@ -988,8 +1422,6 @@ describe('meal log routes', () => {
         itemRevision: 1,
         foodRevision: 1,
         portionRevision: 1,
-        foodAcknowledgedRevision: 1,
-        portionAcknowledgedRevision: 1,
         foodId,
         nutrientProfileId,
         amountMilliunits: 1_500,
@@ -1017,6 +1449,43 @@ describe('meal log routes', () => {
         },
       }],
     });
+    expect(state.snapshots[0]!.inputSnapshot).toMatchObject({
+      version: 'meal-calculation-snapshot-v2',
+      mealItems: [{
+        authority: {
+          fingerprintVersion: MEAL_ITEM_REVIEW_FINGERPRINT_VERSION,
+        },
+        checkpoint: {
+          reviewedItemRevision: 1,
+          reviewedAuthorityFingerprintVersion:
+            MEAL_ITEM_REVIEW_FINGERPRINT_VERSION,
+        },
+        provenance: {
+          calculationVersion: 'meal-nutrition-v1',
+          nutrientProfileId,
+          sourceRegistryId,
+        },
+      }],
+    });
+  });
+
+  test('reopens a confirmation after its response is dropped with the same immutable projection', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+
+    const confirmed = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+      payload: confirmPayload(state),
+    });
+    const reopened = await server.inject({
+      method: 'GET',
+      url: `/api/meal-logs/${mealId}`,
+    });
+
+    expect(confirmed.statusCode).toBe(200);
+    expect(reopened.statusCode).toBe(200);
+    expect(JSON.parse(reopened.body)).toEqual(JSON.parse(confirmed.body));
   });
 
   test('converts non-gram items through their sole matching serving', async () => {
@@ -1038,7 +1507,7 @@ describe('meal log routes', () => {
     });
     expect(response.statusCode).toBe(200);
     const body = JSON.parse(response.body);
-    expect(body.items[0].gramsMg).toBe(300_000);
+    expect(body.nutrition.items[0].gramsMg).toBe(300_000);
     expect(body.nutrition.items[0].source).toMatchObject({
       servingId: '00000000-0000-4000-8000-000000000012',
       servingSourceRegistryId: sourceRegistryId,
@@ -1061,12 +1530,8 @@ describe('meal log routes', () => {
       payload: confirmPayload(state),
       });
       expect(response.statusCode).toBe(409);
-      expect(JSON.parse(response.body).error.details.items[0].code).toBe(
-        invalid === 'mapping'
-          ? 'MISSING_MAPPING'
-          : invalid === 'profile'
-            ? 'MISSING_PROFILE'
-            : 'MISSING_SERVING_CONVERSION',
+      expect(JSON.parse(response.body).error.code).toBe(
+        'MEAL_CONFIRMATION_INVALID',
       );
       expect(state.meal?.status).toBe('draft');
       expect(state.items[0]!.gramsMg).toBeNull();
@@ -1084,7 +1549,9 @@ describe('meal log routes', () => {
       payload: confirmPayload(state),
     });
     expect(response.statusCode).toBe(409);
-    expect(JSON.parse(response.body).error.details.items[0].code).toBe('MISMATCHED_PROFILE');
+    expect(JSON.parse(response.body).error.code).toBe(
+      'MEAL_CONFIRMATION_INVALID',
+    );
     expect(state.meal?.status).toBe('draft');
     expect(state.snapshots).toHaveLength(0);
   });
@@ -1117,12 +1584,8 @@ describe('meal log routes', () => {
       payload: confirmPayload(state),
       });
       expect(response.statusCode).toBe(409);
-      expect(JSON.parse(response.body).error.details.items[0].code).toBe(
-        invalid === 'food'
-          ? 'DEPRECATED_FOOD'
-          : invalid === 'profile'
-            ? 'UNTRUSTED_PROFILE_SOURCE'
-            : 'UNTRUSTED_SERVING_SOURCE',
+      expect(JSON.parse(response.body).error.code).toBe(
+        'MEAL_CONFIRMATION_INVALID',
       );
       expect(state.meal?.status).toBe('draft');
       expect(state.snapshots).toHaveLength(0);
@@ -1163,6 +1626,36 @@ describe('meal log routes', () => {
     expect(JSON.parse(replay.body).nutrition.id).toBe(JSON.parse(first.body).nutrition.id);
     expect(state.snapshots).toHaveLength(1);
   });
+
+  test('rejects changed confirmation payload reuse without creating sequence two', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+    const payload = confirmPayload(state);
+    const first = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+      payload,
+    });
+    expect(first.statusCode).toBe(200);
+
+    const reused = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+      payload: {
+        ...payload,
+        items: payload.items.map((item) => ({
+          ...item,
+          expectedItemRevision: Number(item.expectedItemRevision) + 1,
+        })),
+      },
+    });
+
+    expect(reused.statusCode).toBe(409);
+    expect(JSON.parse(reused.body).error.code).toBe(
+      'IDEMPOTENCY_KEY_REUSED',
+    );
+    expect(state.snapshots).toHaveLength(1);
+  });
 });
 
 function createPayload() {
@@ -1197,13 +1690,73 @@ function draftMeal() {
   };
 }
 
+function legacyCalculationSnapshot(mealItemId: string) {
+  return {
+    id: '00000000-0000-4000-8000-000000000014',
+    mealLogId: mealId,
+    sequence: 1,
+    inputSnapshot: {
+      confirmationDecision: {
+        originalRecognition: null,
+        manualOverride: null,
+        policy: {
+          version: 'meal-confirmation-v1',
+          activation: 'review_only',
+          approvedReportSha256: null,
+          activeReportSha256: null,
+          approvedReportVersion: null,
+        },
+      },
+      mealItems: [{
+        mealItemId,
+        origin: 'user_added',
+        currentResolutionSource: 'user_selected',
+        foodId,
+        nutrientProfileId,
+        amountMilliunits: 1_500,
+        unit: 'g',
+        gramsMg: 1_500,
+        sourceRegistryId,
+        sourceItemId: 'test-source-item',
+        datasetVersion: '2026-08',
+        nutrientProfileQualityGrade: 'verified',
+        nutrients: {
+          energyMillicalories: 300,
+          carbohydrateMg: 45,
+          proteinMg: 15,
+          fatMg: 8,
+          fiberMg: null,
+        },
+        initialEstimateAssessment: null,
+        itemRevision: 1,
+        foodRevision: 1,
+        portionRevision: 1,
+        foodAcknowledgedRevision: null,
+        portionAcknowledgedRevision: null,
+        nutrientProfile: null,
+        serving: null,
+      }],
+    },
+    energyMillicalories: 300,
+    carbohydrateMg: 45,
+    proteinMg: 15,
+    fatMg: 8,
+    fiberMg: null,
+    calculationVersion: 'meal-nutrition-v1',
+    calculatedAt: new Date('2026-08-13T00:01:00.000Z'),
+  };
+}
+
 async function createServer(
   authenticated: boolean,
   overrides: {
     assetStatus?: string;
     mealUserId?: string;
     profileTimezone?: string;
-    reviewMode?: 'review_only' | 'quick_confirm';
+    reviewMode?: 'review_only' | 'auto_selection';
+    recognitionOutcome?: MealRecognitionCoordinatorResult;
+    clientProtocol?: string | null;
+    cutoverMode?: 'normal' | 'maintenance_bridge' | 'safe_review_maintenance';
   } = {},
 ) {
   const state: {
@@ -1220,6 +1773,12 @@ async function createServer(
     rejectMealUpdate?: boolean;
     rejectItemUpdate?: boolean;
     rejectItemDelete?: boolean;
+    recognitionAttempt?: Record<string, unknown>;
+    storedObservation?: Record<string, unknown>;
+    mappingDecisions: Record<string, unknown>[];
+    calculationPreviews: Record<string, unknown>[];
+    decompositionRevisions: Record<string, unknown>[];
+    decompositionComponents: Record<string, unknown>[];
   } = {
     asset: {
       id: imageId,
@@ -1232,6 +1791,10 @@ async function createServer(
     servings: [],
     registries: [],
     snapshots: [],
+    mappingDecisions: [],
+    calculationPreviews: [],
+    decompositionRevisions: [],
+    decompositionComponents: [],
     profileTimezone: overrides.profileTimezone ?? null,
   };
   if (overrides.mealUserId)
@@ -1244,12 +1807,16 @@ async function createServer(
   } as unknown as Auth;
   const database = databaseMock(state);
   const catalogRegistrySha256 =
-    overrides.reviewMode === 'quick_confirm'
+    overrides.reviewMode === 'auto_selection'
       ? await calculateCatalogRegistrySha256(database)
       : environment.mealRecognition.reviewPolicy.catalogRegistrySha256;
   const server = await buildServer({
     environment: {
       ...environment,
+      mealConfirmationCutover: {
+        ...environment.mealConfirmationCutover,
+        mode: overrides.cutoverMode ?? environment.mealConfirmationCutover.mode,
+      },
       mealRecognition: {
         ...environment.mealRecognition,
         reviewPolicy: {
@@ -1263,6 +1830,7 @@ async function createServer(
     database,
     recognitionCoordinator: {
       async recognize() {
+        if (overrides.recognitionOutcome) return overrides.recognitionOutcome;
         if (state.meal?.recognitionStatus !== 'ready') {
           Object.assign(state.meal ?? {}, {
             recognitionStatus: 'ready',
@@ -1291,8 +1859,6 @@ async function createServer(
                 itemRevision: 1,
                 foodRevision: 1,
                 portionRevision: 1,
-                foodAcknowledgedRevision: null,
-                portionAcknowledgedRevision: null,
               },
               {
                 id: `${itemId.slice(0, -1)}4`,
@@ -1308,8 +1874,6 @@ async function createServer(
                 itemRevision: 1,
                 foodRevision: 1,
                 portionRevision: 1,
-                foodAcknowledgedRevision: null,
-                portionAcknowledgedRevision: null,
               },
               {
                 id: `${itemId.slice(0, -1)}5`,
@@ -1325,8 +1889,6 @@ async function createServer(
                 itemRevision: 1,
                 foodRevision: 1,
                 portionRevision: 1,
-                foodAcknowledgedRevision: null,
-                portionAcknowledgedRevision: null,
               },
             );
           }
@@ -1336,15 +1898,146 @@ async function createServer(
       },
     },
   });
+  const clientProtocol = Object.hasOwn(overrides, 'clientProtocol')
+    ? overrides.clientProtocol
+    : MEAL_CONFIRMATION_SAFE_REVIEW_PROTOCOL;
+  if (clientProtocol) {
+    server.addHook('onRequest', (request, _reply, done) => {
+      request.headers['x-nueat-meal-confirmation-protocol'] ??= clientProtocol;
+      done();
+    });
+  }
   servers.push(server);
   return { server, state };
 }
-function confirmPayload(state: { items: Record<string, unknown>[] }) {
+function confirmPayload(
+  state: { items: Record<string, unknown>[] },
+  options: { populateReviewCheckpoint?: boolean } = {},
+) {
+  const authority = state as {
+    profiles?: Record<string, unknown>[];
+    servings?: Record<string, unknown>[];
+    storedObservation?: Record<string, unknown>;
+    mappingDecisions?: Record<string, unknown>[];
+    calculationPreviews?: Record<string, unknown>[];
+    decompositionRevisions?: Record<string, unknown>[];
+    decompositionComponents?: Record<string, unknown>[];
+  };
+  const item = state.items[0];
+  const profile = authority.profiles?.[0];
+  const serving = authority.servings?.find(
+    (candidate) => candidate.unit === item?.unit,
+  );
+  const decision = authority.mappingDecisions?.[0];
+  const preview = authority.calculationPreviews?.[0];
+  if (item && profile && decision && preview) {
+    const modelRoot = item.origin === 'model_estimate';
+    item.recognitionRegionIndex = modelRoot ? 0 : null;
+    if (authority.storedObservation) {
+      authority.storedObservation.canonicalContent = {
+        version: 3,
+        authority: modelRoot ? 'provider_observation' : 'manual_entry',
+        observations: modelRoot
+          ? [{ regionIndex: 0, localObservationId: 'o0' }]
+          : [],
+      };
+    }
+    decision.localObservationId = modelRoot ? 'o0' : `manual:${item.id}`;
+    const identity = {
+      basis: 'finished_profile',
+      rootMappingDecisionId: decision.id,
+      rootRevision: item.itemRevision,
+      catalogReleaseId,
+      releaseActivationId: activationId,
+      leaves: [{
+        ordinal: 0,
+        componentIdentity: decision.id,
+        foodId: item.foodId,
+        edibleAmountMg:
+          item.unit === 'g'
+            ? item.amountMilliunits
+            : Math.round(
+                Number(item.amountMilliunits) *
+                Number(serving?.gramsMg ?? 0) /
+                Number(serving?.amountMilliunits ?? 1),
+              ),
+        unit: item.unit,
+        nutrientProfileId: profile.id,
+        sourceItemId: profile.sourceItemId,
+        profileQualityGrade: profile.qualityGrade,
+        servingId: serving?.id ?? null,
+        servingAmountMilliunits: serving?.amountMilliunits ?? null,
+        servingGramsMg: serving?.gramsMg ?? null,
+        servingSourceRegistryId: serving?.sourceRegistryId ?? null,
+        servingQualityGrade: serving?.qualityGrade ?? null,
+        sourceRegistryId: profile.sourceRegistryId,
+        sourceReleaseId,
+        sourceReleaseVersion: profile.datasetVersion,
+        catalogReleaseId,
+        catalogManifestSha256: 'a'.repeat(64),
+        nutrientProfile: {
+          basisAmountMg: profile.basisAmountMg,
+          energyMillicalories: profile.energyMillicalories,
+          carbohydrateMg: profile.carbohydrateMg,
+          proteinMg: profile.proteinMg,
+          fatMg: profile.fatMg,
+          fiberMg: profile.fiberMg,
+        },
+      }],
+    };
+    preview.identity = identity;
+    preview.rootRevision = item.itemRevision;
+    const gramsMg =
+      item.unit === 'g'
+        ? Number(item.amountMilliunits)
+        : Math.round(
+            Number(item.amountMilliunits) *
+              Number(serving?.gramsMg ?? 0) /
+              Number(serving?.amountMilliunits ?? 1),
+          );
+    if (options.populateReviewCheckpoint !== false) {
+      item.reviewedItemRevision = item.itemRevision;
+      item.reviewedAuthorityFingerprintVersion =
+        MEAL_ITEM_REVIEW_FINGERPRINT_VERSION;
+      item.reviewedAuthorityFingerprint = mealItemReviewFingerprint({
+        itemId: String(item.id),
+        itemRevision: Number(item.itemRevision),
+        foodId: String(item.foodId),
+        nutrientProfileId: String(profile.id),
+        amountMilliunits: Number(item.amountMilliunits),
+        unit: item.unit as 'g' | 'ml' | 'serving' | 'bowl' | 'piece',
+        gramsMg,
+        catalogReleaseId,
+        catalogActivationId: activationId,
+        mappingMethod: 'manual',
+        mappingDecisionId: String(decision.id),
+        mappingContentSha256: String(authority.storedObservation?.contentSha256 ?? null),
+        sourceRegistryId: String(profile.sourceRegistryId),
+        sourceReleaseId,
+        servingId: serving ? String(serving.id) : null,
+        calculationPreviewId: String(preview.id),
+        calculationPreviewSha256: String(preview.contentSha256 ?? null),
+        mealDecompositionRevisionId: null,
+        mealDecompositionSha256: null,
+        calculationVersion: 'meal-nutrition-v1',
+      });
+      item.reviewIdempotencyKey = 'fixture-review';
+      item.reviewRequestFingerprint = 'b'.repeat(64);
+      item.reviewedAt = new Date();
+    }
+  }
   return {
     expectedDraftRevision: 1,
+    idempotencyKey: '00000000-0000-4000-8000-000000000099',
     items: state.items.map((item) => ({
       itemId: item.id,
       expectedItemRevision: item.itemRevision ?? 1,
+      ...(decision && preview
+        ? {
+            mappingDecisionId: decision.id,
+            calculationPreviewId: preview.id,
+          }
+        : {}),
     })),
   };
 }
@@ -1355,6 +2048,9 @@ function configureConfirmableDraft(
     foods: Record<string, unknown>[];
     profiles: Record<string, unknown>[];
     registries: Record<string, unknown>[];
+    storedObservation?: Record<string, unknown>;
+    mappingDecisions?: Record<string, unknown>[];
+    calculationPreviews?: Record<string, unknown>[];
   },
   unit: 'g' | 'serving',
 ) {
@@ -1367,7 +2063,7 @@ function configureConfirmableDraft(
     nutrientProfileId,
     amountMilliunits: 1_500,
     unit,
-    recognitionRegionIndex: 0,
+    recognitionRegionIndex: null,
     recognitionConfidenceBps: null,
     portionConfidenceBps: null,
     mappingConfidenceBps: 10_000,
@@ -1379,8 +2075,6 @@ function configureConfirmableDraft(
     itemRevision: 1,
     foodRevision: 1,
     portionRevision: 1,
-    foodAcknowledgedRevision: 1,
-    portionAcknowledgedRevision: 1,
   }];
   state.foods = [{ id: foodId, isDeprecated: false }];
   state.profiles = [{
@@ -1398,6 +2092,41 @@ function configureConfirmableDraft(
     fiberMg: null,
   }];
   state.registries = [{ id: sourceRegistryId, kind: 'public_dataset' }];
+  state.storedObservation = {
+    id: '00000000-0000-4000-8000-000000000032',
+    mealLogId: mealId,
+    canonicalContent: {
+      version: 3,
+      authority: 'manual_entry',
+      observations: [],
+    },
+    contentSha256: '9'.repeat(64),
+  };
+  state.mappingDecisions = [{
+    id: '00000000-0000-4000-8000-000000000040',
+    storedObservationId: state.storedObservation.id,
+    localObservationId: `manual:${itemId}`,
+    catalogReleaseId,
+    releaseActivationId: activationId,
+    selectedFoodId: foodId,
+    status: 'selected',
+    method: 'manual',
+    candidates: [],
+    createdAt: new Date(),
+  }];
+  state.calculationPreviews = [{
+    id: '00000000-0000-4000-8000-000000000050',
+    mealLogId: mealId,
+    rootMappingDecisionId: state.mappingDecisions[0]!.id,
+    rootRevision: 1,
+    catalogReleaseId,
+    releaseActivationId: activationId,
+    discriminant: 'finished_profile',
+    identity: {},
+    contentSha256: '8'.repeat(64),
+    createdAt: new Date(),
+  }];
+  confirmPayload(state, { populateReviewCheckpoint: false });
 }
 
 function applyValuesWithRevisionIncrements(
@@ -1406,15 +2135,7 @@ function applyValuesWithRevisionIncrements(
   revisionKeys: string[],
 ) {
   for (const [key, value] of Object.entries(values)) {
-    if (key === 'foodAcknowledgedRevision' && value !== null && typeof value !== 'number') {
-      target[key] = target.foodRevision;
-    } else if (
-      key === 'portionAcknowledgedRevision' &&
-      value !== null &&
-      typeof value !== 'number'
-    ) {
-      target[key] = target.portionRevision;
-    } else if (revisionKeys.includes(key) && typeof value !== 'number') {
+    if (revisionKeys.includes(key) && typeof value !== 'number') {
       target[key] = Number(target[key] ?? 1) + 1;
     } else {
       target[key] = value;
@@ -1435,10 +2156,17 @@ function databaseMock(state: {
   rejectMealUpdate?: boolean;
   rejectItemUpdate?: boolean;
   rejectItemDelete?: boolean;
+  recognitionAttempt?: Record<string, unknown>;
+  storedObservation?: Record<string, unknown>;
+  mappingDecisions: Record<string, unknown>[];
+  calculationPreviews: Record<string, unknown>[];
+  decompositionRevisions: Record<string, unknown>[];
+  decompositionComponents: Record<string, unknown>[];
 }) {
   const canClaimImage = state.asset.status === 'validated';
   const query = (value: unknown) => ({
     for: () => query(value),
+    where: () => query(value),
     orderBy: () => query(value),
     limit: async () =>
       value === undefined ? [] : Array.isArray(value) ? value.slice(0, 1) : [value],
@@ -1463,12 +2191,92 @@ function databaseMock(state: {
               ? state.meal
               : table === mealItems
                 ? state.items
+                : table === activeCatalogReleasePointers
+                  ? [{
+                      id: activationId,
+                      activationId,
+                      catalogReleaseId,
+                      policyVersion: 'catalog-release-v1',
+                      policySha256: 'f'.repeat(64),
+                    }]
+                : table === releaseActivations
+                  ? [{
+                      id: activationId,
+                      activationId,
+                      catalogReleaseId,
+                      policyVersion: 'catalog-release-v1',
+                      policySha256: 'f'.repeat(64),
+                    }]
+                : table === catalogReleases
+                  ? [{
+                      id: catalogReleaseId,
+                      status: 'published',
+                      manifestSha256: 'a'.repeat(64),
+                    }]
+                : table === catalogReleaseFoods
+                  ? state.foods.map((food) => ({
+                      catalogReleaseId,
+                      foodId: food.id,
+                    }))
+                : table === catalogReleaseNutrientProfiles
+                  ? state.profiles.map((profile) => ({
+                      catalogReleaseId,
+                      nutrientProfileId: profile.id,
+                    }))
+                : table === catalogReleaseFoodServings
+                  ? state.servings.map((serving) => ({
+                      catalogReleaseId,
+                      foodServingId: serving.id,
+                    }))
+                : table === sourceReleases
+                  ? [{
+                      id: sourceReleaseId,
+                      sourceRegistryId,
+                      version: '2026-08',
+                      status: 'published',
+                      kind:
+                        state.registries.find(
+                          (registry) => registry.id === sourceRegistryId,
+                        )?.kind ?? 'public_dataset',
+                      artifactKind: 'nutrition',
+                      licenseSha256: 'b'.repeat(64),
+                      artifactSha256: 'c'.repeat(64),
+                      manifestSha256: 'd'.repeat(64),
+                    }]
+                : table === catalogReleaseSources
+                  ? [{
+                      catalogReleaseId,
+                      sourceReleaseId,
+                      priority: 100,
+                      allowedArtifactKinds: ['nutrition'],
+                      eligibilityManifestSha256: 'e'.repeat(64),
+                    }]
+                : table === recognitionAttempts
+                  ? state.recognitionAttempt
+                : table === storedObservations
+                  ? state.storedObservation
+                : table === mappingDecisions
+                  ? state.mappingDecisions
+                : table === calculationPreviews
+                  ? state.calculationPreviews
+                  : table === mealDecompositionRevisions
+                    ? state.decompositionRevisions
+                    : table === mealDecompositionComponents
+                      ? state.decompositionComponents
                 : table === foods
                   ? state.foods
                   : table === nutrientProfiles
-                    ? state.profiles
+                    ? state.profiles.map((profile) => ({
+                        ...profile,
+                        sourceReleaseId:
+                          profile.sourceReleaseId ?? sourceReleaseId,
+                      }))
                     : table === foodServings
-                      ? state.servings
+                      ? state.servings.map((serving) => ({
+                          ...serving,
+                          sourceReleaseId:
+                            serving.sourceReleaseId ?? sourceReleaseId,
+                        }))
                       : table === sourceRegistries
                         ? state.registries
                         : table === calculationSnapshots
@@ -1478,6 +2286,7 @@ function databaseMock(state: {
           table === nutrientProfiles
             ? state.profiles.map((profile) => ({
                 ...profile,
+                sourceReleaseId: profile.sourceReleaseId ?? sourceReleaseId,
                 sourceKind: state.registries.find(
                   (registry) => registry.id === profile.sourceRegistryId,
                 )?.kind,
@@ -1485,16 +2294,17 @@ function databaseMock(state: {
             : table === foodServings
               ? state.servings.map((serving) => ({
                   ...serving,
+                  sourceReleaseId: serving.sourceReleaseId ?? sourceReleaseId,
                   sourceKind: state.registries.find(
                     (registry) => registry.id === serving.sourceRegistryId,
                   )?.kind,
                 }))
-              : rows;
-        return {
-          where: () => query(rows),
-          orderBy: () => query(rows),
-          innerJoin: () => ({ where: () => query(joinedRows) }),
-        };
+              : table === sourceReleases
+                ? rows
+                : rows;
+        return Object.assign(query(rows), {
+          innerJoin: () => query(joinedRows),
+        });
       },
     }),
     update: (table: unknown) => ({
@@ -1570,10 +2380,42 @@ function databaseMock(state: {
               itemRevision: row.itemRevision ?? 1,
               foodRevision: row.foodRevision ?? 1,
               portionRevision: row.portionRevision ?? 1,
-              foodAcknowledgedRevision: row.foodAcknowledgedRevision ?? null,
-              portionAcknowledgedRevision: row.portionAcknowledgedRevision ?? null,
             }));
             state.items.push(...inserted);
+            return inserted;
+          }
+          if (table === recognitionAttempts) {
+            const attempt = {
+              ...firstRow,
+              id: '00000000-0000-4000-8000-000000000031',
+            };
+            state.recognitionAttempt = attempt;
+            return [attempt];
+          }
+          if (table === storedObservations) {
+            const observation = {
+              ...firstRow,
+              id: '00000000-0000-4000-8000-000000000032',
+            };
+            state.storedObservation = observation;
+            return [observation];
+          }
+          if (table === mappingDecisions) {
+            const inserted = rows.map((row, index) => ({
+              ...row,
+              id: `00000000-0000-4000-8000-${String(40 + state.mappingDecisions.length + index).padStart(12, '0')}`,
+              createdAt: new Date(),
+            }));
+            state.mappingDecisions.push(...inserted);
+            return inserted;
+          }
+          if (table === calculationPreviews) {
+            const inserted = rows.map((row, index) => ({
+              ...row,
+              id: `00000000-0000-4000-8000-${String(50 + state.calculationPreviews.length + index).padStart(12, '0')}`,
+              createdAt: new Date(),
+            }));
+            state.calculationPreviews.push(...inserted);
             return inserted;
           }
           if (table === calculationSnapshots) {

@@ -99,6 +99,76 @@
       "when": 1786460695623,
       "tag": "0013_handy_spectrum",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1786460695624,
+      "tag": "0014_catalog_release_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1786460695625,
+      "tag": "0015_recognition_v3_resolution_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1786460695626,
+      "tag": "0016_partial_nutrition",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1786460695627,
+      "tag": "0017_composite_meal_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1786460695628,
+      "tag": "0018_composite_preview_provenance",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1786520780633,
+      "tag": "0019_confirmation_idempotency",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1786520780634,
+      "tag": "0020_catalog_backfill_checkpoint",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1786520780635,
+      "tag": "0021_manual_authority_provider",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1786520780636,
+      "tag": "0022_meal_confirmation_safe_review",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1786520780637,
+      "tag": "0023_remove_obsolete_meal_review",
+      "breakpoints": true
     }
   ]
 }

@@ -10,7 +10,7 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "bundleIdentifier": "dev.boseong.nueat",
-      "buildNumber": "2",
+      "buildNumber": "4",
       "supportsTablet": false,
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false

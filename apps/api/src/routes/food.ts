@@ -1,17 +1,21 @@
 import {
-  foodAliases,
+  activeCatalogReleasePointers,
+  catalogReleaseSearchDocuments,
   foods,
   foodServings,
   nutrientProfiles,
+  releaseActivations,
   sourceRegistries,
   type Database,
 } from '@nueat/database';
-import { and, asc, eq, exists, inArray, like, or, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, like, or, sql } from 'drizzle-orm';
 import { fromNodeHeaders } from 'better-auth/node';
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
 import type { Auth } from '../auth/auth';
+import { selectTrustedNutrition } from '../services/catalog-eligibility-selector';
+import { catalogEligibilityAdapter } from '../services/meal-resolution-coordinator';
 
 const searchQuerySchema = z
   .object({
@@ -29,12 +33,6 @@ const foodQuerySchema = z
     nutrientProfileId: z.string().uuid().optional(),
   })
   .strict();
-const trustedNutritionSourceKinds = [
-  'public_dataset',
-  'manufacturer',
-  'commercial_dataset',
-] as const;
-
 interface FoodRouteOptions {
   auth: Auth;
   database: Database;
@@ -52,37 +50,18 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
 
     const normalizedQuery = normalizeFoodQuery(parsed.data.q);
     if (!normalizedQuery) return invalidRequest(reply, request);
+    const catalogReleaseId = await activeCatalogReleaseId(options.database);
+    if (!catalogReleaseId) return { foods: [] };
 
     const aliasMatchRank = sql<number>`
       case
-        when ${foodAliases.normalizedAliasKo} = ${normalizedQuery} then 0
-        when ${foodAliases.normalizedAliasKo} like ${`${normalizedQuery}%`} then 1
+        when ${catalogReleaseSearchDocuments.normalizedCompact} = ${normalizedQuery} then 0
+        when ${catalogReleaseSearchDocuments.normalizedCompact} like ${`${normalizedQuery}%`} then 1
         else 2
       end
     `;
     const bestAliasRank = sql<number>`min(${aliasMatchRank})`;
-    const bestAlias = sql<string>`min(${foodAliases.normalizedAliasKo})`;
-    const eligibleProfile = options.database
-      .select({ one: sql`1` })
-      .from(nutrientProfiles)
-      .innerJoin(
-        sourceRegistries,
-        eq(nutrientProfiles.sourceRegistryId, sourceRegistries.id),
-      )
-      .where(
-        and(
-          eq(nutrientProfiles.foodId, foods.id),
-          or(
-            eq(nutrientProfiles.qualityGrade, 'verified'),
-            eq(nutrientProfiles.qualityGrade, 'estimated'),
-          ),
-          inArray(sourceRegistries.kind, [...trustedNutritionSourceKinds]),
-          sql`${nutrientProfiles.energyMillicalories} is not null`,
-          sql`${nutrientProfiles.carbohydrateMg} is not null`,
-          sql`${nutrientProfiles.proteinMg} is not null`,
-          sql`${nutrientProfiles.fatMg} is not null`,
-        ),
-      );
+    const bestAlias = sql<string>`min(${catalogReleaseSearchDocuments.displayTextKo})`;
     const foodMatches = await options.database
       .select({
         foodId: foods.id,
@@ -91,16 +70,16 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
         preparation: foods.preparation,
         alias: bestAlias,
       })
-      .from(foodAliases)
-      .innerJoin(foods, eq(foodAliases.foodId, foods.id))
+      .from(catalogReleaseSearchDocuments)
+      .innerJoin(foods, eq(catalogReleaseSearchDocuments.foodId, foods.id))
       .where(
         and(
+          eq(catalogReleaseSearchDocuments.catalogReleaseId, catalogReleaseId),
           eq(foods.isDeprecated, false),
           or(
-            eq(foodAliases.normalizedAliasKo, normalizedQuery),
-            like(foodAliases.normalizedAliasKo, `%${normalizedQuery}%`),
+            eq(catalogReleaseSearchDocuments.normalizedCompact, normalizedQuery),
+            like(catalogReleaseSearchDocuments.normalizedCompact, `%${normalizedQuery}%`),
           ),
-          exists(eligibleProfile),
         ),
       )
       .groupBy(
@@ -119,10 +98,37 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
 
     if (!foodMatches.length) return { foods: [] };
 
-    const foodIds = foodMatches.map((match) => match.foodId);
+    const eligibility = catalogEligibilityAdapter(options.database);
+    const selections = await Promise.all(foodMatches.map(async (food) => {
+      const selected = await selectTrustedNutrition(eligibility, {
+        catalogReleaseId, foodId: food.foodId, unit: 'g',
+      });
+      return selected.kind === 'selected' ? [food.foodId, selected] as const : null;
+    }));
+    const selectedByFood = new Map(
+      selections.flatMap((selection) => selection ? [selection] : []),
+    );
+    const selectedProfileIds = [...selectedByFood.values()].map(
+      (selection) => selection.profile.id,
+    );
+    const nonGramUnits = ['ml', 'serving', 'bowl', 'piece'] as const;
+    const servingSelections = await Promise.all(
+      [...selectedByFood.keys()].flatMap((foodId) =>
+        nonGramUnits.map(async (unit) => {
+          const selected = await selectTrustedNutrition(eligibility, {
+            catalogReleaseId, foodId, unit,
+          });
+          return selected.kind === 'selected' && selected.serving
+            ? [foodId, selected.serving.id] as const
+            : null;
+        }),
+      ),
+    );
+    const selectedServingIds = servingSelections.flatMap(
+      (selection) => selection ? [selection[1]] : [],
+    );
     const [profiles, servings] = await Promise.all([
-      options.database
-        .select({
+      selectedProfileIds.length === 0 ? [] : options.database.select({
           id: nutrientProfiles.id,
           foodId: nutrientProfiles.foodId,
           sourceRegistryId: nutrientProfiles.sourceRegistryId,
@@ -143,17 +149,8 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
           sourceRegistries,
           eq(nutrientProfiles.sourceRegistryId, sourceRegistries.id),
         )
-        .where(
-          and(
-            inArray(nutrientProfiles.foodId, foodIds),
-            or(
-              eq(nutrientProfiles.qualityGrade, 'verified'),
-              eq(nutrientProfiles.qualityGrade, 'estimated'),
-            ),
-            inArray(sourceRegistries.kind, [...trustedNutritionSourceKinds]),
-          ),
-        ),
-      options.database
+        .where(inArray(nutrientProfiles.id, selectedProfileIds)),
+      selectedServingIds.length === 0 ? [] : options.database
         .select({
           id: foodServings.id,
           foodId: foodServings.foodId,
@@ -164,40 +161,22 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
           qualityGrade: foodServings.qualityGrade,
         })
         .from(foodServings)
-        .innerJoin(
-          sourceRegistries,
-          eq(foodServings.sourceRegistryId, sourceRegistries.id),
-        )
-        .where(
-          and(
-            inArray(foodServings.foodId, foodIds),
-            or(
-              eq(foodServings.qualityGrade, 'verified'),
-              eq(foodServings.qualityGrade, 'estimated'),
-            ),
-            inArray(sourceRegistries.kind, [...trustedNutritionSourceKinds]),
-          ),
-        )
+        .where(inArray(foodServings.id, selectedServingIds))
         .orderBy(asc(foodServings.labelKo), asc(foodServings.id)),
     ]);
-
-    const preferredProfiles = new Map<string, (typeof profiles)[number]>();
-    for (const profile of profiles.sort(compareProfiles)) {
-      if (!preferredProfiles.has(profile.foodId))
-        preferredProfiles.set(profile.foodId, profile);
-    }
     const servingsByFood = new Map<string, (typeof servings)[number][]>();
     for (const serving of servings) {
-      const values = servingsByFood.get(serving.foodId) ?? [];
-      values.push(serving);
-      servingsByFood.set(serving.foodId, values);
+      const current = servingsByFood.get(serving.foodId) ?? [];
+      current.push(serving);
+      servingsByFood.set(serving.foodId, current);
     }
 
     return {
       foods: foodMatches
-        .filter((food) => preferredProfiles.has(food.foodId))
+        .filter((food) => selectedByFood.has(food.foodId))
         .map((food) => {
-          const profile = preferredProfiles.get(food.foodId);
+          const selected = selectedByFood.get(food.foodId);
+          const profile = selected && profiles.find((candidate) => candidate.id === selected.profile.id);
           if (!profile) throw new Error('Preferred nutrient profile is missing');
           return {
             id: food.foodId,
@@ -231,6 +210,8 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
     if (!parsed.success) return invalidRequest(reply, request);
     const parsedQuery = foodQuerySchema.safeParse(request.query);
     if (!parsedQuery.success) return invalidRequest(reply, request);
+    const catalogReleaseId = await activeCatalogReleaseId(options.database);
+    if (!catalogReleaseId) return foodNotFound(reply, request);
 
     const [food] = await options.database
       .select({
@@ -243,8 +224,34 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
       .where(and(eq(foods.id, parsed.data.foodId), eq(foods.isDeprecated, false)))
       .limit(1);
     if (!food) return foodNotFound(reply, request);
+    const selected = await selectTrustedNutrition(catalogEligibilityAdapter(options.database), {
+      catalogReleaseId,
+      foodId: food.id,
+      unit: 'g',
+    });
+    if (selected.kind === 'unavailable') return foodNotFound(reply, request);
+    if (
+      parsedQuery.data.nutrientProfileId &&
+      parsedQuery.data.nutrientProfileId !== selected.profile.id
+    ) {
+      return foodNotFound(reply, request);
+    }
+    const servingSelections = await Promise.all(
+      (['ml', 'serving', 'bowl', 'piece'] as const).map(async (unit) => {
+        const servingSelection = await selectTrustedNutrition(
+          catalogEligibilityAdapter(options.database),
+          { catalogReleaseId, foodId: food.id, unit },
+        );
+        return servingSelection.kind === 'selected' && servingSelection.serving
+          ? servingSelection.serving.id
+          : null;
+      }),
+    );
+    const selectedServingIds = servingSelections.filter(
+      (id): id is string => id !== null,
+    );
 
-    const [profiles, servings] = await Promise.all([
+    const [profile, servings] = await Promise.all([
       options.database
         .select({
           id: nutrientProfiles.id,
@@ -269,18 +276,11 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
         )
         .where(
           and(
+            eq(nutrientProfiles.id, selected.profile.id),
             eq(nutrientProfiles.foodId, food.id),
-            ...(parsedQuery.data.nutrientProfileId
-              ? [eq(nutrientProfiles.id, parsedQuery.data.nutrientProfileId)]
-              : []),
-            or(
-              eq(nutrientProfiles.qualityGrade, 'verified'),
-              eq(nutrientProfiles.qualityGrade, 'estimated'),
-            ),
-            inArray(sourceRegistries.kind, [...trustedNutritionSourceKinds]),
           ),
         ),
-      options.database
+      selectedServingIds.length === 0 ? [] : options.database
         .select({
           id: foodServings.id,
           foodId: foodServings.foodId,
@@ -291,32 +291,13 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
           qualityGrade: foodServings.qualityGrade,
         })
         .from(foodServings)
-        .innerJoin(
-          sourceRegistries,
-          eq(foodServings.sourceRegistryId, sourceRegistries.id),
-        )
-        .where(
-          and(
-            eq(foodServings.foodId, food.id),
-            or(
-              eq(foodServings.qualityGrade, 'verified'),
-              eq(foodServings.qualityGrade, 'estimated'),
-            ),
-            inArray(sourceRegistries.kind, [...trustedNutritionSourceKinds]),
-          ),
-        )
+        .where(inArray(foodServings.id, selectedServingIds))
         .orderBy(asc(foodServings.labelKo), asc(foodServings.id)),
     ]);
-    const profile = parsedQuery.data.nutrientProfileId
-      ? profiles.find(
-          (candidate) =>
-            candidate.id === parsedQuery.data.nutrientProfileId &&
-            candidate.foodId === food.id &&
-            (candidate.qualityGrade === 'verified' ||
-              candidate.qualityGrade === 'estimated'),
-        )
-      : [...profiles].sort(compareProfiles)[0];
-    if (!profile) return foodNotFound(reply, request);
+    const selectedProfile = profile.find(
+      (candidate) => candidate.id === selected.profile.id,
+    );
+    if (!selectedProfile) return foodNotFound(reply, request);
 
     return {
       id: food.id,
@@ -324,19 +305,19 @@ export const foodRoutes: FastifyPluginAsync<FoodRouteOptions> = async (
       category: food.category,
       preparation: food.preparation,
       nutrientProfile: {
-        id: profile.id,
-        sourceRegistryId: profile.sourceRegistryId,
-        sourceCode: profile.sourceCode,
-        sourceDisplayName: profile.sourceDisplayName,
-        sourceItemId: profile.sourceItemId,
-        datasetVersion: profile.datasetVersion,
-        basisAmountMg: profile.basisAmountMg,
-        energyMillicalories: profile.energyMillicalories,
-        carbohydrateMg: profile.carbohydrateMg,
-        proteinMg: profile.proteinMg,
-        fatMg: profile.fatMg,
-        fiberMg: profile.fiberMg,
-        qualityGrade: profile.qualityGrade,
+        id: selectedProfile.id,
+        sourceRegistryId: selectedProfile.sourceRegistryId,
+        sourceCode: selectedProfile.sourceCode,
+        sourceDisplayName: selectedProfile.sourceDisplayName,
+        sourceItemId: selectedProfile.sourceItemId,
+        datasetVersion: selectedProfile.datasetVersion,
+        basisAmountMg: selectedProfile.basisAmountMg,
+        energyMillicalories: selectedProfile.energyMillicalories,
+        carbohydrateMg: selectedProfile.carbohydrateMg,
+        proteinMg: selectedProfile.proteinMg,
+        fatMg: selectedProfile.fatMg,
+        fiberMg: selectedProfile.fiberMg,
+        qualityGrade: selectedProfile.qualityGrade,
       },
       servings,
     };
@@ -350,17 +331,16 @@ export function normalizeFoodQuery(value: string) {
     .replace(/[\s\p{P}\p{S}]+/gu, '');
 }
 
-function compareProfiles(
-  left: { qualityGrade: string; datasetVersion: string; id: string },
-  right: { qualityGrade: string; datasetVersion: string; id: string },
-) {
-  const qualityRank = (qualityGrade: string) =>
-    qualityGrade === 'verified' ? 0 : qualityGrade === 'estimated' ? 1 : 2;
-  return (
-    qualityRank(left.qualityGrade) - qualityRank(right.qualityGrade) ||
-    right.datasetVersion.localeCompare(left.datasetVersion) ||
-    left.id.localeCompare(right.id)
-  );
+async function activeCatalogReleaseId(database: Pick<Database, 'select'>) {
+  const [active] = await database
+    .select({ catalogReleaseId: releaseActivations.catalogReleaseId })
+    .from(activeCatalogReleasePointers)
+    .innerJoin(
+      releaseActivations,
+      eq(activeCatalogReleasePointers.activationId, releaseActivations.id),
+    )
+    .limit(1);
+  return active?.catalogReleaseId ?? null;
 }
 
 async function requireUserId(

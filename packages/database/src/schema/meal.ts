@@ -16,8 +16,18 @@ import {
   uuid,
 } from 'drizzle-orm/pg-core';
 
+import type {
+  CalculationInputSnapshotV2,
+  LegacyCalculationInputSnapshot,
+} from '../calculation-snapshot';
 import { users } from './auth';
-import { foods, nutrientProfiles, servingUnitEnum } from './food';
+import {
+  catalogReleases,
+  foods,
+  nutrientProfiles,
+  releaseActivations,
+  servingUnitEnum,
+} from './food';
 
 export const mealStatusEnum = pgEnum('meal_status', ['draft', 'confirmed', 'deleted']);
 export const mealTypeEnum = pgEnum('meal_type', ['breakfast', 'lunch', 'dinner', 'snack']);
@@ -46,7 +56,11 @@ export const assetDeletionJobStatusEnum = pgEnum('asset_deletion_job_status', [
   'failed',
   'completed',
 ]);
-export const recognitionProviderEnum = pgEnum('recognition_provider', ['mock', 'openai']);
+export const recognitionProviderEnum = pgEnum('recognition_provider', [
+  'mock',
+  'openai',
+  'manual',
+]);
 export const mealItemOriginEnum = pgEnum('meal_item_origin', [
   'model_estimate',
   'manual_entry',
@@ -58,6 +72,23 @@ export const mealItemMappingSourceEnum = pgEnum('meal_item_mapping_source', [
   'model_alternative',
   'user_selected',
   'legacy_existing',
+]);
+export const resolutionStatusEnum = pgEnum('resolution_status', [
+  'pending',
+  'processing',
+  'resolved',
+  'failed',
+]);
+export const mappingDecisionStatusEnum = pgEnum('mapping_decision_status', [
+  'review_required',
+  'selected',
+  'unresolved',
+]);
+export const mappingDecisionMethodEnum = pgEnum('mapping_decision_method', [
+  'exact',
+  'lexical',
+  'user_selected',
+  'manual',
 ]);
 
 export type RecognitionEvidenceReason =
@@ -103,7 +134,28 @@ export interface RecognitionResultV1 {
   }>;
 }
 
-export type StoredRecognitionResult = RecognitionResultV1 | RecognitionResultV2;
+export interface RecognitionObservationV3 {
+  localObservationId: `o${number}`;
+  regionIndex: number;
+  parentRegionIndex: number | null;
+  kind: 'dish' | 'drink' | 'component';
+  rawLabel: string;
+  normalizedLabel: string;
+  foodConfidenceBps: number;
+  portionConfidenceBps: number;
+  amountMilliunits: number;
+  unit: 'g' | 'ml' | 'serving' | 'bowl' | 'piece';
+  categoryHint: 'staple' | 'soup_stew' | 'meat' | 'seafood' | 'vegetable' | 'noodle_dumpling' | 'snack_dessert' | 'beverage' | 'mixed' | 'unknown';
+  preparationCodes: Array<'raw' | 'boiled' | 'steamed' | 'grilled' | 'fried' | 'baked' | 'braised' | 'fermented' | 'mixed' | 'unknown'>;
+  uncertaintyCodes: Array<'identity_uncertain' | 'portion_uncertain' | 'occluded' | 'overlapping' | 'mixed_dish' | 'preparation_uncertain'>;
+  questionReasonCodes: Array<'confirm_identity' | 'confirm_portion' | 'confirm_component'>;
+  alternatives: Array<{ label: string; normalizedLabel: string; confidenceBps: number }>;
+}
+export type RecognitionResultV3 =
+  | { version: 3; outcome: 'recognized'; imageQualityConfidenceBps: number; observations: RecognitionObservationV3[] }
+  | { version: 3; outcome: 'no_food'; imageQualityConfidenceBps: number; observations: [] }
+  | { version: 3; outcome: 'insufficient_evidence'; imageQualityConfidenceBps: number; evidenceReason: RecognitionEvidenceReason; observations: [] };
+export type StoredRecognitionResult = RecognitionResultV1 | RecognitionResultV2 | RecognitionResultV3;
 
 export function isRecognitionResultV2(
   result: StoredRecognitionResult | null | undefined,
@@ -121,6 +173,37 @@ export function isRecognitionResultV2(
     typeof value.imageQualityConfidenceBps === 'number' &&
     value.foods.length === 0 &&
     ['blurred', 'too_dark', 'occluded', 'not_meal_photo', 'other'].includes(value.evidenceReason as string);
+}
+
+export function isRecognitionResultV3(
+  result: StoredRecognitionResult | null | undefined,
+): result is RecognitionResultV3 {
+  const value: Record<string, unknown> =
+    result && typeof result === 'object'
+      ? result as Record<string, unknown>
+      : {};
+  if (!result || value.version !== 3 || !Array.isArray(value.observations))
+    return false;
+  if (value.outcome === 'recognized') {
+    return (
+      typeof value.imageQualityConfidenceBps === 'number' &&
+      value.observations.length > 0
+    );
+  }
+  if (value.outcome === 'no_food') {
+    return (
+      typeof value.imageQualityConfidenceBps === 'number' &&
+      value.observations.length === 0
+    );
+  }
+  return (
+    value.outcome === 'insufficient_evidence' &&
+    typeof value.imageQualityConfidenceBps === 'number' &&
+    value.observations.length === 0 &&
+    ['blurred', 'too_dark', 'occluded', 'not_meal_photo', 'other'].includes(
+      value.evidenceReason as string,
+    )
+  );
 }
 
 export type RecognitionResultV2 =
@@ -184,70 +267,76 @@ export interface InitialEstimateAssessment {
   policyVersion: string;
 }
 
-export interface CalculationInputSnapshot {
-  confirmationDecision: {
-    originalRecognition: {
-      provider: 'mock' | 'openai';
-      model: string;
-      promptVersion: string;
-      schemaVersion: string;
-      outcome: RecognitionResultV2['outcome'];
-      evidenceReason?: RecognitionEvidenceReason;
-      completedAt: string;
-    } | null;
-    manualOverride: ManualRecognitionOverride | null;
-    policy: {
-      version: string;
-      activation: 'review_only' | 'quick_confirm';
-      approvedReportSha256: string | null;
-      activeReportSha256: string | null;
-      approvedReportVersion: string | null;
-    };
+export type StoredCalculationInputSnapshot =
+  | LegacyCalculationInputSnapshot
+  | CalculationInputSnapshotV2;
+
+export type NutrientSnapshotEvidence = Record<
+  'energyMillicalories' | 'carbohydrateMg' | 'proteinMg' | 'fatMg' | 'fiberMg',
+  {
+    value: number | null;
+    knownValue: number;
+    missingItemCount: number;
+    completeness: 'complete' | 'partial';
+  }
+>;
+
+export type CalculationPreviewLeafProvenance = {
+  ordinal: number;
+  componentIdentity: string;
+  foodId: string;
+  edibleAmountMg: number;
+  unit: 'g' | 'ml' | 'serving' | 'bowl' | 'piece';
+  nutrientProfileId: string;
+  sourceItemId: string;
+  profileQualityGrade: 'verified' | 'estimated' | 'unverified';
+  servingId: string | null;
+  servingAmountMilliunits: number | null;
+  servingGramsMg: number | null;
+  servingSourceRegistryId: string | null;
+  servingQualityGrade: 'verified' | 'estimated' | 'unverified' | null;
+  sourceRegistryId: string;
+  sourceReleaseId: string;
+  sourceReleaseVersion: string;
+  catalogReleaseId: string;
+  catalogManifestSha256: string;
+  nutrientProfile: {
+    basisAmountMg: number;
+    energyMillicalories: number | null;
+    carbohydrateMg: number | null;
+    proteinMg: number | null;
+    fatMg: number | null;
+    fiberMg: number | null;
   };
-  mealItems: Array<{
-    mealItemId: string;
-    origin: 'model_estimate' | 'manual_entry' | 'user_added' | 'legacy_unknown';
-    initialEstimateAssessment: InitialEstimateAssessment | null;
-    currentResolutionSource: 'model_primary' | 'model_alternative' | 'user_selected' | 'legacy_existing' | null;
-    itemRevision: number;
-    foodRevision: number;
-    portionRevision: number;
-    foodAcknowledgedRevision: number | null;
-    portionAcknowledgedRevision: number | null;
-    foodId: string;
-    nutrientProfileId: string;
-    amountMilliunits: number;
-    unit: 'g' | 'ml' | 'serving' | 'bowl' | 'piece';
-    gramsMg: number;
-    sourceRegistryId: string;
-    sourceItemId: string;
-    datasetVersion: string;
-    nutrientProfileQualityGrade: 'verified' | 'estimated' | 'unverified';
-    nutrientProfile: {
-      basisAmountMg: number;
-      energyMillicalories: number;
-      carbohydrateMg: number;
-      proteinMg: number;
-      fatMg: number;
-      fiberMg: number | null;
+};
+
+export type CalculationPreviewIdentity =
+  | {
+      basis: 'finished_profile';
+      rootMappingDecisionId: string;
+      rootRevision: number;
+      catalogReleaseId: string;
+      releaseActivationId: string;
+      leaves: [CalculationPreviewLeafProvenance];
+    }
+  | {
+      basis: 'source_recipe';
+      rootMappingDecisionId: string;
+      rootRevision: number;
+      catalogReleaseId: string;
+      releaseActivationId: string;
+      recipeVersionId: string;
+      leaves: CalculationPreviewLeafProvenance[];
+    }
+  | {
+      basis: 'meal_decomposition';
+      rootMappingDecisionId: string;
+      rootRevision: number;
+      catalogReleaseId: string;
+      releaseActivationId: string;
+      decompositionRevisionId: string;
+      leaves: CalculationPreviewLeafProvenance[];
     };
-    serving: {
-      id: string;
-      unit: 'ml' | 'serving' | 'bowl' | 'piece';
-      amountMilliunits: number;
-      gramsMg: number;
-      sourceRegistryId: string;
-      qualityGrade: 'verified' | 'estimated' | 'unverified';
-    } | null;
-    nutrients: {
-      energyMillicalories: number;
-      carbohydrateMg: number;
-      proteinMg: number;
-      fatMg: number;
-      fiberMg: number | null;
-    };
-  }>;
-}
 
 export const imageAssets = pgTable(
   'image_asset',
@@ -415,8 +504,14 @@ export const mealLogs = pgTable(
         and ${table.recognitionSchemaVersion} is not null
         and ${table.recognitionResult} is not null
         and jsonb_typeof(${table.recognitionResult}) = 'object'
-        and ${table.recognitionResult} ? 'foods'
-        and jsonb_typeof(${table.recognitionResult}->'foods') = 'array'
+        and (
+          (${table.recognitionResult}->>'version' = '2'
+            and ${table.recognitionResult} ? 'foods'
+            and jsonb_typeof(${table.recognitionResult}->'foods') = 'array')
+          or (${table.recognitionResult}->>'version' = '3'
+            and ${table.recognitionResult} ? 'observations'
+            and jsonb_typeof(${table.recognitionResult}->'observations') = 'array')
+        )
         and ${table.recognitionCompletedAt} is not null)`,
     ),
     check('meal_log_draft_revision_check', sql`${table.draftRevision} > 0`),
@@ -455,6 +550,172 @@ export const mealLogs = pgTable(
   ],
 );
 
+export const recognitionAttempts = pgTable(
+  'recognition_attempt',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    mealLogId: uuid('meal_log_id').notNull().unique().references(() => mealLogs.id, { onDelete: 'cascade' }),
+    imageAssetId: uuid('image_asset_id').notNull().references(() => imageAssets.id, { onDelete: 'restrict' }),
+    status: recognitionStatusEnum('status').default('pending').notNull(),
+    provider: recognitionProviderEnum('provider'),
+    model: text('model'),
+    promptVersion: text('prompt_version'),
+    schemaVersion: text('schema_version'),
+    providerRequestId: text('provider_request_id'),
+    inputTokens: integer('input_tokens').default(0).notNull(),
+    outputTokens: integer('output_tokens').default(0).notNull(),
+    attemptCount: integer('attempt_count').default(0).notNull(),
+    leaseToken: uuid('lease_token'),
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+    nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true }).defaultNow().notNull(),
+    lastErrorCode: text('last_error_code'),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('recognition_attempt_due_idx').on(table.status, table.nextAttemptAt),
+    check('recognition_attempt_counts_check', sql`${table.attemptCount} >= 0 and ${table.inputTokens} >= 0 and ${table.outputTokens} >= 0`),
+    check('recognition_attempt_lease_check', sql`(${table.status} = 'processing' and ${table.leaseToken} is not null and ${table.leaseExpiresAt} is not null) or (${table.status} <> 'processing' and ${table.leaseToken} is null and ${table.leaseExpiresAt} is null)`),
+  ],
+);
+
+export const storedObservations = pgTable(
+  'stored_observation',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    mealLogId: uuid('meal_log_id').notNull().unique().references(() => mealLogs.id, { onDelete: 'cascade' }),
+    recognitionAttemptId: uuid('recognition_attempt_id').notNull().unique().references(() => recognitionAttempts.id, { onDelete: 'restrict' }),
+    provider: recognitionProviderEnum('provider').notNull(),
+    model: text('model').notNull(),
+    promptVersion: text('prompt_version').notNull(),
+    schemaVersion: text('schema_version').notNull(),
+    providerRequestId: text('provider_request_id'),
+    inputTokens: integer('input_tokens').notNull(),
+    outputTokens: integer('output_tokens').notNull(),
+    canonicalContent: jsonb('canonical_content').notNull(),
+    contentSha256: text('content_sha256').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('stored_observation_content_unique').on(table.mealLogId, table.contentSha256),
+    check('stored_observation_tokens_check', sql`${table.inputTokens} >= 0 and ${table.outputTokens} >= 0`),
+    check('stored_observation_content_check', sql`jsonb_typeof(${table.canonicalContent}) = 'object' and ${table.contentSha256} ~ '^[0-9a-f]{64}$'`),
+  ],
+);
+
+export const resolutionAttempts = pgTable(
+  'resolution_attempt',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    storedObservationId: uuid('stored_observation_id').notNull().unique().references(() => storedObservations.id, { onDelete: 'cascade' }),
+    status: resolutionStatusEnum('status').default('pending').notNull(),
+    attemptCount: integer('attempt_count').default(0).notNull(),
+    leaseToken: uuid('lease_token'),
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+    nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true }).defaultNow().notNull(),
+    lastErrorCode: text('last_error_code'),
+    resolvedAt: timestamp('resolved_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('resolution_attempt_due_idx').on(table.status, table.nextAttemptAt),
+    check('resolution_attempt_count_check', sql`${table.attemptCount} >= 0`),
+    check('resolution_attempt_lease_check', sql`(${table.status} = 'processing' and ${table.leaseToken} is not null and ${table.leaseExpiresAt} is not null) or (${table.status} <> 'processing' and ${table.leaseToken} is null and ${table.leaseExpiresAt} is null)`),
+    check('resolution_attempt_resolved_check', sql`${table.status} <> 'resolved' or ${table.resolvedAt} is not null`),
+  ],
+);
+
+export const mappingDecisions = pgTable(
+  'mapping_decision',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    storedObservationId: uuid('stored_observation_id').notNull().references(() => storedObservations.id, { onDelete: 'restrict' }),
+    localObservationId: text('local_observation_id').notNull(),
+    catalogReleaseId: uuid('catalog_release_id').notNull().references(() => catalogReleases.id, { onDelete: 'restrict' }),
+    releaseActivationId: uuid('release_activation_id').notNull().references(() => releaseActivations.id, { onDelete: 'restrict' }),
+    resolverVersion: text('resolver_version').notNull(),
+    resolverSha256: text('resolver_sha256').notNull(),
+    policyVersion: text('policy_version').notNull(),
+    policySha256: text('policy_sha256').notNull(),
+    candidates: jsonb('candidates').notNull(),
+    selectedFoodId: uuid('selected_food_id').references(() => foods.id, { onDelete: 'restrict' }),
+    status: mappingDecisionStatusEnum('status').notNull(),
+    method: mappingDecisionMethodEnum('method').notNull(),
+    reasonCode: text('reason_code').notNull(),
+    evidence: jsonb('evidence').notNull(),
+    predecessorId: uuid('predecessor_id').references((): AnyPgColumn => mappingDecisions.id, { onDelete: 'restrict' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    index('mapping_decision_observation_idx').on(table.storedObservationId, table.localObservationId, table.createdAt),
+    check('mapping_decision_content_check', sql`jsonb_typeof(${table.candidates}) = 'array' and jsonb_array_length(${table.candidates}) <= 8 and jsonb_typeof(${table.evidence}) = 'object'`),
+    check('mapping_decision_hash_check', sql`${table.resolverSha256} ~ '^[0-9a-f]{64}$' and ${table.policySha256} ~ '^[0-9a-f]{64}$'`),
+  ],
+);
+
+export const calculationPreviews = pgTable(
+  'calculation_preview',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    mealLogId: uuid('meal_log_id').notNull().references(() => mealLogs.id, { onDelete: 'cascade' }),
+    rootMappingDecisionId: uuid('root_mapping_decision_id').notNull().references(() => mappingDecisions.id, { onDelete: 'restrict' }),
+    rootRevision: integer('root_revision').notNull(),
+    catalogReleaseId: uuid('catalog_release_id').notNull().references(() => catalogReleases.id, { onDelete: 'restrict' }),
+    releaseActivationId: uuid('release_activation_id').notNull().references(() => releaseActivations.id, { onDelete: 'restrict' }),
+    discriminant: text('discriminant').notNull(),
+    identity: jsonb('identity').$type<CalculationPreviewIdentity>().notNull(),
+    contentSha256: text('content_sha256').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('calculation_preview_identity_unique').on(table.mealLogId, table.rootMappingDecisionId, table.rootRevision, table.contentSha256),
+    index('calculation_preview_meal_root_idx').on(table.mealLogId, table.rootRevision),
+    check(
+      'calculation_preview_identity_check',
+      sql`${table.rootRevision} > 0
+        and length(trim(${table.discriminant})) > 0
+        and jsonb_typeof(${table.identity}) = 'object'
+        and ${table.contentSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+  ],
+);
+
+export const mealDecompositionRevisions = pgTable(
+  'meal_decomposition_revision',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    mealLogId: uuid('meal_log_id').notNull().references(() => mealLogs.id, { onDelete: 'cascade' }),
+    revision: integer('revision').notNull(),
+    rootMappingDecisionId: uuid('root_mapping_decision_id').notNull().references(() => mappingDecisions.id, { onDelete: 'restrict' }),
+    rootCalculationPreviewId: uuid('root_calculation_preview_id').notNull().references(() => calculationPreviews.id, { onDelete: 'restrict' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('meal_decomposition_revision_unique').on(table.mealLogId, table.revision),
+    check('meal_decomposition_revision_number_check', sql`${table.revision} > 0`),
+  ],
+);
+
+export const mealDecompositionComponents = pgTable(
+  'meal_decomposition_component',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    mealDecompositionRevisionId: uuid('meal_decomposition_revision_id').notNull().references(() => mealDecompositionRevisions.id, { onDelete: 'cascade' }),
+    ordinal: integer('ordinal').notNull(),
+    mappingDecisionId: uuid('mapping_decision_id').notNull().references(() => mappingDecisions.id, { onDelete: 'restrict' }),
+    calculationPreviewId: uuid('calculation_preview_id').notNull().references(() => calculationPreviews.id, { onDelete: 'restrict' }),
+    edibleAmountMg: integer('edible_amount_mg').notNull(),
+  },
+  (table) => [
+    uniqueIndex('meal_decomposition_component_ordinal_unique').on(table.mealDecompositionRevisionId, table.ordinal),
+    uniqueIndex('meal_decomposition_component_mapping_unique').on(table.mealDecompositionRevisionId, table.mappingDecisionId),
+    check('meal_decomposition_component_ordinal_check', sql`${table.ordinal} between 0 and 11`),
+    check('meal_decomposition_component_amount_check', sql`${table.edibleAmountMg} > 0`),
+  ],
+);
+
 export const mealItems = pgTable(
   'meal_item',
   {
@@ -482,8 +743,12 @@ export const mealItems = pgTable(
     itemRevision: integer('item_revision').default(1).notNull(),
     foodRevision: integer('food_revision').default(1).notNull(),
     portionRevision: integer('portion_revision').default(1).notNull(),
-    foodAcknowledgedRevision: integer('food_acknowledged_revision'),
-    portionAcknowledgedRevision: integer('portion_acknowledged_revision'),
+    reviewedItemRevision: integer('reviewed_item_revision'),
+    reviewedAuthorityFingerprintVersion: text('reviewed_authority_fingerprint_version'),
+    reviewedAuthorityFingerprint: text('reviewed_authority_fingerprint'),
+    reviewIdempotencyKey: text('review_idempotency_key'),
+    reviewRequestFingerprint: text('review_request_fingerprint'),
+    reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
   },
@@ -509,13 +774,28 @@ export const mealItems = pgTable(
       'meal_item_revision_check',
       sql`${table.itemRevision} > 0
         and ${table.foodRevision} > 0
-        and ${table.portionRevision} > 0
-        and (${table.foodAcknowledgedRevision} is null
-          or (${table.foodAcknowledgedRevision} > 0
-            and ${table.foodAcknowledgedRevision} <= ${table.foodRevision}))
-        and (${table.portionAcknowledgedRevision} is null
-          or (${table.portionAcknowledgedRevision} > 0
-            and ${table.portionAcknowledgedRevision} <= ${table.portionRevision}))`,
+        and ${table.portionRevision} > 0`,
+    ),
+    check(
+      'meal_item_review_checkpoint_check',
+      sql`(${table.reviewedItemRevision} is null
+          and ${table.reviewedAuthorityFingerprintVersion} is null
+          and ${table.reviewedAuthorityFingerprint} is null
+          and ${table.reviewIdempotencyKey} is null
+          and ${table.reviewRequestFingerprint} is null
+          and ${table.reviewedAt} is null)
+        or (${table.reviewedItemRevision} is not null
+          and ${table.reviewedAuthorityFingerprintVersion} is not null
+          and ${table.reviewedAuthorityFingerprint} is not null
+          and ${table.reviewIdempotencyKey} is not null
+          and ${table.reviewRequestFingerprint} is not null
+          and ${table.reviewedAt} is not null
+          and ${table.reviewedItemRevision} = ${table.itemRevision}
+          and ${table.reviewedItemRevision} > 0
+          and length(trim(${table.reviewedAuthorityFingerprintVersion})) > 0
+          and ${table.reviewedAuthorityFingerprint} ~ '^[0-9a-f]{64}$'
+          and length(trim(${table.reviewIdempotencyKey})) > 0
+          and ${table.reviewRequestFingerprint} ~ '^[0-9a-f]{64}$')`,
     ),
     check(
       'meal_item_initial_estimate_origin_check',
@@ -540,25 +820,36 @@ export const calculationSnapshots = pgTable(
       .notNull()
       .references(() => mealLogs.id, { onDelete: 'cascade' }),
     sequence: integer('sequence').notNull(),
-    inputSnapshot: jsonb('input_snapshot').$type<CalculationInputSnapshot>().notNull(),
-    energyMillicalories: integer('energy_millicalories').notNull(),
-    carbohydrateMg: integer('carbohydrate_mg').notNull(),
-    proteinMg: integer('protein_mg').notNull(),
-    fatMg: integer('fat_mg').notNull(),
+    inputSnapshot: jsonb('input_snapshot').$type<StoredCalculationInputSnapshot>().notNull(),
+    energyMillicalories: integer('energy_millicalories'),
+    carbohydrateMg: integer('carbohydrate_mg'),
+    proteinMg: integer('protein_mg'),
+    fatMg: integer('fat_mg'),
     fiberMg: integer('fiber_mg'),
+    nutrientEvidence: jsonb('nutrient_evidence').$type<NutrientSnapshotEvidence>(),
+    confirmationIdempotencyKey: text('confirmation_idempotency_key'),
+    confirmationFingerprint: text('confirmation_fingerprint'),
     calculationVersion: text('calculation_version').notNull(),
     calculatedAt: timestamp('calculated_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
     uniqueIndex('calculation_snapshot_meal_sequence_unique').on(table.mealLogId, table.sequence),
+    uniqueIndex('calculation_snapshot_confirmation_idempotency_unique')
+      .on(table.mealLogId, table.confirmationIdempotencyKey)
+      .where(sql`${table.confirmationIdempotencyKey} is not null`),
     index('calculation_snapshot_meal_calculated_idx').on(table.mealLogId, table.calculatedAt),
     check('calculation_snapshot_sequence_check', sql`${table.sequence} > 0`),
     check(
+      'calculation_snapshot_confirmation_idempotency_check',
+      sql`(${table.confirmationIdempotencyKey} is null and ${table.confirmationFingerprint} is null)
+        or (${table.confirmationIdempotencyKey} is not null and ${table.confirmationFingerprint} is not null)`,
+    ),
+    check(
       'calculation_snapshot_values_check',
-      sql`${table.energyMillicalories} >= 0
-        and ${table.carbohydrateMg} >= 0
-        and ${table.proteinMg} >= 0
-        and ${table.fatMg} >= 0
+      sql`(${table.energyMillicalories} is null or ${table.energyMillicalories} >= 0)
+        and (${table.carbohydrateMg} is null or ${table.carbohydrateMg} >= 0)
+        and (${table.proteinMg} is null or ${table.proteinMg} >= 0)
+        and (${table.fatMg} is null or ${table.fatMg} >= 0)
         and (${table.fiberMg} is null or ${table.fiberMg} >= 0)`,
     ),
   ],

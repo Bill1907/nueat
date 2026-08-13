@@ -5,14 +5,22 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./schema": "./src/schema/index.ts"
+    "./schema": "./src/schema/index.ts",
+    "./catalog-normalization": "./src/catalog-normalization.ts",
+    "./catalog-release": "./src/catalog-release.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "db:generate": "drizzle-kit generate",
-    "db:migrate": "drizzle-kit migrate",
-    "db:check": "drizzle-kit check",
-    "db:import:data-go-foods": "bun run src/fixtures/import-data-go-foods.ts"
+    "db:generate": "bun run scripts/generate.ts",
+    "db:migrate:bridge": "bun run scripts/migrate.ts bridge",
+    "db:migrate:0022": "bun run scripts/migrate.ts 0022",
+    "db:migrate:0023": "bun run scripts/migrate.ts 0023",
+    "db:check": "bun run scripts/check.ts",
+    "db:import:data-go-foods": "bun run scripts/import-data-go-foods.ts",
+    "db:catalog:backfill": "bun run scripts/catalog-release.ts --apply --action backfill",
+    "db:catalog:publish": "bun run scripts/catalog-release.ts --apply --action publish",
+    "db:catalog:validate": "bun run scripts/catalog-release.ts --apply --action validate",
+    "db:catalog:index": "bun run scripts/catalog-release.ts --apply --action index"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

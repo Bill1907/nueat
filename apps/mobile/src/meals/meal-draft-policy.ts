@@ -9,6 +9,27 @@ export const nutritionKeys = [
 ] as const;
 
 export type NutritionKey = (typeof nutritionKeys)[number];
+export type MealCalculationBasis =
+  | 'finished_profile'
+  | 'source_recipe'
+  | 'meal_decomposition';
+
+/** A composite root has one basis; its finished-dish nutrients are never added
+ * to the reviewed component leaves. */
+export function mealCalculationBasisLabel(
+  basis: MealCalculationBasis | null,
+) {
+  switch (basis) {
+    case 'meal_decomposition':
+      return '검토한 구성 재료 기준';
+    case 'source_recipe':
+      return '출처 레시피 기준';
+    case 'finished_profile':
+      return '완성 음식 기준';
+    default:
+      return null;
+  }
+}
 
 export interface PreviewNutrientProfile {
   id: string;
