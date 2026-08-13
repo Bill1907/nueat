@@ -68,7 +68,10 @@ async function createTargetedMigrations(targetName: keyof typeof MIGRATION_TARGE
   };
   const entries = journal.entries.filter((entry) => entry.idx <= MIGRATION_TARGET_INDEX[targetName]);
   await Promise.all(entries.map((entry) =>
-    copyFile(join(sourceDirectory, `${entry.tag}.sql`), join(targetDirectory, `${entry.tag}.sql`)),
+    copyFile(
+      join(sourceDirectory, `${entry.idx.toString().padStart(4, '0')}_${entry.tag.replace(/^\d{4}_/, '')}.sql`),
+      join(targetDirectory, `${entry.idx.toString().padStart(4, '0')}_${entry.tag.replace(/^\d{4}_/, '')}.sql`),
+    ),
   ));
   await writeFile(
     join(metaDirectory, '_journal.json'),
