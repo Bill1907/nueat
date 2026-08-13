@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { sha256 as sha256Digest } from '@noble/hashes/sha2.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
 
 export const MEAL_ITEM_REVIEW_FINGERPRINT_VERSION = 'meal-item-review-fingerprint-v1';
 
@@ -93,7 +94,7 @@ function canonicalBytes(domain: string, value: object): Uint8Array {
 }
 
 function sha256(bytes: Uint8Array): string {
-  return createHash('sha256').update(bytes).digest('hex');
+  return bytesToHex(sha256Digest(bytes));
 }
 
 function validateAuthority(input: MealItemAuthorityFingerprintInput): void {
