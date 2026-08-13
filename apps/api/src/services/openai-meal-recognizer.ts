@@ -16,7 +16,7 @@ export const OPENAI_MEAL_RECOGNITION_SYSTEM_PROMPT = `당신은 식사 사진 �
 반드시 제공된 JSON 스키마만 따르세요. 음식이나 음료가 없으면 no_food를, 사진 근거가 부족하면 insufficient_evidence를 반환하고 음식 항목을 만들지 마세요.
 에너지, 칼로리, 영양소, 건강 진단, 정식 Food ID, NutrientProfile ID, 출처, 카탈로그, 레시피, 서빙 또는 다른 공식 ID를 출력하거나 추론하지 마세요. 질문은 자유 문장이 아닌 enum 사유 코드만 사용하세요. 사진으로 뒷받침되지 않는 확실성을 주장하지 마세요.`;
 
-export const OPENAI_MEAL_RECOGNITION_USER_PROMPT = `이 식사 사진을 관찰하세요. outcome은 recognized, no_food, insufficient_evidence 중 하나입니다. recognized일 때만 observations를 반환하세요. regionIndex는 0부터 19의 고유 정수입니다. parentRegionIndex는 루트면 null이고 구성 요소면 더 이른 루트 regionIndex입니다. 루트 kind는 dish 또는 drink, 자식 kind는 component만 가능합니다. 양은 g, ml, serving, bowl, piece 중 하나입니다. categoryHint와 preparationCodes는 제공된 enum만 쓰고, uncertaintyCodes와 questionReasonCodes도 enum 코드만 쓰세요. alternatives는 주 관찰보다 낮은 confidence의 서로 다른 label을 confidence 내림차순으로 반환하세요. evidenceReason은 insufficient_evidence일 때만 반환하세요.`;
+export const OPENAI_MEAL_RECOGNITION_USER_PROMPT = `이 식사 사진을 관찰하세요. outcome은 recognized, no_food, insufficient_evidence 중 하나입니다. recognized일 때만 observations를 반환하세요. regionIndex는 0부터 19의 고유 정수입니다. parentRegionIndex는 루트면 null이고 구성 요소면 더 이른 루트 regionIndex입니다. 루트 kind는 dish 또는 drink, 자식 kind는 component만 가능합니다. 양은 g, ml, serving, bowl, piece 중 하나입니다. categoryHint와 preparationCodes는 제공된 enum만 쓰고, uncertaintyCodes와 questionReasonCodes도 enum 코드만 쓰세요. alternatives는 주 관찰보다 낮은 confidence의 서로 다른 label을 confidence 내림차순으로 반환하세요. evidenceReason은 insufficient_evidence일 때만 사유 코드를 반환하고, 나머지는 null로 반환하세요.`;
 
 const labelSchema = { type: 'string', minLength: 1, maxLength: 120 };
 const confidenceBpsSchema = { type: 'integer', minimum: 0, maximum: 10_000 };
@@ -72,7 +72,12 @@ const recognitionObservationSchema = {
 export const OPENAI_MEAL_RECOGNITION_JSON_SCHEMA = {
   type: 'object',
   additionalProperties: false,
-  required: ['outcome', 'imageQualityConfidenceBps', 'observations'],
+  required: [
+    'outcome',
+    'imageQualityConfidenceBps',
+    'evidenceReason',
+    'observations',
+  ],
   properties: {
     outcome: {
       type: 'string',
@@ -80,8 +85,8 @@ export const OPENAI_MEAL_RECOGNITION_JSON_SCHEMA = {
     },
     imageQualityConfidenceBps: confidenceBpsSchema,
     evidenceReason: {
-      type: 'string',
-      enum: ['blurred', 'too_dark', 'occluded', 'not_meal_photo', 'other'],
+      type: ['string', 'null'],
+      enum: ['blurred', 'too_dark', 'occluded', 'not_meal_photo', 'other', null],
     },
     observations: {
       type: 'array',

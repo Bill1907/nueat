@@ -59,7 +59,18 @@ describe('OpenAIMealRecognizer', () => {
     expect(request).toMatchObject({ model: 'gpt-5.4-mini-2026-03-17', store: false, max_output_tokens: 1_200, text: { format: { type: 'json_schema', strict: true } } });
     expect((request.text as { format: { schema: unknown } }).format.schema).toMatchObject({
       type: 'object',
-      required: ['outcome', 'imageQualityConfidenceBps', 'observations'],
+      required: [
+        'outcome',
+        'imageQualityConfidenceBps',
+        'evidenceReason',
+        'observations',
+      ],
+      properties: {
+        evidenceReason: {
+          type: ['string', 'null'],
+          enum: ['blurred', 'too_dark', 'occluded', 'not_meal_photo', 'other', null],
+        },
+      },
     });
     expect(JSON.stringify((request.text as { format: { schema: unknown } }).format.schema)).not.toContain('"oneOf"');
     expect(JSON.stringify(request)).toContain('data:image/png;base64,AAEC');
