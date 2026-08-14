@@ -10,7 +10,6 @@ import {
 
 export const OPENAI_MEAL_RECOGNITION_MODEL = 'gpt-5.4-mini-2026-03-17';
 export const OPENAI_MEAL_RECOGNITION_MAX_OUTPUT_TOKENS = 1_200;
-export const OPENAI_MEAL_RECOGNITION_DEADLINE_MS = 15_000;
 
 export const OPENAI_MEAL_RECOGNITION_SYSTEM_PROMPT = `당신은 식사 사진 관찰기입니다. 사진에서 보이는 음식, 음료, 구성 요소, 대략적인 양과 불확실성만 구조화하세요.
 반드시 제공된 JSON 스키마만 따르세요. 음식이나 음료가 없으면 no_food를, 사진 근거가 부족하면 insufficient_evidence를 반환하고 음식 항목을 만들지 마세요.
@@ -119,13 +118,13 @@ export interface OpenAIResponse {
 
 export interface OpenAIMealRecognizerOptions {
   model?: string;
+  /** Deadline ownership moved to the caller; retained solely for composition compatibility. */
   deadlineMs?: number;
   maxOutputTokens?: number;
 }
 
 export class OpenAIMealRecognizer implements MealRecognizer {
   private readonly model: string;
-  private readonly deadlineMs: number;
   private readonly maxOutputTokens: number;
 
   constructor(
@@ -133,7 +132,6 @@ export class OpenAIMealRecognizer implements MealRecognizer {
     options: OpenAIMealRecognizerOptions = {},
   ) {
     this.model = options.model?.trim() || OPENAI_MEAL_RECOGNITION_MODEL;
-    this.deadlineMs = positiveInteger(options.deadlineMs, OPENAI_MEAL_RECOGNITION_DEADLINE_MS);
     this.maxOutputTokens = positiveInteger(
       options.maxOutputTokens,
       OPENAI_MEAL_RECOGNITION_MAX_OUTPUT_TOKENS,
@@ -141,33 +139,19 @@ export class OpenAIMealRecognizer implements MealRecognizer {
   }
 
   async recognize(input: MealRecognizerInput): Promise<MealRecognizerOutput> {
-    const controller = new AbortController();
-    let timeout: ReturnType<typeof setTimeout>;
-    const deadline = new Promise<never>((_, reject) => {
-      timeout = setTimeout(() => {
-        controller.abort();
-        reject(new MealRecognitionFailure('DEADLINE_EXCEEDED'));
-      }, this.deadlineMs);
-    });
-
     let response: OpenAIResponse;
     try {
-      response = await Promise.race([
-        this.client.responses.create(
+      response = await this.client.responses.create(
           createRequest(input, this.model, this.maxOutputTokens),
-          { signal: controller.signal },
-        ),
-        deadline,
-      ]);
+        input.signal ? { signal: input.signal } : undefined,
+      );
     } catch (error) {
       if (error instanceof MealRecognitionFailure) throw error;
-      throw mapProviderError(error, controller.signal.aborted);
-    } finally {
-      clearTimeout(timeout!);
+      throw mapProviderError(error, input.signal?.aborted === true);
     }
 
     if (typeof response !== 'object' || response === null) {
-      throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE');
+      throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE', 'provider_output');
     }
 
     if (
@@ -175,27 +159,27 @@ export class OpenAIMealRecognizer implements MealRecognizer {
       response.incomplete_details != null ||
       (response.status !== undefined && response.status !== 'completed')
     ) {
-      throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE');
+      throw new MealRecognitionFailure('PROVIDER_INCOMPLETE', 'provider_output');
     }
     if (hasRefusal(response)) {
-      throw new MealRecognitionFailure('PROVIDER_REJECTED');
+      throw new MealRecognitionFailure('PROVIDER_REJECTED', 'provider_output');
     }
     if (typeof response.output_text !== 'string') {
-      throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE');
+      throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE', 'provider_output');
     }
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(response.output_text);
     } catch {
-      throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE');
+      throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE', 'provider_output');
     }
 
     let result;
     try {
       result = parseRecognitionResultV3(normalizeProviderResult(parsed));
     } catch {
-      throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE');
+      throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE', 'provider_output');
     }
 
     const providerRequestId = sanitizeRequestId(
@@ -270,23 +254,38 @@ function hasRefusal(response: OpenAIResponse): boolean {
   ) ?? false;
 }
 
-function mapProviderError(error: unknown, timedOut: boolean): MealRecognitionFailure {
-  if (timedOut) return new MealRecognitionFailure('DEADLINE_EXCEEDED');
-
+function mapProviderError(error: unknown, aborted: boolean): MealRecognitionFailure {
+  if (aborted || isAbortError(error)) return new MealRecognitionFailure('PROVIDER_CALL_DEADLINE');
   const status = getStatus(error);
-  if (status === 408 || status === 409 || status === 429)
-    return new MealRecognitionFailure('PROVIDER_UNAVAILABLE');
-  if (status === 400 || status === 401 || status === 403)
-    return new MealRecognitionFailure('CONFIGURATION_INVALID');
+  if (status === 408) return new MealRecognitionFailure('PROVIDER_REQUEST_TIMEOUT');
+  if (status === 409) return new MealRecognitionFailure('PROVIDER_CONFLICT');
+  if (status === 429) return new MealRecognitionFailure('PROVIDER_RATE_LIMITED');
+  if (status === 400) return new MealRecognitionFailure('PROVIDER_REQUEST_INVALID');
+  if (status === 401 || status === 403) return new MealRecognitionFailure('PROVIDER_AUTH_INVALID');
+  if (status !== undefined && status >= 500) return new MealRecognitionFailure('PROVIDER_SERVER_ERROR');
   if (status !== undefined && status >= 400 && status < 500)
     return new MealRecognitionFailure('PROVIDER_REJECTED');
-  return new MealRecognitionFailure('PROVIDER_UNAVAILABLE');
+  if (isConnectionError(error)) return new MealRecognitionFailure('PROVIDER_CONNECTION_FAILED');
+  return new MealRecognitionFailure('PROVIDER_UNKNOWN');
 }
 
 function getStatus(error: unknown): number | undefined {
   if (typeof error !== 'object' || error === null) return undefined;
   const status = (error as { status?: unknown }).status;
   return typeof status === 'number' && Number.isInteger(status) ? status : undefined;
+}
+
+function isAbortError(error: unknown): boolean {
+  return typeof error === 'object'
+    && error !== null
+    && (error as { name?: unknown }).name === 'AbortError';
+}
+
+function isConnectionError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string'
+    && /^(?:ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT)$/u.test(code);
 }
 
 function nonnegativeInteger(value: unknown): number {

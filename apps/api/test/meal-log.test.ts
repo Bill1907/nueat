@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { EventEmitter } from 'node:events';
+
 import {
   activeCatalogReleasePointers,
   calculationPreviews,
@@ -34,6 +36,7 @@ import type { FastifyInstance } from 'fastify';
 import type { Auth } from '../src/auth/auth';
 import { parseEnvironment } from '../src/config/env';
 import { buildServer } from '../src/server';
+import { observeResponseLifecycle } from '../src/routes/meal-log';
 import { calculateCatalogRegistrySha256 } from '../src/services/catalog-registry-verifier';
 import { MEAL_CONFIRMATION_SAFE_REVIEW_PROTOCOL } from '../src/services/meal-confirmation-cutover';
 import type { MealRecognitionCoordinatorResult } from '../src/services/meal-recognition-coordinator';
@@ -51,6 +54,21 @@ const mealId = '00000000-0000-4000-8000-000000000001';
 const imageId = '00000000-0000-4000-8000-000000000002';
 const itemId = '00000000-0000-4000-8000-000000000003';
 const foodId = '00000000-0000-4000-8000-000000000010';
+
+test('response lifecycle reports close before finish exactly once and ignores close after finish', () => {
+  const lost = new EventEmitter();
+  let calls = 0;
+  observeResponseLifecycle(lost, () => { calls += 1; });
+  lost.emit('close');
+  lost.emit('close');
+  expect(calls).toBe(1);
+
+  const finished = new EventEmitter();
+  observeResponseLifecycle(finished, () => { calls += 1; });
+  finished.emit('finish');
+  finished.emit('close');
+  expect(calls).toBe(1);
+});
 const nutrientProfileId = '00000000-0000-4000-8000-000000000011';
 const sourceRegistryId = '00000000-0000-4000-8000-000000000013';
 const catalogReleaseId = '00000000-0000-4000-8000-000000000020';
@@ -572,8 +590,7 @@ describe('meal log routes', () => {
       imageAssetId: imageId,
       status: 'draft',
       recognitionStatus: 'ready',
-      recognitionProvider: 'mock',
-      recognitionModel: 'mock-recognition-v2',
+      recognitionRecovery: { mode: 'none', reason: 'recognition_complete', retryAt: null },
       localDate: '2026-08-10',
     });
     expect(
@@ -623,7 +640,7 @@ describe('meal log routes', () => {
     });
   });
 
-  test('includes an additive recognition outcome without changing mealLog/items', async () => {
+  test('includes the closed recognition recovery union without internal diagnostics', async () => {
     const { server } = await createServer(true);
     const response = await server.inject({
       method: 'POST',
@@ -632,14 +649,33 @@ describe('meal log routes', () => {
     });
     const body = JSON.parse(response.body);
     expect(body).toMatchObject({
-      mealLog: { recognitionStatus: 'ready' },
-      recognitionOutcome: { status: 'ready' },
+      mealLog: {
+        recognitionStatus: 'ready',
+        recognitionRecovery: {
+          mode: 'none',
+          reason: 'recognition_complete',
+          retryAt: null,
+        },
+      },
     });
+    expect(body.recognitionOutcome).toBeUndefined();
+    for (const field of [
+      'recognitionProvider', 'recognitionModel', 'recognitionPromptVersion',
+      'recognitionSchemaVersion', 'recognitionLastErrorCode',
+      'recognitionAttemptCount', 'recognitionNextAttemptAt',
+      'recognitionManualOverride', 'observationId', 'resolutionStatus',
+      'resolutionReason', 'resolutionRetryAt',
+    ]) expect(body.mealLog[field]).toBeUndefined();
+    for (const item of body.items) {
+      expect(item.currentResolution).toBeUndefined();
+      expect(item.confirmationProof).toBeNull();
+    }
     expect(Array.isArray(body.items)).toBe(true);
   });
 
   test('returns a retryable 503 when catalog resolution is unavailable', async () => {
     const { server } = await createServer(true, {
+      mealUserId: 'user-id',
       recognitionOutcome: {
         status: 'unavailable',
         code: 'CATALOG_UNAVAILABLE',
@@ -658,6 +694,126 @@ describe('meal log routes', () => {
       code: 'CATALOG_UNAVAILABLE',
     });
   });
+  test('returns a bounded 503 instead of projecting a claim failure as pending', async () => {
+    const { server } = await createServer(true, {
+      recognitionOutcome: {
+        status: 'unavailable',
+        code: 'CLAIM_UNAVAILABLE',
+        retryable: true,
+      },
+    });
+
+    const response = await server.inject({
+      method: 'POST', url: '/api/meal-logs', payload: createPayload(),
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(JSON.parse(response.body)).toMatchObject({
+      error: { code: 'CLAIM_UNAVAILABLE' },
+    });
+  });
+
+  test('returns 503 when reconciliation consumes the runner response reserve', async () => {
+    const { server } = await createServer(true, {
+      mealUserId: 'user-id',
+      responseReserveMs: 10,
+      reconciliationDelayMs: 25,
+      responseDeadlineAt: new Date(Date.now() + 30),
+    });
+    const response = await server.inject({ method: 'GET', url: `/api/meal-logs/${mealId}` });
+    expect(response.statusCode).toBe(503);
+  });
+
+  test('returns 503 when response hydration consumes the runner response reserve', async () => {
+    const { server } = await createServer(true, {
+      mealUserId: 'user-id',
+      responseReserveMs: 10,
+      responseHydrationDelayMs: 15,
+      responseDeadlineAt: new Date(Date.now() + 30),
+    });
+    const response = await server.inject({ method: 'GET', url: `/api/meal-logs/${mealId}` });
+    expect(response.statusCode).toBe(503);
+  });
+
+  test('bounds immediate create, concurrent, recovery, and stored-observation reloads', async () => {
+    const deadline = () => new Date(Date.now() + 40);
+    const withinHydrationBound = async (response: Promise<{ statusCode: number }>) =>
+      await Promise.race([
+        response,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('response reload exceeded its deadline')), 100),
+        ),
+      ]);
+
+    const create = await createServer(true, {
+      responseReserveMs: 20,
+      responseHydrationDelayMs: 200,
+      delayReloadOnly: true,
+      responseDeadlineAt: deadline(),
+    });
+    expect((await withinHydrationBound(create.server.inject({
+      method: 'POST', url: '/api/meal-logs', payload: createPayload(),
+    }))).statusCode).toBe(503);
+
+    const concurrent = await createServer(true, {
+      mealUserId: 'user-id',
+      responseReserveMs: 20,
+      responseHydrationDelayMs: 200,
+      delayReloadOnly: true,
+      draftLookupMisses: 1,
+      responseDeadlineAt: deadline(),
+    });
+    concurrent.state.asset.status = 'processed';
+    expect((await withinHydrationBound(concurrent.server.inject({
+      method: 'POST', url: '/api/meal-logs', payload: createPayload(),
+    }))).statusCode).toBe(503);
+
+    const recovery = await createServer(true, {
+      mealUserId: 'user-id',
+      responseReserveMs: 20,
+      responseHydrationDelayMs: 200,
+      delayReloadOnly: true,
+      responseDeadlineAt: deadline(),
+    });
+    recovery.state.meal = {
+      ...draftMeal(),
+      recognitionStatus: 'failed',
+      recognitionResult: null,
+      recognitionNextAttemptAt: new Date('2020-01-01T00:00:00.000Z'),
+    };
+    recovery.state.recognitionAttempt = {
+      userGrantState: 'available',
+      nextAttemptAt: new Date('2020-01-01T00:00:00.000Z'),
+      lastErrorCode: 'PROVIDER_SERVER_ERROR',
+    };
+    Object.assign(recovery.state.asset, {
+      purpose: 'inference', status: 'processed',
+      expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+      byteSize: 1_000, detectedContentType: 'image/jpeg', sha256: 'a'.repeat(64),
+    });
+    expect((await withinHydrationBound(recovery.server.inject({
+      method: 'POST', url: `/api/meal-logs/${mealId}/recognition/retry`,
+    }))).statusCode).toBe(503);
+
+    const stored = await createServer(true, {
+      mealUserId: 'user-id',
+      responseReserveMs: 20,
+      responseHydrationDelayMs: 200,
+      delayReloadOnly: true,
+      responseDeadlineAt: deadline(),
+    });
+    stored.state.meal = {
+      ...draftMeal(),
+      recognitionStatus: 'ready',
+      recognitionResult: { version: 3, observations: [] },
+    };
+    stored.state.storedObservation = { id: 'stored-observation-id' };
+    expect((await withinHydrationBound(stored.server.inject({
+      method: 'POST', url: `/api/meal-logs/${mealId}/recognition/retry`,
+    }))).statusCode).toBe(503);
+  });
+
+
 
 
   test('returns the existing draft when the validated image is retried', async () => {
@@ -878,6 +1034,155 @@ describe('meal log routes', () => {
         },
       },
     });
+  });
+  test('confirms a finished-profile item using only the proof returned by GET', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+    state.meal!.recognitionResult = {
+      version: 3,
+      outcome: 'recognized',
+      observations: [],
+    };
+
+    const initial = JSON.parse((await server.inject({
+      method: 'GET', url: `/api/meal-logs/${mealId}`,
+    })).body);
+    expect(initial.items[0].confirmationProof).toEqual({
+      mappingDecisionId: state.mappingDecisions[0]!.id,
+      calculationPreviewId: state.calculationPreviews[0]!.id,
+    });
+
+    const reviewed = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/items/${itemId}/review`,
+      payload: {
+        expectedDraftRevision: initial.mealLog.draftRevision,
+        expectedItemRevision: initial.items[0].itemRevision,
+        idempotencyKey: 'proof-review',
+        displayedAuthorityFingerprintVersion: initial.items[0].review.authority.fingerprintVersion,
+        displayedAuthorityFingerprint: initial.items[0].review.authority.fingerprint,
+      },
+    });
+    expect(reviewed.statusCode, reviewed.body).toBe(200);
+    const current = JSON.parse((await server.inject({
+      method: 'GET', url: `/api/meal-logs/${mealId}`,
+    })).body);
+    const confirmed = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+      payload: {
+        expectedDraftRevision: current.mealLog.draftRevision,
+        idempotencyKey: 'proof-confirm',
+        items: current.items.map((item: Record<string, unknown>) => ({
+          itemId: item.id,
+          expectedItemRevision: item.itemRevision,
+          ...(item.confirmationProof as Record<string, unknown>),
+        })),
+      },
+    });
+    expect(confirmed.statusCode, confirmed.body).toBe(200);
+  });
+  test('confirms a persisted legacy draft without synthesizing V3 proof artifacts', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+    delete state.storedObservation;
+    state.mappingDecisions = [];
+    state.calculationPreviews = [];
+
+    const initial = JSON.parse((await server.inject({
+      method: 'GET', url: `/api/meal-logs/${mealId}`,
+    })).body);
+    expect(initial.items[0].confirmationProof).toBeNull();
+    const reviewed = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/items/${itemId}/review`,
+      payload: {
+        expectedDraftRevision: initial.mealLog.draftRevision,
+        expectedItemRevision: initial.items[0].itemRevision,
+        idempotencyKey: 'legacy-proof-review',
+        displayedAuthorityFingerprintVersion: initial.items[0].review.authority.fingerprintVersion,
+        displayedAuthorityFingerprint: initial.items[0].review.authority.fingerprint,
+      },
+    });
+    expect(reviewed.statusCode, reviewed.body).toBe(200);
+    const current = JSON.parse((await server.inject({
+      method: 'GET', url: `/api/meal-logs/${mealId}`,
+    })).body);
+    const confirmed = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+      payload: {
+        expectedDraftRevision: current.mealLog.draftRevision,
+        idempotencyKey: 'legacy-proof-confirm',
+        items: current.items.map((item: Record<string, unknown>) => ({
+          itemId: item.id,
+          expectedItemRevision: item.itemRevision,
+        })),
+      },
+    });
+    expect(confirmed.statusCode, confirmed.body).toBe(200);
+    expect(state.storedObservation).toBeUndefined();
+  });
+  test('confirms a decomposition item using only the proof returned by GET', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+    state.meal!.recognitionResult = { version: 3, outcome: 'recognized', observations: [] };
+    const preview = state.calculationPreviews[0]!;
+    (preview.identity as { basis: string }).basis = 'meal_decomposition';
+    const decompositionRevisionId = '00000000-0000-4000-8000-000000000060';
+    state.decompositionRevisions.push({
+      id: decompositionRevisionId,
+      mealLogId: mealId,
+      rootMappingDecisionId: state.mappingDecisions[0]!.id,
+      rootCalculationPreviewId: preview.id,
+      revision: 1,
+      createdAt: new Date(),
+    });
+    state.decompositionComponents.push({
+      mealDecompositionRevisionId: decompositionRevisionId,
+      ordinal: 0,
+      mappingDecisionId: state.mappingDecisions[0]!.id,
+      calculationPreviewId: preview.id,
+      edibleAmountMg: ((preview.identity as { leaves: Array<{ edibleAmountMg: number }> }).leaves[0]!).edibleAmountMg,
+    });
+
+    const initial = JSON.parse((await server.inject({
+      method: 'GET', url: `/api/meal-logs/${mealId}`,
+    })).body);
+    expect(initial.items[0].confirmationProof).toEqual({
+      mappingDecisionId: state.mappingDecisions[0]!.id,
+      calculationPreviewId: preview.id,
+      decompositionRevisionId,
+    });
+    const reviewed = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/items/${itemId}/review`,
+      payload: {
+        expectedDraftRevision: initial.mealLog.draftRevision,
+        expectedItemRevision: initial.items[0].itemRevision,
+        idempotencyKey: 'decomposition-proof-review',
+        displayedAuthorityFingerprintVersion: initial.items[0].review.authority.fingerprintVersion,
+        displayedAuthorityFingerprint: initial.items[0].review.authority.fingerprint,
+      },
+    });
+    expect(reviewed.statusCode, reviewed.body).toBe(200);
+    const current = JSON.parse((await server.inject({
+      method: 'GET', url: `/api/meal-logs/${mealId}`,
+    })).body);
+    const confirmed = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+      payload: {
+        expectedDraftRevision: current.mealLog.draftRevision,
+        idempotencyKey: 'decomposition-proof-confirm',
+        items: current.items.map((item: Record<string, unknown>) => ({
+          itemId: item.id,
+          expectedItemRevision: item.itemRevision,
+          ...(item.confirmationProof as Record<string, unknown>),
+        })),
+      },
+    });
+    expect(confirmed.statusCode, confirmed.body).toBe(200);
   });
   test('requires explicit review for a high-confidence mapped model estimate', async () => {
     const { server, state } = await createServer(true);
@@ -1232,6 +1537,206 @@ describe('meal log routes', () => {
     expect(state.meal.recognitionStatus).toBe('ready');
     expect(state.meal.recognitionProvider).toBe('mock');
   });
+  test('uses only the explicit user-recovery trigger for an eligible failed draft', async () => {
+    const { server, state } = await createServer(true);
+    state.meal = {
+      ...draftMeal(),
+      recognitionStatus: 'failed',
+      recognitionResult: null,
+      recognitionNextAttemptAt: new Date('2020-01-01T00:00:00.000Z'),
+    };
+    Object.assign(state.asset, {
+      purpose: 'inference',
+      status: 'processed',
+      expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+      byteSize: 1_000,
+      detectedContentType: 'image/jpeg',
+      sha256: 'a'.repeat(64),
+    });
+    state.recognitionAttempt = {
+      userGrantState: 'available',
+      nextAttemptAt: new Date('2020-01-01T00:00:00.000Z'),
+      lastErrorCode: 'PROVIDER_SERVER_ERROR',
+    };
+
+    const response = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/recognition/retry`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(state.recognitionCalls).toEqual(['user_recovery']);
+    expect(state.recognitionSignals).toHaveLength(1);
+    expect(state.recognitionSignals[0]?.aborted).toBe(false);
+    expect(JSON.parse(response.body).mealLog.recognitionRecovery).toEqual({
+      mode: 'none', reason: 'recognition_complete', retryAt: null,
+    });
+  });
+  test('offers recovery for a maxed historical failed draft without a workflow', async () => {
+    const { server, state } = await createServer(true);
+    state.meal = {
+      ...draftMeal(), recognitionStatus: 'failed', recognitionResult: null,
+      recognitionAttemptCount: 99,
+    };
+    Object.assign(state.asset, {
+      purpose: 'inference', status: 'processed',
+      expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+      byteSize: 1_000, detectedContentType: 'image/jpeg', sha256: 'a'.repeat(64),
+    });
+
+    const response = await server.inject({
+      method: 'POST', url: `/api/meal-logs/${mealId}/recognition/retry`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(state.recognitionCalls).toEqual(['user_recovery']);
+  });
+  test('offers recovery through a same-binding legacy workflow', async () => {
+    const { server, state } = await createServer(true);
+    state.meal = { ...draftMeal(), recognitionStatus: 'failed', recognitionResult: null };
+    Object.assign(state.asset, {
+      purpose: 'inference', status: 'processed',
+      expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+      byteSize: 1_000, detectedContentType: 'image/jpeg', sha256: 'a'.repeat(64),
+    });
+    state.recognitionAttempt = {
+      imageAssetId: imageId, protocolVersion: 'legacy_v1', userGrantState: 'available',
+      nextAttemptAt: new Date('2020-01-01T00:00:00.000Z'),
+      lastErrorCode: 'PROVIDER_SERVER_ERROR',
+    };
+
+    const response = await server.inject({
+      method: 'POST', url: `/api/meal-logs/${mealId}/recognition/retry`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(state.recognitionCalls).toEqual(['user_recovery']);
+  });
+  test('reconciles a crashed processing recovery before projecting it', async () => {
+    const { server, state } = await createServer(true);
+    state.meal = { ...draftMeal(), recognitionStatus: 'processing', recognitionResult: null };
+    Object.assign(state.asset, {
+      purpose: 'inference', status: 'processed', expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+      byteSize: 1_000, detectedContentType: 'image/jpeg', sha256: 'a'.repeat(64),
+    });
+    state.recognitionAttempt = { userGrantState: 'reserved' };
+
+    const response = await server.inject({ method: 'GET', url: `/api/meal-logs/${mealId}` });
+
+    expect(response.statusCode).toBe(200);
+    expect(state.reconciliationCalls).toBeGreaterThan(0);
+    expect(JSON.parse(response.body).mealLog.recognitionRecovery).toEqual({
+      mode: 'manual_only', reason: 'recovery_exhausted', retryAt: null,
+    });
+  });
+  test('does not invoke recovery early or after recovery is unavailable', async () => {
+    const { server, state } = await createServer(true);
+    state.meal = { ...draftMeal(), recognitionStatus: 'failed', recognitionResult: null };
+    Object.assign(state.asset, {
+      purpose: 'inference',
+      status: 'processed',
+      expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+      byteSize: 1_000,
+      detectedContentType: 'image/jpeg',
+      sha256: 'a'.repeat(64),
+    });
+    state.recognitionAttempt = {
+      userGrantState: 'available',
+      nextAttemptAt: new Date('2030-01-01T00:00:00.000Z'),
+      lastErrorCode: 'PROVIDER_SERVER_ERROR',
+    };
+    const response = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/recognition/retry`,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(state.recognitionCalls).toEqual([]);
+    expect(JSON.parse(response.body).mealLog.recognitionRecovery).toEqual({
+      mode: 'retry_after',
+      reason: 'cooldown',
+      retryAt: '2030-01-01T00:00:00.000Z',
+    });
+  });
+  test.each([null, new Date('2020-01-01T00:00:00.000Z')])(
+    'does not recover from a failed draft with a non-future asset expiry',
+    async (expiresAt) => {
+      const { server, state } = await createServer(true);
+      state.meal = { ...draftMeal(), recognitionStatus: 'failed', recognitionResult: null };
+      Object.assign(state.asset, {
+        purpose: 'inference', status: 'processed', expiresAt, byteSize: 1_000,
+        detectedContentType: 'image/jpeg', sha256: 'a'.repeat(64),
+      });
+      state.recognitionAttempt = {
+        userGrantState: 'available',
+        nextAttemptAt: new Date('2020-01-01T00:00:00.000Z'),
+        lastErrorCode: 'PROVIDER_SERVER_ERROR',
+      };
+
+      const response = await server.inject({
+        method: 'POST',
+        url: `/api/meal-logs/${mealId}/recognition/retry`,
+      });
+
+      expect(state.recognitionCalls).toEqual([]);
+      expect(JSON.parse(response.body).mealLog.recognitionRecovery).toEqual({
+        mode: 'manual_only', reason: 'asset_unavailable', retryAt: null,
+      });
+    },
+  );
+  test('does not retry persistence failures without an observation', async () => {
+    const { server, state } = await createServer(true);
+    state.meal = { ...draftMeal(), recognitionStatus: 'failed', recognitionResult: null };
+    Object.assign(state.asset, {
+      purpose: 'inference', status: 'processed', expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+      byteSize: 1_000, detectedContentType: 'image/jpeg', sha256: 'a'.repeat(64),
+    });
+    state.recognitionAttempt = {
+      userGrantState: 'available', nextAttemptAt: null, lastErrorCode: 'PERSISTENCE_UNAVAILABLE',
+    };
+
+    const response = await server.inject({
+      method: 'POST', url: `/api/meal-logs/${mealId}/recognition/retry`,
+    });
+
+    expect(state.recognitionCalls).toEqual([]);
+    expect(JSON.parse(response.body).mealLog.recognitionRecovery).toEqual({
+      mode: 'manual_only', reason: 'terminal_failure', retryAt: null,
+    });
+  });
+  test('replay requests cannot start more than one user recovery execution', async () => {
+    const { server, state } = await createServer(true);
+    state.meal = {
+      ...draftMeal(),
+      recognitionStatus: 'failed',
+      recognitionResult: null,
+      recognitionNextAttemptAt: new Date('2020-01-01T00:00:00.000Z'),
+    };
+    Object.assign(state.asset, {
+      purpose: 'inference', status: 'processed',
+      expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+      byteSize: 1_000, detectedContentType: 'image/jpeg', sha256: 'a'.repeat(64),
+    });
+    state.recognitionAttempt = {
+      userGrantState: 'available',
+      nextAttemptAt: new Date('2020-01-01T00:00:00.000Z'),
+      lastErrorCode: 'PROVIDER_SERVER_ERROR',
+    };
+
+    const responses = await Promise.all([
+      server.inject({ method: 'POST', url: `/api/meal-logs/${mealId}/recognition/retry` }),
+      server.inject({ method: 'POST', url: `/api/meal-logs/${mealId}/recognition/retry` }),
+    ]);
+
+    expect(state.recognitionCalls.filter((trigger) => trigger === 'user_recovery')).toHaveLength(1);
+    for (const response of responses) {
+      const mealLog = JSON.parse(response.body).mealLog;
+      expect(mealLog.recognitionRecovery).toEqual({
+        mode: 'none', reason: 'recognition_complete', retryAt: null,
+      });
+      expect(mealLog.recognitionLastErrorCode).toBeUndefined();
+      expect(mealLog.recognitionAttemptCount).toBeUndefined();
+    }
+  });
   test('records provenance for a zero-item no-food manual override without auto-confirming', async () => {
     const { server, state } = await createServer(true);
     state.meal = {
@@ -1249,11 +1754,10 @@ describe('meal log routes', () => {
     expect(JSON.parse(response.body).mealLog).toMatchObject({
       status: 'draft',
       recognitionStatus: 'manual',
-      recognitionManualOverride: {
-        fromStatus: 'ready',
-        fromOutcome: 'no_food',
-        decision: 'direct_entry',
-        decisionVersion: 'recognition-manual-override-v1',
+      recognitionRecovery: {
+        mode: 'none',
+        reason: 'not_applicable',
+        retryAt: null,
       },
     });
     expect(state.items).toHaveLength(0);
@@ -1329,14 +1833,11 @@ describe('meal log routes', () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body).mealLog.recognitionManualOverride).toMatchObject({
-      fromStatus: 'pending',
-      fromOutcome: null,
-      fromErrorCode: null,
-      actorUserId: 'user-id',
-      expectedDraftRevision: 1,
-      changedFields: ['recognitionStatus'],
-      decision: 'direct_entry',
+    expect(JSON.parse(response.body).mealLog.recognitionManualOverride).toBeUndefined();
+    expect(JSON.parse(response.body).mealLog.recognitionRecovery).toEqual({
+      mode: 'none',
+      reason: 'not_applicable',
+      retryAt: null,
     });
     expect(state.meal.recognitionLeaseToken).toBeNull();
     expect(state.meal.recognitionNextAttemptAt).toBeNull();
@@ -1755,6 +2256,13 @@ async function createServer(
     profileTimezone?: string;
     reviewMode?: 'review_only' | 'auto_selection';
     recognitionOutcome?: MealRecognitionCoordinatorResult;
+    recognitionWaitForAbort?: boolean;
+    reconciliationDelayMs?: number;
+    responseDeadlineAt?: Date;
+    responseHydrationDelayMs?: number;
+    delayReloadOnly?: boolean;
+    draftLookupMisses?: number;
+    responseReserveMs?: number;
     clientProtocol?: string | null;
     cutoverMode?: 'normal' | 'maintenance_bridge' | 'safe_review_maintenance';
   } = {},
@@ -1774,6 +2282,14 @@ async function createServer(
     rejectItemUpdate?: boolean;
     rejectItemDelete?: boolean;
     recognitionAttempt?: Record<string, unknown>;
+    recognitionCalls: Array<'initial' | 'user_recovery' | undefined>;
+    recognitionSignals: AbortSignal[];
+    responseLostCalls: number;
+    reconciliationCalls: number;
+    responseHydrationDelayMs: number;
+    delayReloadOnly: boolean;
+    responseHydrationEnabled: boolean;
+    draftLookupMisses: number;
     storedObservation?: Record<string, unknown>;
     mappingDecisions: Record<string, unknown>[];
     calculationPreviews: Record<string, unknown>[];
@@ -1795,6 +2311,14 @@ async function createServer(
     calculationPreviews: [],
     decompositionRevisions: [],
     decompositionComponents: [],
+    recognitionCalls: [],
+    recognitionSignals: [],
+    responseLostCalls: 0,
+    reconciliationCalls: 0,
+    responseHydrationDelayMs: overrides.responseHydrationDelayMs ?? 0,
+    delayReloadOnly: overrides.delayReloadOnly ?? false,
+    responseHydrationEnabled: !(overrides.delayReloadOnly ?? false),
+    draftLookupMisses: overrides.draftLookupMisses ?? 0,
     profileTimezone: overrides.profileTimezone ?? null,
   };
   if (overrides.mealUserId)
@@ -1819,6 +2343,15 @@ async function createServer(
       },
       mealRecognition: {
         ...environment.mealRecognition,
+        reliability: {
+          ...environment.mealRecognition.reliability,
+          protocolMode: 'v2_one_call',
+          cohortPercent: 100,
+          v2OneCallAdmitted: true,
+          recoveryEnabled: true,
+          responseReserveMs: overrides.responseReserveMs
+            ?? environment.mealRecognition.reliability.responseReserveMs,
+        },
         reviewPolicy: {
           ...environment.mealRecognition.reviewPolicy,
           mode: overrides.reviewMode ?? environment.mealRecognition.reviewPolicy.mode,
@@ -1829,7 +2362,50 @@ async function createServer(
     auth,
     database,
     recognitionCoordinator: {
-      async recognize() {
+      async responseLost() {
+        state.responseLostCalls += 1;
+      },
+      async reconcile(_mealLogId, _userId, signal) {
+        state.reconciliationCalls += 1;
+        if (overrides.reconciliationDelayMs)
+          await new Promise((resolve) => setTimeout(resolve, overrides.reconciliationDelayMs));
+        if (overrides.recognitionWaitForAbort && signal) {
+          state.recognitionSignals.push(signal);
+          await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
+        }
+        if (state.meal?.recognitionStatus === 'processing') {
+          Object.assign(state.meal, {
+            recognitionStatus: 'failed',
+            recognitionLastErrorCode: 'PROCESS_OUTCOME_UNKNOWN',
+          });
+          if (state.recognitionAttempt) state.recognitionAttempt.userGrantState = 'consumed';
+        }
+        return {
+          status: 'unavailable' as const,
+          code: 'PROCESS_OUTCOME_UNKNOWN',
+          retryable: false,
+          ...(overrides.responseDeadlineAt
+            ? { responseDeadlineAt: overrides.responseDeadlineAt }
+            : {}),
+        };
+      },
+      async recognize(_mealLogId, _userId, trigger, signal) {
+        if (signal) state.recognitionSignals.push(signal);
+        if (overrides.recognitionWaitForAbort && signal) {
+          await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
+          return { status: 'unavailable' as const, code: 'CLAIM_UNAVAILABLE', retryable: true };
+        }
+        if (trigger === 'user_recovery') {
+          if (
+            state.recognitionAttempt &&
+            state.recognitionAttempt.userGrantState !== 'available'
+          ) {
+            return { status: 'active' as const, retryAfterSeconds: 1 };
+          }
+          if (state.recognitionAttempt) state.recognitionAttempt.userGrantState = 'reserved';
+        }
+        state.recognitionCalls.push(trigger);
+        state.responseHydrationEnabled = true;
         if (overrides.recognitionOutcome) return overrides.recognitionOutcome;
         if (state.meal?.recognitionStatus !== 'ready') {
           Object.assign(state.meal ?? {}, {
@@ -1894,7 +2470,12 @@ async function createServer(
           }
           state.asset.status = 'processed';
         }
-        return { status: 'ready' };
+        return {
+          status: 'ready' as const,
+          ...(overrides.responseDeadlineAt
+            ? { responseDeadlineAt: overrides.responseDeadlineAt }
+            : {}),
+        };
       },
     },
   });
@@ -2162,14 +2743,21 @@ function databaseMock(state: {
   calculationPreviews: Record<string, unknown>[];
   decompositionRevisions: Record<string, unknown>[];
   decompositionComponents: Record<string, unknown>[];
+  responseHydrationDelayMs: number;
+  delayReloadOnly: boolean;
+  responseHydrationEnabled: boolean;
+  draftLookupMisses: number;
 }) {
   const canClaimImage = state.asset.status === 'validated';
   const query = (value: unknown) => ({
     for: () => query(value),
     where: () => query(value),
     orderBy: () => query(value),
-    limit: async () =>
-      value === undefined ? [] : Array.isArray(value) ? value.slice(0, 1) : [value],
+    limit: async () => {
+      if (state.responseHydrationDelayMs && state.responseHydrationEnabled)
+        await new Promise((resolve) => setTimeout(resolve, state.responseHydrationDelayMs));
+      return value === undefined ? [] : Array.isArray(value) ? value.slice(0, 1) : [value];
+    },
     then<TResult1 = unknown, TResult2 = never>(
       ok?: ((result: unknown) => TResult1 | PromiseLike<TResult1>) | null,
       fail?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
@@ -2188,7 +2776,11 @@ function databaseMock(state: {
               ? { timezone: state.profileTimezone }
               : undefined
             : table === mealLogs && state.meal?.userId === 'user-id'
-              ? state.meal
+              ? state.draftLookupMisses > 0
+                ? (state.draftLookupMisses -= 1, undefined)
+                : state.meal
+              : table === imageAssets
+                ? state.asset
               : table === mealItems
                 ? state.items
                 : table === activeCatalogReleasePointers

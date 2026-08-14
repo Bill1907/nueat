@@ -10,13 +10,17 @@ import {
 
 type Spawn = typeof spawn;
 type VerifyTarget = (env: Record<string, string | undefined>) => Promise<VerifiedDatabaseTarget>;
+export type MigrationTargetName = 'bridge' | '0022' | '0023' | '0024';
 
 export async function runMigration(
-  targetName: 'bridge' | '0022' | '0023',
+  targetName: MigrationTargetName,
   env: Record<string, string | undefined> = process.env,
   spawnChild: Spawn = spawn,
   verifyTarget: VerifyTarget = verifyDatabaseTarget,
 ): Promise<void> {
+  if (!(targetName in MIGRATION_TARGET_INDEX)) {
+    throw new Error('Unsupported migration target');
+  }
   const target = await verifyTarget(env);
   const migrationsDirectory = await createTargetedMigrations(targetName);
   try {
@@ -42,8 +46,8 @@ export async function runMigration(
 
 if (import.meta.main) {
   const [targetName] = process.argv.slice(2);
-  if (targetName !== 'bridge' && targetName !== '0022' && targetName !== '0023') {
-    console.error('Migration target must be one of: bridge, 0022, 0023');
+  if (targetName !== 'bridge' && targetName !== '0022' && targetName !== '0023' && targetName !== '0024') {
+    console.error('Migration target must be one of: bridge, 0022, 0023, 0024');
     process.exitCode = 1;
   } else runMigration(targetName).catch(() => {
     console.error('Database target verification or migration failed');
@@ -55,6 +59,7 @@ const MIGRATION_TARGET_INDEX = {
   bridge: 21,
   '0022': 22,
   '0023': 23,
+  '0024': 24,
 } as const;
 
 async function createTargetedMigrations(targetName: keyof typeof MIGRATION_TARGET_INDEX) {

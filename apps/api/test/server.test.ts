@@ -4,7 +4,11 @@ import type { FastifyInstance } from 'fastify';
 
 import type { Auth } from '../src/auth/auth';
 import { parseEnvironment } from '../src/config/env';
-import { buildServer, materializeAutoSelectionPolicy } from '../src/server';
+import {
+  buildServer,
+  cohortGatedRecognitionRunner,
+  materializeAutoSelectionPolicy,
+} from '../src/server';
 
 const environment = parseEnvironment({
   NODE_ENV: 'test',
@@ -26,6 +30,50 @@ afterEach(async () => {
 });
 
 describe('NUEAT API server', () => {
+  test('routes protocol cohorts to distinct v2 and legacy runners without v2 fallback ledgers', async () => {
+    const calls: string[] = [];
+    const v2 = {
+      async reconcile() {
+        return { status: 'ready' as const };
+      },
+      async recognize(_mealLogId: string, _userId: string, trigger = 'initial') {
+        calls.push(`v2:${trigger}`);
+        return { status: 'ready' as const };
+      },
+    };
+    const legacy = {
+      async reconcile() {
+        return { status: 'ready' as const };
+      },
+      async recognize(_mealLogId: string, _userId: string, trigger = 'initial') {
+        calls.push(`legacy:${trigger}`);
+        return { status: 'ready' as const };
+      },
+    };
+    const base = {
+      ...environment.mealRecognition.reliability,
+      protocolMode: 'v2_one_call' as const,
+      cohortPercent: 0,
+      recoveryEnabled: false,
+    };
+    await cohortGatedRecognitionRunner(v2, legacy, base).recognize('meal', 'user');
+    await cohortGatedRecognitionRunner(v2, legacy, {
+      ...base, cohortPercent: 100, recoveryEnabled: true,
+    }).recognize('meal', 'user', 'user_recovery');
+    await cohortGatedRecognitionRunner(v2, legacy, {
+      ...base, protocolMode: 'legacy_observe',
+    }).recognize('meal', 'user');
+    await cohortGatedRecognitionRunner(v2, legacy, {
+      ...base, protocolMode: 'legacy_observe',
+    }).recognize('meal', 'user', 'user_recovery');
+
+    expect(calls).toEqual([
+      'legacy:initial',
+      'v2:user_recovery',
+      'legacy:initial',
+    ]);
+  });
+
   test('materializes only a complete signed auto-selection policy carrier', () => {
     const policy = {
       version: 'catalog-auto-selection-policy-v1' as const,

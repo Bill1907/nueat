@@ -9,7 +9,21 @@ const environment = parseEnvironment(process.env);
 const database = createDatabase(environment.databaseUrl);
 const mailer = createResendOtpMailer(environment.resendApiKey, environment.authEmailFrom);
 const auth = createAuth(database, mailer, environment);
-const app = await buildServer({ environment, database, auth });
+let app: Awaited<ReturnType<typeof buildServer>>;
+app = await buildServer({
+  environment,
+  database,
+  auth,
+  recognitionEventSink(event) {
+    app?.log.info({
+      recognitionEvent: event.type,
+      executionId: 'executionId' in event ? event.executionId : undefined,
+      workflowId: 'workflowId' in event ? event.workflowId : undefined,
+      code: event.type === 'terminal' ? event.code : undefined,
+      phase: event.type === 'phase' ? event.phase : undefined,
+    }, 'Recognition execution event');
+  },
+});
 
 let shuttingDown = false;
 async function shutdown(signal: string) {

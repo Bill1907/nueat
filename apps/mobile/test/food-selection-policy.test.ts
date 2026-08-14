@@ -11,19 +11,42 @@ describe('food selection policy', () => {
     expect(normalizeKoreanFoodLabel('된장\n\t찌개')).toBe('된장 찌개');
   });
 
-  test('treats the server resolution as authoritative for aliases', () => {
+  test('derives current mapping from review, confirmation proof, and canonical food fields', () => {
     expect(
       isFoodMappingCurrent({
-        status: 'resolved',
-        reason: 'INITIAL_ALTERNATIVE_MAPPING',
+        review: { status: 'current', authority: { fingerprint: 'canonical' } },
+        origin: 'model_estimate',
+        confirmationProof: {},
+        foodId: 'food-1',
+        nutrientProfileId: 'profile-1',
       }),
     ).toBe(true);
     expect(
       isFoodMappingCurrent({
-        status: 'unresolved',
-        reason: 'FOOD_MAPPING_MISSING',
+        review: { status: 'required', authority: { fingerprint: 'canonical' } },
+        origin: 'model_estimate',
+        confirmationProof: {},
+        foodId: 'food-1',
+        nutrientProfileId: 'profile-1',
       }),
     ).toBe(false);
-    expect(isFoodMappingCurrent(null)).toBe(false);
+    expect(
+      isFoodMappingCurrent({
+        review: { status: 'current', authority: { fingerprint: 'canonical' } },
+        origin: 'model_estimate',
+        confirmationProof: null,
+        foodId: 'food-1',
+        nutrientProfileId: 'profile-1',
+      }),
+    ).toBe(false);
+    expect(
+      isFoodMappingCurrent({
+        review: { status: 'current', authority: { fingerprint: 'canonical' } },
+        origin: 'legacy_unknown',
+        confirmationProof: null,
+        foodId: 'food-1',
+        nutrientProfileId: 'profile-1',
+      }),
+    ).toBe(true);
   });
 });

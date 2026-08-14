@@ -24,6 +24,7 @@
     "db:check": "bun run --cwd packages/database db:check",
     "db:migrate:bridge": "bun run --cwd packages/database db:migrate:bridge",
     "db:migrate:0022": "bun run --cwd packages/database db:migrate:0022",
-    "db:migrate:0023": "bun run --cwd packages/database db:migrate:0023"
+    "db:migrate:0023": "bun run --cwd packages/database db:migrate:0023",
+    "db:migrate:0024": "bun run --cwd packages/database db:migrate:0024"
   }
 }

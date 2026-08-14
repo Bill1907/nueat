@@ -12,7 +12,10 @@ import {
 } from './services/catalog-registry-verifier';
 import { createS3ImageObjectStore, type ImageObjectStore } from './services/image-object-store';
 import {
+  LegacyObserveMealRecognitionRunner,
   MealRecognitionCoordinator,
+  type MealRecognitionCoordinatorOptions,
+  type RecognitionExecutionEvent,
   type MealRecognitionRunner,
 } from './services/meal-recognition-coordinator';
 import {
@@ -22,7 +25,14 @@ import {
   CATALOG_AUTO_SELECTION_COMPARATOR_VERSION,
   CATALOG_AUTO_SELECTION_POLICY_VERSION,
 } from './services/catalog-auto-selection-policy';
-import { MockMealRecognizer } from './services/mock-meal-recognizer';
+import {
+  MockMealRecognizer,
+  MOCK_MEAL_RECOGNITION_MODEL,
+} from './services/mock-meal-recognizer';
+import {
+  MEAL_RECOGNITION_V3_PROMPT_VERSION,
+  MEAL_RECOGNITION_V3_SCHEMA_VERSION,
+} from './services/meal-recognizer';
 import {
   OpenAIMealRecognizer,
   type OpenAIResponsesClient,
@@ -41,6 +51,7 @@ import { onboardingRoutes } from './routes/onboarding';
 import { nutritionTargetRoutes } from './routes/nutrition-target';
 import { sessionRoutes } from './routes/session';
 import { recommendationRoutes } from './routes/recommendation';
+import { isInRecognitionCohort } from './services/recognition-cohort';
 
 export interface ServerDependencies {
   environment: ApiEnvironment;
@@ -48,10 +59,25 @@ export interface ServerDependencies {
   auth: Auth;
   imageObjectStore?: ImageObjectStore;
   recognitionCoordinator?: MealRecognitionRunner;
+  recognitionEventSink?: (event: RecognitionExecutionEvent) => void;
 }
 
 export async function buildServer(dependencies: ServerDependencies) {
   const { environment } = dependencies;
+  if (
+    environment.mealRecognition.reliability.protocolMode !== 'disabled' &&
+    !dependencies.recognitionCoordinator
+  ) {
+    const [capability] = await dependencies.database.execute(sql`
+      select exists (
+        select 1 from schema_capability
+        where name = 'recognition_reliability_v2'
+      ) as ready
+    `);
+    if (capability?.ready !== true) {
+      throw new Error('RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY_MISSING');
+    }
+  }
   const bridgeMode =
     environment.mealConfirmationCutover.mode === 'maintenance_bridge';
   const configuredAutoSelectionPolicy = bridgeMode
@@ -90,33 +116,79 @@ export async function buildServer(dependencies: ServerDependencies) {
   const imageObjectStore =
     dependencies.imageObjectStore ??
     (environment.imageBucket ? createS3ImageObjectStore(environment.imageBucket) : null);
-  const recognitionCoordinator =
-    dependencies.recognitionCoordinator ??
-    (imageObjectStore
-      ? new MealRecognitionCoordinator({
+  const reliabilityMode = environment.mealRecognition.reliability.protocolMode;
+  const createRecognizer = (kind: 'legacy' | 'v2') =>
+    environment.mealRecognition.mode === 'openai'
+      ? new OpenAIMealRecognizer(
+          new OpenAI({
+            apiKey: environment.mealRecognition.apiKey,
+            ...(kind === 'v2' ? { maxRetries: 0 } : {}),
+          }) as unknown as OpenAIResponsesClient,
+          {
+            model: environment.mealRecognition.model,
+            deadlineMs: environment.mealRecognition.deadlineMs,
+            maxOutputTokens: environment.mealRecognition.maxOutputTokens,
+          },
+        )
+      : new MockMealRecognizer();
+  const coordinatorOptions = (
+    recognizer: MockMealRecognizer | OpenAIMealRecognizer,
+  ): MealRecognitionCoordinatorOptions => ({
           database: dependencies.database,
-          objectStore: imageObjectStore,
-          recognizer:
-            environment.mealRecognition.mode === 'openai'
-              ? new OpenAIMealRecognizer(
-                  new OpenAI({
-                    apiKey: environment.mealRecognition.apiKey,
-                  }) as unknown as OpenAIResponsesClient,
-                  {
-                    model: environment.mealRecognition.model,
-                    deadlineMs: environment.mealRecognition.deadlineMs,
-                    maxOutputTokens: environment.mealRecognition.maxOutputTokens,
-                  },
-                )
-              : new MockMealRecognizer(),
+          objectStore: imageObjectStore!,
+          recognizer,
           maxBytes: environment.imageBucket?.maxBytes ?? 10_000_000,
           timeoutMs: environment.mealRecognition.deadlineMs,
-          leaseMs: environment.mealRecognition.deadlineMs + 5_000,
+          leaseMs:
+            environment.mealRecognition.deadlineMs +
+            environment.mealRecognition.reliability.leaseMarginMs,
           maxAttempts: environment.mealRecognition.maxAttempts,
           dailyQuota: environment.mealRecognition.dailyAttemptQuota,
+          finalizationReserveMs:
+            environment.mealRecognition.reliability.finalizationReserveMs,
+          providerCallMaxMs:
+            environment.mealRecognition.reliability.providerCallMaxMs,
+          providerCallMinMs:
+            environment.mealRecognition.reliability.providerCallMinMs,
+          dbLockCapMs: environment.mealRecognition.reliability.dbLockCapMs,
+          dbStatementCapMs:
+            environment.mealRecognition.reliability.dbStatementCapMs,
+          leaseMarginMs: environment.mealRecognition.reliability.leaseMarginMs,
+          providerIdentity: {
+            provider: environment.mealRecognition.mode === 'openai' ? 'openai' : 'mock',
+            model: environment.mealRecognition.mode === 'openai'
+              ? environment.mealRecognition.model
+              : MOCK_MEAL_RECOGNITION_MODEL,
+            promptVersion: MEAL_RECOGNITION_V3_PROMPT_VERSION,
+            schemaVersion: MEAL_RECOGNITION_V3_SCHEMA_VERSION,
+          },
           autoSelectionPolicy,
-        })
-      : unavailableRecognitionRunner);
+          ...(dependencies.recognitionEventSink
+            ? { eventSink: dependencies.recognitionEventSink }
+            : {}),
+        });
+  const [v2Runner, legacyRunner] = dependencies.recognitionCoordinator
+    ? [dependencies.recognitionCoordinator, dependencies.recognitionCoordinator]
+    : reliabilityMode === 'disabled' || !imageObjectStore
+      ? [unavailableRecognitionRunner, unavailableRecognitionRunner]
+      : environment.mealRecognition.mode === 'openai'
+        ? [
+            new MealRecognitionCoordinator(coordinatorOptions(createRecognizer('v2'))),
+            new LegacyObserveMealRecognitionRunner(coordinatorOptions(createRecognizer('legacy'))),
+          ]
+        : (() => {
+            const recognizer = createRecognizer('legacy');
+            const options = coordinatorOptions(recognizer);
+            return [
+              new MealRecognitionCoordinator(options),
+              new LegacyObserveMealRecognitionRunner(options),
+            ] as const;
+          })();
+  const recognitionCoordinator = cohortGatedRecognitionRunner(
+    v2Runner,
+    legacyRunner,
+    environment.mealRecognition.reliability,
+  );
   const app = Fastify({
     trustProxy: true,
     genReqId: () => crypto.randomUUID(),
@@ -206,6 +278,13 @@ export async function buildServer(dependencies: ServerDependencies) {
               from pg_trigger
               where tgname = 'meal_log_confirmed_review_checkpoint_guard'
                 and not tgisinternal
+            )
+            and (
+              ${environment.mealRecognition.reliability.protocolMode === 'disabled'}
+              or exists (
+                select 1 from schema_capability
+                where name = 'recognition_reliability_v2'
+              )
             ) as ready
         `);
         if (capability?.ready === true) return;
@@ -277,6 +356,11 @@ export async function buildServer(dependencies: ServerDependencies) {
       database: dependencies.database,
       recognitionCoordinator,
       reviewPolicy: environment.mealRecognition.reviewPolicy,
+      recoveryEnabled: environment.mealRecognition.reliability.recoveryEnabled,
+      v2OneCallAdmitted: environment.mealRecognition.reliability.v2OneCallAdmitted,
+      cohortPercent: environment.mealRecognition.reliability.cohortPercent,
+      dailyRecognitionQuota: environment.mealRecognition.dailyAttemptQuota,
+      responseReserveMs: environment.mealRecognition.reliability.responseReserveMs,
       mealConfirmationCutover: environment.mealConfirmationCutover,
     });
     await app.register(dailyDashboardRoutes, {
@@ -388,4 +472,48 @@ const unavailableRecognitionRunner: MealRecognitionRunner = {
       retryable: false,
     };
   },
+  async reconcile() {
+    return { status: 'unavailable', code: 'RECOGNITION_UNAVAILABLE', retryable: false };
+  },
+  async responseLost() {},
 };
+
+export function cohortGatedRecognitionRunner(
+  v2Runner: MealRecognitionRunner,
+  legacyRunner: MealRecognitionRunner,
+  reliability: ApiEnvironment['mealRecognition']['reliability'],
+): MealRecognitionRunner {
+  if (reliability.protocolMode === 'disabled') return unavailableRecognitionRunner;
+  if (reliability.protocolMode === 'legacy_observe') {
+    return {
+      async reconcile(mealLogId, userId) {
+        return legacyRunner.reconcile(mealLogId, userId);
+      },
+      async recognize(mealLogId, userId, trigger = 'initial', signal) {
+        if (trigger === 'user_recovery')
+          return unavailableRecognitionRunner.recognize(mealLogId, userId, trigger);
+        return legacyRunner.recognize(mealLogId, userId, trigger, signal);
+      },
+      async responseLost(mealLogId, userId) {
+        return legacyRunner.responseLost?.(mealLogId, userId);
+      },
+    };
+  }
+  return {
+    async reconcile(mealLogId, userId) {
+      return v2Runner.reconcile(mealLogId, userId);
+    },
+    async recognize(mealLogId, userId, trigger = 'initial', signal) {
+      if (trigger === 'user_recovery' && !reliability.recoveryEnabled)
+        return unavailableRecognitionRunner.recognize(mealLogId, userId, trigger);
+      if (!isInRecognitionCohort(userId, reliability.cohortPercent))
+        return legacyRunner.recognize(mealLogId, userId, trigger, signal);
+      return v2Runner.recognize(mealLogId, userId, trigger, signal);
+    },
+    async responseLost(mealLogId, userId) {
+      if (!isInRecognitionCohort(userId, reliability.cohortPercent))
+        return legacyRunner.responseLost?.(mealLogId, userId);
+      return v2Runner.responseLost?.(mealLogId, userId);
+    },
+  };
+}

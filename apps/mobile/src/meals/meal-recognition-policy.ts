@@ -1,3 +1,10 @@
+import type {
+  ConfirmMealDraftInput,
+  DraftMealLog,
+  MealDraftItem,
+  RecognitionRecovery,
+} from '@/api/meal-drafts';
+
 export type RecognitionStatus =
   | 'pending'
   | 'processing'
@@ -56,6 +63,210 @@ export function canAddMealDraftItem(
   outcome: string | null,
 ) {
   return status === 'manual' || (status === 'ready' && outcome === 'recognized');
+}
+
+export type RecognitionRecoveryPolicy = {
+  canRetryRecognition: boolean;
+  canStartDirectEntry: boolean;
+  retryLabel: string | null;
+  showRefresh: boolean;
+  showProgress: boolean;
+  message: string;
+};
+
+const inProgressRecoveryPolicy: RecognitionRecoveryPolicy = {
+  canRetryRecognition: false,
+  canStartDirectEntry: false,
+  retryLabel: null,
+  showRefresh: false,
+  showProgress: true,
+  message: '사진에서 음식을 인식하고 있어요. 완료될 때까지 잠시만 기다려 주세요.',
+};
+
+const localTimeoutRecoveryPolicy: RecognitionRecoveryPolicy = {
+  canRetryRecognition: false,
+  canStartDirectEntry: true,
+  retryLabel: null,
+  showRefresh: true,
+  showProgress: false,
+  message: '분석에 시간이 더 걸리고 있어요. 새로고침하거나 직접 입력해 주세요.',
+};
+
+const unknownRecoveryPolicy: RecognitionRecoveryPolicy = {
+  canRetryRecognition: false,
+  canStartDirectEntry: true,
+  retryLabel: null,
+  showRefresh: true,
+  showProgress: false,
+  message: '인식 상태를 확인할 수 없어요. 새로고침하거나 직접 입력해 주세요.',
+};
+
+export function formatRecognitionRetryAt(
+  retryAt: string,
+  {
+    locale = Intl.DateTimeFormat().resolvedOptions().locale,
+    timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone,
+  }: { locale?: string; timeZone?: string } = {},
+) {
+  const date = new Date(retryAt);
+  if (Number.isNaN(date.getTime())) return '잠시 후';
+  return new Intl.DateTimeFormat(locale, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+    ...(timeZone ? { timeZone } : {}),
+  }).format(date);
+}
+
+export function createConfirmMealDraftInput(
+  draft: {
+    mealLog: Pick<DraftMealLog, 'draftRevision'>;
+    items: Pick<
+      MealDraftItem,
+      'id' | 'itemRevision' | 'origin' | 'confirmationProof'
+    >[];
+  },
+  idempotencyKey: string,
+): ConfirmMealDraftInput | null {
+  const items: ConfirmMealDraftInput['items'] = [];
+  for (const item of draft.items) {
+    const proof = item.confirmationProof;
+    if (proof === null) {
+      if (item.origin === 'model_estimate') return null;
+      items.push({
+        itemId: item.id,
+        expectedItemRevision: item.itemRevision,
+      });
+      continue;
+    }
+    items.push({
+      itemId: item.id,
+      expectedItemRevision: item.itemRevision,
+      mappingDecisionId: proof.mappingDecisionId,
+      calculationPreviewId: proof.calculationPreviewId,
+      ...(proof.decompositionRevisionId === undefined
+        ? {}
+        : { decompositionRevisionId: proof.decompositionRevisionId }),
+    });
+  }
+
+  return {
+    expectedDraftRevision: draft.mealLog.draftRevision,
+    idempotencyKey,
+    items,
+  };
+}
+
+function isRecognitionRecovery(value: unknown): value is RecognitionRecovery {
+  if (!value || typeof value !== 'object') return false;
+  const recovery = value as Record<string, unknown>;
+  if (recovery.mode === 'none') {
+    return (
+      recovery.retryAt === null &&
+      (recovery.reason === 'in_progress' ||
+        recovery.reason === 'recognition_complete' ||
+        recovery.reason === 'not_applicable')
+    );
+  }
+  if (recovery.mode === 'retry_now') {
+    return recovery.reason === 'recoverable_failure' && recovery.retryAt === null;
+  }
+  if (recovery.mode === 'retry_after') {
+    return (
+      (recovery.reason === 'cooldown' || recovery.reason === 'daily_quota') &&
+      typeof recovery.retryAt === 'string'
+    );
+  }
+  return (
+    recovery.mode === 'manual_only' &&
+    recovery.retryAt === null &&
+    (recovery.reason === 'asset_unavailable' ||
+      recovery.reason === 'recovery_exhausted' ||
+      recovery.reason === 'terminal_failure')
+  );
+}
+
+export function deriveRecognitionRecoveryPolicy({
+  recovery,
+  localPollingTimedOut,
+}: {
+  recovery: RecognitionRecovery | null | undefined | unknown;
+  localPollingTimedOut: boolean;
+}): RecognitionRecoveryPolicy {
+  if (localPollingTimedOut) return localTimeoutRecoveryPolicy;
+  if (!isRecognitionRecovery(recovery)) return unknownRecoveryPolicy;
+
+  switch (recovery.mode) {
+    case 'none':
+      switch (recovery.reason) {
+        case 'in_progress':
+          return inProgressRecoveryPolicy;
+        case 'recognition_complete':
+          return {
+            ...inProgressRecoveryPolicy,
+            showProgress: false,
+            message: '음식 인식 결과를 확인해 주세요.',
+          };
+        case 'not_applicable':
+          return {
+            ...inProgressRecoveryPolicy,
+            showProgress: false,
+            message: '직접 입력으로 식사를 기록할 수 있어요.',
+          };
+      }
+    case 'retry_now':
+      return {
+        canRetryRecognition: true,
+        canStartDirectEntry: true,
+        retryLabel: '인식 다시 시도',
+        showRefresh: false,
+        showProgress: false,
+        message: '음식 인식을 다시 시도하거나 직접 입력해 주세요.',
+      };
+    case 'retry_after': {
+      const retryAt = formatRecognitionRetryAt(recovery.retryAt);
+      return {
+        canRetryRecognition: false,
+        canStartDirectEntry: true,
+        retryLabel: '다시 시도',
+        showRefresh: false,
+        showProgress: false,
+        message:
+          recovery.reason === 'cooldown'
+            ? `잠시 후 다시 시도할 수 있어요: ${retryAt}`
+            : `오늘의 인식 횟수를 모두 사용했어요. 다시 시도 가능: ${retryAt}`,
+      };
+    }
+    case 'manual_only':
+      switch (recovery.reason) {
+        case 'asset_unavailable':
+          return {
+            canRetryRecognition: false,
+            canStartDirectEntry: true,
+            retryLabel: null,
+            showRefresh: false,
+            showProgress: false,
+            message: '사진을 다시 분석할 수 없어 직접 입력해 주세요.',
+          };
+        case 'recovery_exhausted':
+          return {
+            canRetryRecognition: false,
+            canStartDirectEntry: true,
+            retryLabel: null,
+            showRefresh: false,
+            showProgress: false,
+            message: '추가 인식 시도 없이 직접 입력해 주세요.',
+          };
+        case 'terminal_failure':
+          return {
+            canRetryRecognition: false,
+            canStartDirectEntry: true,
+            retryLabel: null,
+            showRefresh: false,
+            showProgress: false,
+            message: '이 사진은 직접 입력으로 기록해 주세요.',
+          };
+      }
+  }
 }
 
 export function recognitionPollDelay({

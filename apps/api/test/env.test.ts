@@ -110,6 +110,39 @@ function hybridAutoEnvironment(receipt: ReturnType<typeof approvedReceipt>) {
 }
 
 describe('parseEnvironment', () => {
+  test('parses reliability booleans only from explicit literals', () => {
+    const disabled = parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RELIABILITY_KILL_SWITCH: 'false',
+      RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY: 'false',
+      RECOGNITION_RECOVERY_ENABLED: 'false',
+    });
+    expect(disabled.mealRecognition.reliability).toMatchObject({
+      protocolMode: 'disabled', recoveryEnabled: false,
+    });
+    const enabled = parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RELIABILITY_KILL_SWITCH: 'true',
+      RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY: 'true',
+    });
+    expect(enabled.mealRecognition.reliability).toMatchObject({
+      protocolMode: 'disabled',
+    });
+    const recovery = parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RELIABILITY_PROTOCOL_MODE: 'v2_one_call',
+      RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY: 'true',
+      RECOGNITION_RELIABILITY_V2_ONE_CALL_ADMISSION_EVIDENCE: 'a'.repeat(64),
+      RECOGNITION_RELIABILITY_COHORT_PERCENT: '1',
+      RECOGNITION_RECOVERY_ENABLED: 'true',
+      MEAL_RECOGNITION_INGRESS_HARD_TIMEOUT_MS: '23000',
+      MEAL_RECOGNITION_APPLICATION_HARD_TIMEOUT_MS: '21000',
+    });
+    expect(recovery.mealRecognition.reliability.recoveryEnabled).toBe(true);
+    expect(() => parseEnvironment({
+      ...validEnvironment, RECOGNITION_RELIABILITY_KILL_SWITCH: '1',
+    })).toThrow();
+  });
   test('defaults meal recognition, cutover mode, and maintenance retry metadata', () => {
     const result = parseEnvironment({ ...validEnvironment, OPENAI_API_KEY: '' });
     expect(result.mealRecognition).toMatchObject({ mode: 'mock', apiKey: undefined, model: 'gpt-5.4-mini-2026-03-17', deadlineMs: 20_000, maxOutputTokens: 2_000, maxAttempts: 2, dailyAttemptQuota: 20, reviewPolicy: { mode: 'review_only', approvedReportSha256: undefined, activeReportSha256: undefined, approvedReportVersion: undefined, approvedReportReceipt: null } });
@@ -117,6 +150,132 @@ describe('parseEnvironment', () => {
       mode: 'normal',
       retryAfterSeconds: 60,
     });
+    expect(result.mealRecognition.reliability).toMatchObject({
+      protocolMode: 'disabled',
+      cohortPercent: 0,
+      recoveryEnabled: false,
+    });
+  });
+
+  test('fails closed for unproven protocol modes and impossible recognition deadlines', () => {
+    expect(() => parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RELIABILITY_PROTOCOL_MODE: 'v2_one_call',
+    })).toThrow('schema capability');
+    expect(() => parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RELIABILITY_PROTOCOL_MODE: 'v2_auto_retry',
+      RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY: 'true',
+    })).toThrow('not admitted');
+    expect(() => parseEnvironment({
+      ...validEnvironment,
+      MEAL_RECOGNITION_DEADLINE_MS: '3000',
+      MEAL_RECOGNITION_PROVIDER_CALL_MAX_MS: '2000',
+      MEAL_RECOGNITION_FINALIZATION_RESERVE_MS: '2000',
+    })).toThrow('deadline reserves');
+    expect(() => parseEnvironment({
+      ...validEnvironment,
+      MEAL_RECOGNITION_INGRESS_HARD_TIMEOUT_MS: '21000',
+    })).toThrow('ingress hard timeout');
+  });
+
+  test('uses the kill switch to disable an otherwise configured reliability cohort', () => {
+    const result = parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RELIABILITY_PROTOCOL_MODE: 'v2_one_call',
+      RECOGNITION_RELIABILITY_KILL_SWITCH: 'true',
+      RECOGNITION_RELIABILITY_COHORT_PERCENT: '100',
+    });
+    expect(result.mealRecognition.reliability.protocolMode).toBe('disabled');
+  });
+
+  test('parses the coordinator reliability budgets as an explicit bounded contract', () => {
+    const result = parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RELIABILITY_PROTOCOL_MODE: 'v2_one_call',
+      RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY: 'true',
+      RECOGNITION_RELIABILITY_V2_ONE_CALL_ADMISSION_EVIDENCE: 'a'.repeat(64),
+      MEAL_RECOGNITION_INGRESS_HARD_TIMEOUT_MS: '23000',
+      MEAL_RECOGNITION_APPLICATION_HARD_TIMEOUT_MS: '21000',
+      MEAL_RECOGNITION_FINALIZATION_RESERVE_MS: '3000',
+      MEAL_RECOGNITION_PROVIDER_CALL_MAX_MS: '16000',
+      MEAL_RECOGNITION_PROVIDER_CALL_MIN_MS: '1500',
+      MEAL_RECOGNITION_DB_LOCK_CAP_MS: '900',
+      MEAL_RECOGNITION_DB_STATEMENT_CAP_MS: '1200',
+      MEAL_RECOGNITION_LEASE_MARGIN_MS: '1400',
+    });
+    expect(result.mealRecognition.reliability).toMatchObject({
+      protocolMode: 'v2_one_call',
+      finalizationReserveMs: 3_000,
+      providerCallMaxMs: 16_000,
+      providerCallMinMs: 1_500,
+      dbLockCapMs: 900,
+      dbStatementCapMs: 1_200,
+      leaseMarginMs: 1_400,
+    });
+  });
+
+  test('keeps legacy observe behavior unchanged and gates v2 recovery separately', () => {
+    const legacy = parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RELIABILITY_PROTOCOL_MODE: 'legacy_observe',
+      RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY: 'true',
+    });
+    expect(legacy.mealRecognition.reliability).toMatchObject({
+      protocolMode: 'legacy_observe',
+      v2OneCallAdmitted: false,
+      recoveryEnabled: false,
+    });
+  });
+
+  test('enforces the protocol and recovery admission matrix', () => {
+    expect(() => parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RELIABILITY_PROTOCOL_MODE: 'v2_one_call',
+      RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY: 'true',
+    })).toThrow('v2_one_call requires admission evidence');
+    expect(() => parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RECOVERY_ENABLED: 'true',
+    })).toThrow('recovery requires admitted');
+    expect(() => parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RELIABILITY_PROTOCOL_MODE: 'v2_one_call',
+      RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY: 'true',
+      RECOGNITION_RELIABILITY_V2_ONE_CALL_ADMISSION_EVIDENCE: 'a'.repeat(64),
+      RECOGNITION_RECOVERY_ENABLED: 'true',
+    })).toThrow('non-zero cohort');
+    expect(parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RELIABILITY_PROTOCOL_MODE: 'v2_one_call',
+      RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY: 'true',
+      RECOGNITION_RELIABILITY_V2_ONE_CALL_ADMISSION_EVIDENCE: 'a'.repeat(64),
+      RECOGNITION_RELIABILITY_COHORT_PERCENT: '1',
+      RECOGNITION_RECOVERY_ENABLED: 'true',
+      MEAL_RECOGNITION_INGRESS_HARD_TIMEOUT_MS: '23000',
+      MEAL_RECOGNITION_APPLICATION_HARD_TIMEOUT_MS: '21000',
+    }).mealRecognition.reliability).toMatchObject({
+      protocolMode: 'v2_one_call',
+      v2OneCallAdmitted: true,
+      recoveryEnabled: true,
+    });
+  });
+
+  test('requires a receipt digest and measured timeouts for v2 admission', () => {
+    expect(() => parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RELIABILITY_PROTOCOL_MODE: 'v2_one_call',
+      RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY: 'true',
+      RECOGNITION_RELIABILITY_V2_ONE_CALL_ADMISSION_EVIDENCE: 'not-a-digest',
+      MEAL_RECOGNITION_INGRESS_HARD_TIMEOUT_MS: '23000',
+      MEAL_RECOGNITION_APPLICATION_HARD_TIMEOUT_MS: '21000',
+    })).toThrow('lowercase SHA-256');
+    expect(() => parseEnvironment({
+      ...validEnvironment,
+      RECOGNITION_RELIABILITY_PROTOCOL_MODE: 'v2_one_call',
+      RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY: 'true',
+      RECOGNITION_RELIABILITY_V2_ONE_CALL_ADMISSION_EVIDENCE: 'a'.repeat(64),
+    })).toThrow('measured ingress and application');
   });
 
   test('passes a configured model ID through in review-only mode', () => {

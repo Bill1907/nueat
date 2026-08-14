@@ -12,7 +12,12 @@ export function isConfirmedMealResponseProjection(
 }
 
 export interface MealConfirmationReviewPolicyInput {
-  items: readonly { itemId: string; review: MealDraftItemReview }[];
+  items: readonly {
+    itemId: string;
+    review: MealDraftItemReview;
+    origin: 'model_estimate' | 'manual_entry' | 'user_added' | 'legacy_unknown';
+    confirmationProof: unknown | null;
+  }[];
   serverConfirmable: boolean;
   hasUnsavedChanges: boolean;
   hasPendingMutation: boolean;
@@ -104,6 +109,13 @@ export function deriveMealConfirmationReviewPolicy(
     canConfirmMeal:
       input.items.length > 0 &&
       input.serverConfirmable &&
+      input.items.every(
+        (item) =>
+          item.confirmationProof !== null ||
+          (item.origin !== 'model_estimate' &&
+            item.review.status === 'current' &&
+            item.review.authority.fingerprint !== null),
+      ) &&
       !input.hasUnsavedChanges &&
       !input.hasPendingMutation,
   };

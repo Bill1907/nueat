@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    "scripts/validate-recognition-reliability.ts",
+    "src/migration-target-guard.ts"
+  ]
+}

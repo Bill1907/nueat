@@ -257,9 +257,9 @@ export type StoredRecognitionResultV3 =
   | { version: 3; outcome: 'insufficient_evidence'; imageQualityConfidenceBps: number; evidenceReason: 'blurred' | 'too_dark' | 'occluded' | 'not_meal_photo' | 'other'; observations: [] };
 
 export function parseRecognitionResultV3(value: unknown): RecognitionResultV3 {
-  if (!hasOnlyV3ObservationContent(value)) throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE');
+  if (!hasOnlyV3ObservationContent(value)) throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE', 'provider_output');
   const parsed = RecognitionResultV3.safeParse(value);
-  if (!parsed.success) throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE');
+  if (!parsed.success) throw new MealRecognitionFailure('INVALID_PROVIDER_RESPONSE', 'provider_output');
   return parsed.data;
 }
 
@@ -331,6 +331,8 @@ function hasOnlyV3ObservationContent(value: unknown): boolean {
 export interface MealRecognizerInput {
   imageBytes: Uint8Array;
   imageContentType: 'image/jpeg' | 'image/png' | 'image/webp';
+  /** Owned by the coordinator; adapters must not replace it with an execution-wide timer. */
+  signal?: AbortSignal;
 }
 
 export interface MealRecognizerOutput {
@@ -352,12 +354,40 @@ export interface MealRecognizer {
   recognize(input: MealRecognizerInput): Promise<MealRecognizerOutput>;
 }
 
-export const MealRecognitionFailureCode = z.enum([
-  'CONFIGURATION_INVALID',
-  'DEADLINE_EXCEEDED',
-  'PROVIDER_UNAVAILABLE',
+export const RecognitionFailurePhase = z.enum([
+  'claim', 'asset_read', 'asset_verify', 'invocation_reserve', 'provider_call',
+  'provider_output', 'observation_persist', 'resolution_handoff',
+  'response_delivery', 'reconciliation',
+]);
+export type RecognitionFailurePhase = z.infer<typeof RecognitionFailurePhase>;
+
+export const RecognitionSafeFailureCode = z.enum([
+  'DRAFT_INELIGIBLE', 'EXECUTION_LIMIT_REACHED', 'USER_RECOVERY_UNAVAILABLE',
+  'DAILY_QUOTA_RESERVED', 'DB_LOCK_TIMEOUT', 'DB_STATEMENT_TIMEOUT', 'DB_UNAVAILABLE',
+  'LEASE_LOST', 'ASSET_NOT_FOUND', 'ASSET_EXPIRED', 'ASSET_TOO_LARGE',
+  'ASSET_UNAVAILABLE', 'ASSET_READ_TIMEOUT', 'ASSET_MISMATCH', 'ASSET_TYPE_INVALID',
+  'PROVIDER_CALL_DEADLINE',
+  'PROVIDER_REQUEST_TIMEOUT',
+  'PROVIDER_CONFLICT',
+  'PROVIDER_RATE_LIMITED',
+  'PROVIDER_CONNECTION_FAILED',
+  'PROVIDER_SERVER_ERROR',
+  'PROVIDER_REQUEST_INVALID',
+  'PROVIDER_AUTH_INVALID',
   'PROVIDER_REJECTED',
+  'PROVIDER_UNKNOWN',
+  'PROVIDER_INCOMPLETE',
   'INVALID_PROVIDER_RESPONSE',
+  'EXECUTION_CANCELLED', 'EXECUTION_DEADLINE', 'PERSISTENCE_UNAVAILABLE', 'DRAFT_STATE_LOST',
+  'COORDINATOR_INTERNAL', 'PROCESS_OUTCOME_UNKNOWN',
+]);
+export type RecognitionSafeFailureCode = z.infer<typeof RecognitionSafeFailureCode>;
+
+export const MealRecognitionFailureCode = z.enum([
+  'PROVIDER_CALL_DEADLINE', 'PROVIDER_REQUEST_TIMEOUT', 'PROVIDER_CONFLICT',
+  'PROVIDER_RATE_LIMITED', 'PROVIDER_CONNECTION_FAILED', 'PROVIDER_SERVER_ERROR',
+  'PROVIDER_REQUEST_INVALID', 'PROVIDER_AUTH_INVALID', 'PROVIDER_REJECTED',
+  'PROVIDER_UNKNOWN', 'PROVIDER_INCOMPLETE', 'INVALID_PROVIDER_RESPONSE',
 ]);
 
 export type MealRecognitionFailureCode = z.infer<
@@ -365,8 +395,14 @@ export type MealRecognitionFailureCode = z.infer<
 >;
 
 export class MealRecognitionFailure extends Error {
-  constructor(readonly code: MealRecognitionFailureCode) {
+  readonly phase: Extract<RecognitionFailurePhase, 'provider_call' | 'provider_output'>;
+
+  constructor(
+    readonly code: MealRecognitionFailureCode,
+    phase: Extract<RecognitionFailurePhase, 'provider_call' | 'provider_output'> = 'provider_call',
+  ) {
     super(code);
     this.name = 'MealRecognitionFailure';
+    this.phase = phase;
   }
 }

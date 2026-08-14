@@ -13,6 +13,8 @@ import {
   CATALOG_AUTO_SELECTION_POLICY_VERSION,
 } from '../services/catalog-auto-selection-policy';
 
+const environmentBoolean = z.enum(['true', 'false']).transform((value) => value === 'true');
+
 const environmentSchema = z
   .object({
     NODE_ENV: z
@@ -84,6 +86,28 @@ const environmentSchema = z
       .min(1_000)
       .max(60_000)
       .default(20_000),
+    RECOGNITION_RELIABILITY_PROTOCOL_MODE: z
+      .enum(['disabled', 'legacy_observe', 'v2_one_call', 'v2_auto_retry'])
+      .default('disabled'),
+    RECOGNITION_RELIABILITY_KILL_SWITCH: environmentBoolean.default(false),
+    RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY: environmentBoolean.default(false),
+
+    RECOGNITION_RELIABILITY_V2_ONE_CALL_ADMISSION_EVIDENCE: z
+      .string()
+      .trim()
+      .regex(/^[a-f0-9]{64}$/, 'RECOGNITION_RELIABILITY_V2_ONE_CALL_ADMISSION_EVIDENCE must be a lowercase SHA-256 hex digest')
+      .optional(),
+    RECOGNITION_RECOVERY_ENABLED: environmentBoolean.default(false),
+    RECOGNITION_RELIABILITY_COHORT_PERCENT: z.coerce.number().int().min(0).max(100).default(0),
+    MEAL_RECOGNITION_FINALIZATION_RESERVE_MS: z.coerce.number().int().min(1).default(2_000),
+    MEAL_RECOGNITION_RESPONSE_RESERVE_MS: z.coerce.number().int().min(1).default(2_000),
+    MEAL_RECOGNITION_PROVIDER_CALL_MAX_MS: z.coerce.number().int().min(1).default(15_000),
+    MEAL_RECOGNITION_PROVIDER_CALL_MIN_MS: z.coerce.number().int().min(1).default(1_000),
+    MEAL_RECOGNITION_DB_LOCK_CAP_MS: z.coerce.number().int().min(1).default(1_000),
+    MEAL_RECOGNITION_DB_STATEMENT_CAP_MS: z.coerce.number().int().min(1).default(1_500),
+    MEAL_RECOGNITION_LEASE_MARGIN_MS: z.coerce.number().int().min(1).default(1_000),
+    MEAL_RECOGNITION_INGRESS_HARD_TIMEOUT_MS: z.coerce.number().int().min(1).optional(),
+    MEAL_RECOGNITION_APPLICATION_HARD_TIMEOUT_MS: z.coerce.number().int().min(1).optional(),
     MEAL_RECOGNITION_MAX_OUTPUT_TOKENS: z.coerce
       .number()
       .int()
@@ -142,6 +166,68 @@ const environmentSchema = z
       .default(60),
   })
   .superRefine((value, context) => {
+    const protocolMode = value.RECOGNITION_RELIABILITY_KILL_SWITCH
+      ? 'disabled'
+      : value.RECOGNITION_RELIABILITY_PROTOCOL_MODE;
+    const deadline = value.MEAL_RECOGNITION_DEADLINE_MS;
+    if (
+      value.MEAL_RECOGNITION_PROVIDER_CALL_MIN_MS + value.MEAL_RECOGNITION_FINALIZATION_RESERVE_MS >
+        deadline ||
+      value.MEAL_RECOGNITION_PROVIDER_CALL_MAX_MS >
+        deadline - value.MEAL_RECOGNITION_FINALIZATION_RESERVE_MS ||
+      value.MEAL_RECOGNITION_DB_LOCK_CAP_MS >= value.MEAL_RECOGNITION_FINALIZATION_RESERVE_MS ||
+      value.MEAL_RECOGNITION_DB_STATEMENT_CAP_MS >= value.MEAL_RECOGNITION_FINALIZATION_RESERVE_MS
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['MEAL_RECOGNITION_DEADLINE_MS'],
+        message: 'recognition deadline reserves must leave a useful provider window and finalization DB timeouts below the finalization reserve',
+      });
+    }
+    if (
+      value.MEAL_RECOGNITION_INGRESS_HARD_TIMEOUT_MS !== undefined &&
+      deadline + value.MEAL_RECOGNITION_RESPONSE_RESERVE_MS >
+        value.MEAL_RECOGNITION_INGRESS_HARD_TIMEOUT_MS
+    ) {
+      context.addIssue({ code: 'custom', path: ['MEAL_RECOGNITION_INGRESS_HARD_TIMEOUT_MS'], message: 'recognition deadline plus response reserve exceeds ingress hard timeout' });
+    }
+    if (
+      value.MEAL_RECOGNITION_APPLICATION_HARD_TIMEOUT_MS !== undefined &&
+      deadline > value.MEAL_RECOGNITION_APPLICATION_HARD_TIMEOUT_MS
+    ) {
+      context.addIssue({ code: 'custom', path: ['MEAL_RECOGNITION_APPLICATION_HARD_TIMEOUT_MS'], message: 'recognition deadline exceeds application hard timeout' });
+    }
+    if (protocolMode !== 'disabled' && !value.RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY) {
+      context.addIssue({ code: 'custom', path: ['RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY'], message: 'recognition reliability protocol requires schema capability' });
+    }
+    if (protocolMode === 'v2_auto_retry') {
+      context.addIssue({ code: 'custom', path: ['RECOGNITION_RELIABILITY_PROTOCOL_MODE'], message: 'v2_auto_retry is not admitted for coordinator replay' });
+    }
+    if (
+      protocolMode === 'v2_one_call' &&
+      !value.RECOGNITION_RELIABILITY_V2_ONE_CALL_ADMISSION_EVIDENCE
+    ) {
+      context.addIssue({ code: 'custom', path: ['RECOGNITION_RELIABILITY_V2_ONE_CALL_ADMISSION_EVIDENCE'], message: 'v2_one_call requires admission evidence' });
+    }
+    if (
+      protocolMode === 'v2_one_call' &&
+      (value.MEAL_RECOGNITION_INGRESS_HARD_TIMEOUT_MS === undefined ||
+        value.MEAL_RECOGNITION_APPLICATION_HARD_TIMEOUT_MS === undefined)
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['MEAL_RECOGNITION_INGRESS_HARD_TIMEOUT_MS'],
+        message: 'v2_one_call requires measured ingress and application hard timeouts',
+      });
+    }
+    if (value.RECOGNITION_RECOVERY_ENABLED && (
+      protocolMode !== 'v2_one_call' ||
+      !value.RECOGNITION_RELIABILITY_V2_ONE_CALL_ADMISSION_EVIDENCE ||
+      !value.RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY ||
+      value.RECOGNITION_RELIABILITY_COHORT_PERCENT <= 0
+    )) {
+      context.addIssue({ code: 'custom', path: ['RECOGNITION_RECOVERY_ENABLED'], message: 'recovery requires admitted v2_one_call, schema capability, and a non-zero cohort' });
+    }
     const effectiveMappingMode = value.MEAL_RECOGNITION_EMERGENCY_OVERRIDE === 'none'
       ? value.MEAL_RECOGNITION_MAPPING_MODE
       : value.MEAL_RECOGNITION_EMERGENCY_OVERRIDE === 'disabled'
@@ -270,6 +356,21 @@ export function parseEnvironment(input: Record<string, string | undefined>) {
       apiKey: parsed.OPENAI_API_KEY,
       model: parsed.OPENAI_MODEL,
       deadlineMs: parsed.MEAL_RECOGNITION_DEADLINE_MS,
+      reliability: {
+        protocolMode: parsed.RECOGNITION_RELIABILITY_KILL_SWITCH
+          ? 'disabled'
+          : parsed.RECOGNITION_RELIABILITY_PROTOCOL_MODE,
+        cohortPercent: parsed.RECOGNITION_RELIABILITY_COHORT_PERCENT,
+        v2OneCallAdmitted: !!parsed.RECOGNITION_RELIABILITY_V2_ONE_CALL_ADMISSION_EVIDENCE,
+        recoveryEnabled: parsed.RECOGNITION_RECOVERY_ENABLED,
+        finalizationReserveMs: parsed.MEAL_RECOGNITION_FINALIZATION_RESERVE_MS,
+        responseReserveMs: parsed.MEAL_RECOGNITION_RESPONSE_RESERVE_MS,
+        providerCallMaxMs: parsed.MEAL_RECOGNITION_PROVIDER_CALL_MAX_MS,
+        providerCallMinMs: parsed.MEAL_RECOGNITION_PROVIDER_CALL_MIN_MS,
+        dbLockCapMs: parsed.MEAL_RECOGNITION_DB_LOCK_CAP_MS,
+        dbStatementCapMs: parsed.MEAL_RECOGNITION_DB_STATEMENT_CAP_MS,
+        leaseMarginMs: parsed.MEAL_RECOGNITION_LEASE_MARGIN_MS,
+      },
       maxOutputTokens: parsed.MEAL_RECOGNITION_MAX_OUTPUT_TOKENS,
       maxAttempts: parsed.MEAL_RECOGNITION_MAX_ATTEMPTS,
       dailyAttemptQuota: parsed.MEAL_RECOGNITION_DAILY_ATTEMPT_QUOTA,

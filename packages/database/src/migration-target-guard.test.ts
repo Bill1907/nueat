@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { EventEmitter } from 'node:events';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import {
   guardedChildEnvironment,
   verifyDatabaseTarget,
@@ -140,10 +142,16 @@ describe('Neon migration target guard', () => {
       spawned = true;
       expect(options.env?.DATABASE_URL).toBe(directUrl);
       const child = new EventEmitter() as EventEmitter & { once: EventEmitter['once'] };
-      queueMicrotask(() => child.emit('exit', 0, null));
+      void readFile(join(options.env!.NUEAT_DRIZZLE_OUT!, 'meta', '_journal.json'), 'utf8').then(
+        (journal) => {
+          const entries = (JSON.parse(journal) as { entries: Array<{ idx: number }> }).entries;
+          expect(entries.at(-1)?.idx).toBe(24);
+          child.emit('exit', 0, null);
+        },
+      );
       return child;
     }) as unknown as typeof import('node:child_process').spawn;
-    await runMigration('bridge', baseEnv(), fakeSpawn, async () => target);
+    await runMigration('0024', baseEnv(), fakeSpawn, async () => target);
     expect(spawned).toBe(true);
   });
 
@@ -153,9 +161,17 @@ describe('Neon migration target guard', () => {
       spawned = true;
       return new EventEmitter();
     }) as unknown as typeof import('node:child_process').spawn;
-    await expect(runMigration('bridge', baseEnv(), fakeSpawn, async () => {
+    await expect(runMigration('0024', baseEnv(), fakeSpawn, async () => {
       throw new Error('Database target verification failed');
     })).rejects.toThrow();
     expect(spawned).toBe(false);
+  });
+
+  test('does not accept unguarded migration target names', async () => {
+    await expect(runMigration(
+      '0025' as never,
+      baseEnv(),
+      (() => new EventEmitter()) as unknown as typeof import('node:child_process').spawn,
+    )).rejects.toThrow();
   });
 });

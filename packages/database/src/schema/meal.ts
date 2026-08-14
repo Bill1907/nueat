@@ -61,6 +61,77 @@ export const recognitionProviderEnum = pgEnum('recognition_provider', [
   'openai',
   'manual',
 ]);
+export const recognitionProtocolVersionEnum = pgEnum('recognition_protocol_version', [
+  'legacy_v1',
+  'v2_option_b',
+]);
+export const recognitionUserGrantStateEnum = pgEnum('recognition_user_grant_state', [
+  'available',
+  'reserved',
+  'consumed',
+]);
+export const recognitionExecutionTriggerEnum = pgEnum('recognition_execution_trigger', [
+  'initial',
+  'automatic_lease_recovery',
+  'user_recovery',
+]);
+export const recognitionExecutionPhaseEnum = pgEnum('recognition_execution_phase', [
+  'claim',
+  'asset_read',
+  'asset_verify',
+  'invocation_reserve',
+  'provider_call',
+  'provider_output',
+  'observation_persist',
+  'resolution_handoff',
+  'response_delivery',
+  'reconciliation',
+]);
+export const recognitionExecutionStatusEnum = pgEnum('recognition_execution_status', [
+  'open',
+  'succeeded',
+  'failed',
+  'abandoned',
+]);
+export const recognitionProviderInvocationStatusEnum = pgEnum(
+  'recognition_provider_invocation_status',
+  ['reserved', 'succeeded', 'failed_known', 'cancelled_before_call', 'outcome_unknown'],
+);
+export const recognitionFailureCodeEnum = pgEnum('recognition_failure_code', [
+  'DRAFT_INELIGIBLE',
+  'EXECUTION_LIMIT_REACHED',
+  'USER_RECOVERY_UNAVAILABLE',
+  'DAILY_QUOTA_RESERVED',
+  'DB_LOCK_TIMEOUT',
+  'DB_STATEMENT_TIMEOUT',
+  'DB_UNAVAILABLE',
+  'LEASE_LOST',
+  'ASSET_NOT_FOUND',
+  'ASSET_EXPIRED',
+  'ASSET_TOO_LARGE',
+  'ASSET_UNAVAILABLE',
+  'ASSET_READ_TIMEOUT',
+  'ASSET_MISMATCH',
+  'ASSET_TYPE_INVALID',
+  'PROVIDER_CALL_DEADLINE',
+  'PROVIDER_REQUEST_TIMEOUT',
+  'PROVIDER_CONFLICT',
+  'PROVIDER_RATE_LIMITED',
+  'PROVIDER_CONNECTION_FAILED',
+  'PROVIDER_SERVER_ERROR',
+  'PROVIDER_REQUEST_INVALID',
+  'PROVIDER_AUTH_INVALID',
+  'PROVIDER_REJECTED',
+  'PROVIDER_UNKNOWN',
+  'PROVIDER_INCOMPLETE',
+  'INVALID_PROVIDER_RESPONSE',
+  'EXECUTION_DEADLINE',
+  'EXECUTION_CANCELLED',
+  'PERSISTENCE_UNAVAILABLE',
+  'DRAFT_STATE_LOST',
+  'COORDINATOR_INTERNAL',
+  'PROCESS_OUTCOME_UNKNOWN',
+]);
 export const mealItemOriginEnum = pgEnum('meal_item_origin', [
   'model_estimate',
   'manual_entry',
@@ -432,6 +503,11 @@ export const recognitionDailyUsages = pgTable(
   ],
 );
 
+export const schemaCapabilities = pgTable('schema_capability', {
+  name: text('name').primaryKey(),
+  appliedAt: timestamp('applied_at', { withTimezone: true }).defaultNow().notNull(),
+});
+
 export const mealLogs = pgTable(
   'meal_log',
   {
@@ -565,6 +641,16 @@ export const recognitionAttempts = pgTable(
     inputTokens: integer('input_tokens').default(0).notNull(),
     outputTokens: integer('output_tokens').default(0).notNull(),
     attemptCount: integer('attempt_count').default(0).notNull(),
+    protocolVersion: recognitionProtocolVersionEnum('protocol_version')
+      .default('legacy_v1')
+      .notNull(),
+    nextExecutionOrdinal: integer('next_execution_ordinal').default(1).notNull(),
+    automaticExecutionCount: integer('automatic_execution_count').default(0).notNull(),
+    automaticInvocationReservationCount: integer('automatic_invocation_reservation_count')
+      .default(0)
+      .notNull(),
+    userGrantState: recognitionUserGrantStateEnum('user_grant_state').default('available').notNull(),
+    userGrantExecutionId: uuid('user_grant_execution_id'),
     leaseToken: uuid('lease_token'),
     leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
     nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true }).defaultNow().notNull(),
@@ -575,8 +661,104 @@ export const recognitionAttempts = pgTable(
   },
   (table) => [
     index('recognition_attempt_due_idx').on(table.status, table.nextAttemptAt),
-    check('recognition_attempt_counts_check', sql`${table.attemptCount} >= 0 and ${table.inputTokens} >= 0 and ${table.outputTokens} >= 0`),
+    index('recognition_attempt_protocol_status_idx').on(table.protocolVersion, table.status),
+    check('recognition_attempt_counts_check', sql`${table.attemptCount} >= 0 and ${table.inputTokens} >= 0 and ${table.outputTokens} >= 0 and ${table.automaticExecutionCount} >= 0 and ${table.automaticInvocationReservationCount} >= 0 and ${table.nextExecutionOrdinal} > 0`),
+    check(
+      'recognition_attempt_option_b_reservation_ceiling_check',
+      sql`${table.protocolVersion} <> 'v2_option_b'
+        or ${table.automaticInvocationReservationCount} <= ${table.automaticExecutionCount}`,
+    ),
+    check(
+      'recognition_attempt_user_grant_binding_check',
+      sql`(${table.userGrantState} = 'available' and ${table.userGrantExecutionId} is null)
+        or (${table.userGrantState} in ('reserved', 'consumed') and ${table.userGrantExecutionId} is not null)`,
+    ),
     check('recognition_attempt_lease_check', sql`(${table.status} = 'processing' and ${table.leaseToken} is not null and ${table.leaseExpiresAt} is not null) or (${table.status} <> 'processing' and ${table.leaseToken} is null and ${table.leaseExpiresAt} is null)`),
+  ],
+);
+
+export const recognitionExecutions = pgTable(
+  'recognition_execution',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    workflowId: uuid('workflow_id')
+      .notNull()
+      .references(() => recognitionAttempts.id, { onDelete: 'cascade' }),
+    executionOrdinal: integer('execution_ordinal').notNull(),
+    trigger: recognitionExecutionTriggerEnum('trigger').notNull(),
+    wallDeadlineAt: timestamp('wall_deadline_at', { withTimezone: true }).notNull(),
+    leaseToken: uuid('lease_token').notNull(),
+    phase: recognitionExecutionPhaseEnum('phase').default('claim').notNull(),
+    status: recognitionExecutionStatusEnum('status').default('open').notNull(),
+    terminalCode: recognitionFailureCodeEnum('terminal_code'),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('recognition_execution_workflow_ordinal_unique').on(
+      table.workflowId,
+      table.executionOrdinal,
+    ),
+    index('recognition_execution_open_deadline_idx')
+      .on(table.wallDeadlineAt)
+      .where(sql`${table.status} = 'open'`),
+    check('recognition_execution_ordinal_check', sql`${table.executionOrdinal} > 0`),
+    check(
+      'recognition_execution_terminal_check',
+      sql`(${table.status} = 'open' and ${table.completedAt} is null and ${table.terminalCode} is null)
+        or (${table.status} = 'succeeded' and ${table.completedAt} is not null and ${table.terminalCode} is null)
+        or (${table.status} in ('failed', 'abandoned') and ${table.completedAt} is not null and ${table.terminalCode} is not null)`,
+    ),
+  ],
+);
+
+export const recognitionProviderInvocations = pgTable(
+  'recognition_provider_invocation',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    workflowId: uuid('workflow_id')
+      .notNull()
+      .references(() => recognitionAttempts.id, { onDelete: 'cascade' }),
+    executionId: uuid('execution_id')
+      .notNull()
+      .references(() => recognitionExecutions.id, { onDelete: 'cascade' }),
+    invocationOrdinal: integer('invocation_ordinal').notNull(),
+    workflowInvocationOrdinal: integer('workflow_invocation_ordinal').notNull(),
+    status: recognitionProviderInvocationStatusEnum('status').default('reserved').notNull(),
+    provider: recognitionProviderEnum('provider').notNull(),
+    model: text('model').notNull(),
+    promptVersion: text('prompt_version').notNull(),
+    schemaVersion: text('schema_version').notNull(),
+    terminalCode: recognitionFailureCodeEnum('terminal_code'),
+    providerAcknowledgedAt: timestamp('provider_acknowledged_at', { withTimezone: true }),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => [
+    uniqueIndex('recognition_provider_invocation_execution_ordinal_unique').on(
+      table.executionId,
+      table.invocationOrdinal,
+    ),
+    uniqueIndex('recognition_provider_invocation_workflow_ordinal_unique').on(
+      table.workflowId,
+      table.workflowInvocationOrdinal,
+    ),
+    index('recognition_provider_invocation_reserved_idx')
+      .on(table.createdAt)
+      .where(sql`${table.status} = 'reserved'`),
+    check(
+      'recognition_provider_invocation_ordinal_check',
+      sql`${table.invocationOrdinal} = 1 and ${table.workflowInvocationOrdinal} > 0`,
+    ),
+    check(
+      'recognition_provider_invocation_terminal_check',
+      sql`(${table.status} = 'reserved' and ${table.completedAt} is null and ${table.terminalCode} is null)
+        or (${table.status} = 'succeeded' and ${table.completedAt} is not null and ${table.terminalCode} is null)
+        or (${table.status} in ('failed_known', 'cancelled_before_call', 'outcome_unknown')
+          and ${table.completedAt} is not null and ${table.terminalCode} is not null)`,
+    ),
   ],
 );
 

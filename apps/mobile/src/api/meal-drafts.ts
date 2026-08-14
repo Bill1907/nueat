@@ -9,6 +9,24 @@ import type { RecognitionStatus } from '@/meals/meal-recognition-policy';
 export { inferMealType };
 export type { MealType, MealUnit };
 
+export type RecognitionRecovery =
+  | {
+      mode: 'none';
+      reason: 'in_progress' | 'recognition_complete' | 'not_applicable';
+      retryAt: null;
+    }
+  | { mode: 'retry_now'; reason: 'recoverable_failure'; retryAt: null }
+  | {
+      mode: 'retry_after';
+      reason: 'cooldown' | 'daily_quota';
+      retryAt: string;
+    }
+  | {
+      mode: 'manual_only';
+      reason: 'asset_unavailable' | 'recovery_exhausted' | 'terminal_failure';
+      retryAt: null;
+    };
+
 interface MealLogBase {
   id: string;
   eatenAt: string;
@@ -17,32 +35,10 @@ interface MealLogBase {
   mealType: MealType;
   imageAssetId: string | null;
   recognitionStatus: RecognitionStatus;
-  recognitionProvider: string | null;
-  recognitionModel: string | null;
-  recognitionPromptVersion: string | null;
-  recognitionSchemaVersion: string | null;
-  recognitionCompletedAt: string | null;
-  recognitionLastErrorCode: string | null;
-  recognitionAttemptCount: number;
-  recognitionNextAttemptAt: string | null;
+  recognitionRecovery: RecognitionRecovery;
   draftRevision: number;
   recognitionOutcome: 'recognized' | 'no_food' | 'insufficient_evidence' | null;
   recognitionEvidenceReason: string | null;
-  recognitionManualOverride: {
-    decision: 'direct_entry';
-    decisionVersion: string;
-    fromStatus: RecognitionStatus;
-    fromOutcome: 'recognized' | 'no_food' | 'insufficient_evidence' | null;
-    fromErrorCode: string | null;
-    expectedDraftRevision: number;
-    actorUserId: string;
-    decidedAt: string;
-    changedFields: string[];
-  } | null;
-  observationId: string | null;
-  resolutionStatus: 'pending' | 'processing' | 'resolved' | 'failed' | null;
-  resolutionReason: string | null;
-  resolutionRetryAt: string | null;
 }
 
 export interface DraftMealLog extends MealLogBase {
@@ -106,25 +102,13 @@ export interface MealDraftItem {
   origin: 'model_estimate' | 'manual_entry' | 'user_added' | 'legacy_unknown';
   initialAssessment: unknown | null;
   review: MealDraftItemReview;
-  currentResolution: {
-    status: 'resolved' | 'unresolved';
-    reason: string | null;
-    observationId: string | null;
-    decisionId: string | null;
-    previewId: string | null;
-    decompositionRevisionId: string | null;
-    composition: 'finished_profile' | 'source_recipe' | 'meal_decomposition' | null;
-    resolutionStatus: 'pending' | 'processing' | 'resolved' | 'failed' | null;
-    resolutionReason: string | null;
-    resolutionRetryAt: string | null;
-    candidates: {
-      foodId: string;
-      labelKo: string;
-      scoreBps: number;
-      availability: 'available' | 'unavailable' | 'unknown';
-      reason: string | null;
-    }[];
-  } | null;
+  confirmationProof:
+    | {
+        mappingDecisionId: string;
+        calculationPreviewId: string;
+        decompositionRevisionId?: string;
+      }
+    | null;
 }
 
 export interface DraftMealDraftResponse {
@@ -381,20 +365,25 @@ export function reviewMealDraftItem(
   );
 }
 
-export function confirmMealDraft(
-  mealLogId: string,
-  input: {
-    expectedDraftRevision: number;
-    idempotencyKey: string;
-    items: {
-      itemId: string;
-      expectedItemRevision: number;
-      mappingDecisionId?: string;
-      calculationPreviewId?: string;
-      decompositionRevisionId?: string;
-    }[];
-  },
-) {
+export type ConfirmMealDraftInput = {
+  expectedDraftRevision: number;
+  idempotencyKey: string;
+  items: (
+    | {
+        itemId: string;
+        expectedItemRevision: number;
+        mappingDecisionId: string;
+        calculationPreviewId: string;
+        decompositionRevisionId?: string;
+      }
+    | {
+        itemId: string;
+        expectedItemRevision: number;
+      }
+  )[];
+};
+
+export function confirmMealDraft(mealLogId: string, input: ConfirmMealDraftInput) {
   return apiRequest<ConfirmMealDraftResponse>(
     `/api/meal-logs/${mealLogId}/confirm`,
     { method: 'POST', body: JSON.stringify(input) },

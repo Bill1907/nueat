@@ -14,9 +14,16 @@ import {
 function item(
   itemId: string,
   status: 'current' | 'required',
-): { itemId: string; review: MealDraftItemReview } {
+): {
+  itemId: string;
+  review: MealDraftItemReview;
+  origin: 'model_estimate' | 'manual_entry' | 'user_added' | 'legacy_unknown';
+  confirmationProof: object;
+} {
   return {
     itemId,
+    origin: 'model_estimate',
+    confirmationProof: {},
     review: {
       status,
       checkpoint: null,
@@ -195,6 +202,24 @@ describe('meal confirmation review policy', () => {
     expect(
       deriveMealConfirmationReviewPolicy({ ...base, hasPendingMutation: true }).canConfirmMeal,
     ).toBe(false);
+    expect(
+      deriveMealConfirmationReviewPolicy({
+        ...base,
+        items: [{ ...item('one', 'current'), confirmationProof: null }],
+      }).canConfirmMeal,
+    ).toBe(false);
+    expect(
+      deriveMealConfirmationReviewPolicy({
+        ...base,
+        items: [
+          {
+            ...item('legacy', 'current'),
+            origin: 'legacy_unknown',
+            confirmationProof: null,
+          },
+        ],
+      }).canConfirmMeal,
+    ).toBe(true);
   });
 
   test.each([

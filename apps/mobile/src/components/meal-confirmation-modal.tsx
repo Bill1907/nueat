@@ -40,7 +40,6 @@ import {
   decimalToMilliunits,
   formatNutritionValue,
   hasUnsavedMealDraftItemForms,
-  mealCalculationBasisLabel,
   mealUnitLabel,
   nutritionKeys,
 } from '@/meals/meal-draft-policy';
@@ -51,6 +50,8 @@ import {
 import {
   RECOGNITION_MAX_ELAPSED_MS,
   canAddMealDraftItem,
+  createConfirmMealDraftInput,
+  deriveRecognitionRecoveryPolicy,
   isRetakeReason,
   recognitionPollDelay,
   type RecognitionStatus,
@@ -429,6 +430,7 @@ export function MealConfirmationModal({
   }
 
   function retryRecognition() {
+    if (!draftData || !recognitionRecoveryPolicy.canRetryRecognition) return;
     enqueueMutation('recognition', async (scopedMealId, generation) => {
       const response = await retryMealDraftRecognition(scopedMealId);
       if (!isCurrent(scopedMealId, generation)) return;
@@ -439,7 +441,14 @@ export function MealConfirmationModal({
   }
 
   function startManualEntry() {
-    if (!data || !isDraftMealDraftResponse(data)) return;
+    if (
+      !data ||
+      !isDraftMealDraftResponse(data) ||
+      (!recognitionRecoveryPolicy.canStartDirectEntry &&
+        !canOverrideZeroItemRecognition)
+    ) {
+      return;
+    }
     const draftRevision = data.mealLog.draftRevision;
     enqueueMutation('recognition', async (scopedMealId, generation) => {
       const response = await startManualMealDraftEntry(
@@ -459,7 +468,7 @@ export function MealConfirmationModal({
 
     setInvalidatedMappings((current) => {
       const next = new Set(current);
-      if (isFoodMappingCurrent(item.currentResolution)) {
+      if (isFoodMappingCurrent(item)) {
         next.delete(item.id);
       } else {
         next.add(item.id);
@@ -503,34 +512,6 @@ export function MealConfirmationModal({
         setFoodQuery('');
       },
     );
-  }
-
-  function selectResolutionCandidate(item: MealDraftItem, foodId: string) {
-    if (!isEditable || !data) return;
-    enqueueMutation(item.id, async (scopedMealId, generation) => {
-      const food = await getFood(foodId);
-      const response = await mapMealDraftItemFood(
-        scopedMealId,
-        item.id,
-        food.id,
-        item.itemRevision,
-      );
-      if (!isCurrent(scopedMealId, generation)) return;
-      setMappedFoods((current) => ({ ...current, [item.id]: food }));
-      setInvalidatedMappings((current) => {
-        const next = new Set(current);
-        next.delete(item.id);
-        return next;
-      });
-      applyResponse(response, scopedMealId, generation);
-      setForms((current) => ({
-        ...current,
-        [item.id]: {
-          ...current[item.id],
-          recognizedLabel: food.canonicalNameKo,
-        },
-      }));
-    });
   }
 
   function updateForm(itemId: string, update: Partial<ItemForm>) {
@@ -653,8 +634,10 @@ export function MealConfirmationModal({
     draftData !== null &&
     (draftData.mealLog.recognitionStatus === 'ready' ||
       draftData.mealLog.recognitionStatus === 'manual');
-  const canRecoverRecognition =
-    draftData?.mealLog.recognitionStatus === 'failed' || recognitionTimedOut;
+  const recognitionRecoveryPolicy = deriveRecognitionRecoveryPolicy({
+    recovery: draftData?.mealLog.recognitionRecovery,
+    localPollingTimedOut: recognitionTimedOut,
+  });
   const canOverrideZeroItemRecognition =
     draftData?.mealLog.recognitionStatus === 'ready' &&
     draftData.items.length === 0 &&
@@ -674,6 +657,8 @@ export function MealConfirmationModal({
         items: draftData.items.map((item) => ({
           itemId: item.id,
           review: item.review,
+          origin: item.origin,
+          confirmationProof: item.confirmationProof,
         })),
         serverConfirmable: draftData.review.confirmable,
         hasUnsavedChanges: hasUnsavedItemForms || Boolean(manualForm),
@@ -710,26 +695,14 @@ export function MealConfirmationModal({
         if (!draftResponse.review.confirmable) {
           throw new Error('MEAL_REVIEW_REQUIRED');
         }
-        return confirmMealDraft(scopedMealId, {
-          expectedDraftRevision: draftResponse.mealLog.draftRevision,
-          idempotencyKey: randomUUID(),
-          items: draftResponse.items.map((item) => ({
-            itemId: item.id,
-            expectedItemRevision: item.itemRevision,
-            ...(item.currentResolution?.decisionId
-              ? { mappingDecisionId: item.currentResolution.decisionId }
-              : {}),
-            ...(item.currentResolution?.previewId
-              ? { calculationPreviewId: item.currentResolution.previewId }
-              : {}),
-            ...(item.currentResolution?.decompositionRevisionId
-              ? {
-                  decompositionRevisionId:
-                    item.currentResolution.decompositionRevisionId,
-                }
-              : {}),
-          })),
-        });
+        const confirmationInput = createConfirmMealDraftInput(
+          draftResponse,
+          randomUUID(),
+        );
+        if (confirmationInput === null) {
+          throw new Error('MEAL_CONFIRMATION_PROOF_REQUIRED');
+        }
+        return confirmMealDraft(scopedMealId, confirmationInput);
       })
       .then((response) => {
         if (!isCurrent(scopedMealId, generation)) return;
@@ -850,15 +823,11 @@ export function MealConfirmationModal({
             {draftData && <View style={styles.recognition}>
               <ThemedText type="smallBold">인식 결과</ThemedText>
               <ThemedText type="small" themeColor="textSecondary">
-                {draftData.mealLog.recognitionStatus === 'pending' ||
-                draftData.mealLog.recognitionStatus === 'processing'
-                  ? '사진에서 음식을 인식하고 있어요. 완료될 때까지 잠시만 기다려 주세요.'
-                  : `상태: ${draftData.mealLog.recognitionStatus} · 제공자: ${draftData.mealLog.recognitionProvider ?? '알 수 없음'} · 모델: ${draftData.mealLog.recognitionModel ?? '알 수 없음'}`}
+                {recognitionRecoveryPolicy.message}
               </ThemedText>
-              {(draftData.mealLog.recognitionStatus === 'pending' ||
-                draftData.mealLog.recognitionStatus === 'processing') && (
+              {recognitionRecoveryPolicy.showProgress && (
                 <View
-                  accessibilityLabel="AI 음식 인식 진행 중"
+                  accessibilityLabel="음식 인식 진행 중"
                   accessibilityLiveRegion="polite"
                   style={styles.loadingRow}
                 >
@@ -868,31 +837,41 @@ export function MealConfirmationModal({
                   </ThemedText>
                 </View>
               )}
-              {(draftData.mealLog.recognitionStatus === 'pending' ||
-                draftData.mealLog.recognitionStatus === 'processing') &&
-                draftData.mealLog.recognitionNextAttemptAt && (
-                  <ThemedText type="small" themeColor="textSecondary">
-                    다음 확인: {draftData.mealLog.recognitionNextAttemptAt}
-                  </ThemedText>
-                )}
-              {canRecoverRecognition && (
+              {(recognitionRecoveryPolicy.canRetryRecognition ||
+                recognitionRecoveryPolicy.canStartDirectEntry ||
+                recognitionRecoveryPolicy.retryLabel !== null ||
+                recognitionRecoveryPolicy.showRefresh) && (
                 <View style={styles.itemActions}>
-                  <ThemedText accessibilityRole="alert" type="small" style={styles.errorText}>
-                    {recognitionTimedOut
-                      ? '인식 시간이 초과되었습니다. 다시 시도하거나 직접 입력해 주세요.'
-                      : '음식 인식에 실패했습니다. 다시 시도하거나 직접 입력해 주세요.'}
-                  </ThemedText>
-                  <ModalButton
-                    disabled={savingItemId !== null}
-                    label={savingItemId === 'recognition' ? '처리 중' : '인식 다시 시도'}
-                    onPress={() => void retryRecognition()}
-                  />
-                  <ModalButton
-                    disabled={savingItemId !== null}
-                    label="직접 입력"
-                    onPress={() => void startManualEntry()}
-                    secondary
-                  />
+                  {recognitionRecoveryPolicy.showRefresh && (
+                    <ModalButton
+                      disabled={savingItemId !== null}
+                      label="새로고침"
+                      onPress={() => setPollGeneration((current) => current + 1)}
+                      secondary
+                    />
+                  )}
+                  {recognitionRecoveryPolicy.retryLabel !== null && (
+                    <ModalButton
+                      disabled={
+                        savingItemId !== null ||
+                        !recognitionRecoveryPolicy.canRetryRecognition
+                      }
+                      label={
+                        savingItemId === 'recognition'
+                          ? '처리 중'
+                          : recognitionRecoveryPolicy.retryLabel
+                      }
+                      onPress={() => void retryRecognition()}
+                    />
+                  )}
+                  {recognitionRecoveryPolicy.canStartDirectEntry && (
+                    <ModalButton
+                      disabled={savingItemId !== null}
+                      label="직접 입력"
+                      onPress={() => void startManualEntry()}
+                      secondary
+                    />
+                  )}
                 </View>
               )}
               {canOverrideZeroItemRecognition && (
@@ -917,11 +896,11 @@ export function MealConfirmationModal({
               const mappingNeedsReconnect =
                 item.foodId !== null &&
                 (invalidatedMappings.has(item.id) ||
-                  !isFoodMappingCurrent(item.currentResolution));
+                  !isFoodMappingCurrent(item));
               const authorityRecovery = deriveMealItemAuthorityRecovery(item.review);
               const isExpanded =
                 reviewPolicy?.recommendedNextItemId === item.id ||
-                item.currentResolution?.status !== 'resolved' ||
+                !isFoodMappingCurrent(item) ||
                 expandedItemIds.has(item.id);
               if (!isExpanded) {
                 return (
@@ -930,11 +909,6 @@ export function MealConfirmationModal({
                     <ThemedText type="small" themeColor="textSecondary">
                       {form.amount} {mealUnitLabel(form.unit)} · 공식 DB 연결됨
                     </ThemedText>
-                    {item.currentResolution?.composition === 'meal_decomposition' && (
-                      <ThemedText type="small" themeColor="textSecondary">
-                        {mealCalculationBasisLabel(item.currentResolution.composition)}
-                      </ThemedText>
-                    )}
                     <ModalButton
                       disabled={saving}
                       label="수정"
@@ -950,11 +924,6 @@ export function MealConfirmationModal({
               return (
                 <View key={item.id} style={styles.itemCard}>
                   <ThemedText type="smallBold">음식</ThemedText>
-                  {item.currentResolution?.composition === 'meal_decomposition' && (
-                    <ThemedText type="small" themeColor="textSecondary">
-                      이 음식은 완성 음식 영양과 합산하지 않고, {mealCalculationBasisLabel(item.currentResolution.composition)}만 계산합니다.
-                    </ThemedText>
-                  )}
                   <TextInput
                     accessibilityLabel="음식 이름"
                     editable={!saving}
@@ -994,30 +963,6 @@ export function MealConfirmationModal({
                       다시 연결 필요
                     </ThemedText>
                   )}
-                  {(item.currentResolution?.candidates ?? [])
-                    .filter((candidate) => candidate.availability === 'available')
-                    .map((candidate) => (
-                      <Pressable
-                        key={candidate.foodId}
-                        accessibilityLabel={`${candidate.labelKo}, 공식 DB 검색 후보 일치도 ${Math.round(candidate.scoreBps / 100)}퍼센트, 선택`}
-                        accessibilityRole="button"
-                        disabled={saving}
-                        onPress={() =>
-                          selectResolutionCandidate(item, candidate.foodId)
-                        }
-                        style={({ pressed }) => [
-                          styles.foodResult,
-                          (pressed || saving) && styles.pressed,
-                        ]}
-                      >
-                        <ThemedText type="smallBold">
-                          {candidate.labelKo}
-                        </ThemedText>
-                        <ThemedText type="small" themeColor="textSecondary">
-                          공식 DB 검색 후보 · 일치도 {Math.round(candidate.scoreBps / 100)}%
-                        </ThemedText>
-                      </Pressable>
-                    ))}
                   <ModalButton
                     disabled={saving}
                     label={searchOpen ? '음식 검색 닫기' : '한국 음식 DB 검색'}

@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-08-13T08:30:00Z",
+  "classification": "provider_recognition_succeeded",
+  "provider": "openai",
+  "model": "gpt-5.4-mini-2026-03-17",
+  "promptVersion": "meal-recognition-prompt-v3",
+  "schemaVersionName": "meal-recognition-schema-v3",
+  "store": false,
+  "durationMs": 3170,
+  "providerRequestId": "req_b8a225a082bb47599962763518fe5a58",
+  "outcome": "recognized",
+  "observationCount": 4,
+  "privacy": {
+    "containsImageBytes": false,
+    "containsBase64": false,
+    "containsSignedUrl": false,
+    "containsObjectKey": false,
+    "containsEmail": false,
+    "containsCredentials": false,
+    "containsProviderBody": false
+  },
+  "scope": "The configured provider/model accepted the exact uploaded asset through the production adapter contract. This receipt does not identify the coordinator or Railway failure phase."
+}

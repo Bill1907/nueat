@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-08-13T11:35:00Z",
+  "sourceHash": "sha256:00f11c144f8409a5b0ff10f5a53bfa8ac7d657517c9b35395ac71dbc7eba8347",
+  "approvedPlan": {
+    "path": ".gjc/_session-019ff936-0e40-7000-8200-037ac82a6ae5/plans/ralplan/recognition-reliability-20260813/pending-approval.md",
+    "sha256": "80512a1324e4042a379a86f213f63826deb3c1b3ef799e1dc939b4527edd22ea"
+  },
+  "results": {
+    "workspaceTypecheck": "passed",
+    "mobileLint": "passed with zero warnings",
+    "bunTests": {
+      "status": "passed",
+      "tests": 387,
+      "failures": 0,
+      "assertions": 1623,
+      "files": 47
+    },
+    "databaseCheck": "passed",
+    "diffCheck": "passed",
+    "iosProductionBundle": "passed",
+    "migration0024TransactionalParseApplyRollback": "passed against shared schema at migration 23; rollback confirmed",
+    "migration0024PostgresStateMachineRollbackFixture": "passed for workflow, execution, invocation success and terminal immutability; rollback confirmed",
+    "providerProbe": "passed; see artifacts/recognition-provider-probe.json"
+  },
+  "safety": {
+    "productionMigrationApplied": false,
+    "productionBehaviorEnabled": false,
+    "modelChanged": false,
+    "model": "gpt-5.4-mini-2026-03-17",
+    "store": false,
+    "automaticCoordinatorReplayEnabled": false
+  }
+}

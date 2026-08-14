@@ -118,8 +118,50 @@ describe('OpenAIMealRecognizer', () => {
     const refusal = fakeClient({ output: [{ type: 'message', content: [{ type: 'refusal' }] }] });
     await expect(new OpenAIMealRecognizer(refusal.client).recognize({ imageBytes: new Uint8Array([1]), imageContentType: 'image/webp' })).rejects.toMatchObject({ code: 'PROVIDER_REJECTED' });
     const incomplete = fakeClient({ status: 'incomplete' });
-    await expect(new OpenAIMealRecognizer(incomplete.client).recognize({ imageBytes: new Uint8Array([1]), imageContentType: 'image/webp' })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+    await expect(new OpenAIMealRecognizer(incomplete.client).recognize({ imageBytes: new Uint8Array([1]), imageContentType: 'image/webp' })).rejects.toMatchObject({ code: 'PROVIDER_INCOMPLETE' });
     const unavailable: OpenAIResponsesClient = { responses: { async create() { throw { status: 503, message: 'private provider detail' }; } } };
-    await expect(new OpenAIMealRecognizer(unavailable).recognize({ imageBytes: new Uint8Array([1]), imageContentType: 'image/webp' })).rejects.toMatchObject({ code: 'PROVIDER_UNAVAILABLE' });
+    await expect(new OpenAIMealRecognizer(unavailable).recognize({ imageBytes: new Uint8Array([1]), imageContentType: 'image/webp' })).rejects.toMatchObject({ code: 'PROVIDER_SERVER_ERROR' });
+  });
+
+  test('uses the caller-owned abort signal without installing an adapter deadline', async () => {
+    let receivedSignal: AbortSignal | undefined;
+    const client: OpenAIResponsesClient = {
+      responses: {
+        async create(_request, options) {
+          receivedSignal = options?.signal;
+          throw Object.assign(new Error('sensitive upstream text'), { name: 'AbortError' });
+        },
+      },
+    };
+    const controller = new AbortController();
+    await expect(
+      new OpenAIMealRecognizer(client).recognize({
+        imageBytes: new Uint8Array([1]),
+        imageContentType: 'image/jpeg',
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ code: 'PROVIDER_CALL_DEADLINE', phase: 'provider_call' });
+    expect(receivedSignal).toBe(controller.signal);
+  });
+
+  test('maps provider statuses through the closed taxonomy without retaining raw errors', async () => {
+    const cases: Array<[number, string]> = [
+      [408, 'PROVIDER_REQUEST_TIMEOUT'],
+      [409, 'PROVIDER_CONFLICT'],
+      [429, 'PROVIDER_RATE_LIMITED'],
+      [400, 'PROVIDER_REQUEST_INVALID'],
+      [401, 'PROVIDER_AUTH_INVALID'],
+      [418, 'PROVIDER_REJECTED'],
+      [500, 'PROVIDER_SERVER_ERROR'],
+    ];
+    for (const [status, code] of cases) {
+      const client: OpenAIResponsesClient = {
+        responses: { async create() { throw { status, message: 'private provider text' }; } },
+      };
+      await expect(new OpenAIMealRecognizer(client).recognize({
+        imageBytes: new Uint8Array([1]),
+        imageContentType: 'image/jpeg',
+      })).rejects.toMatchObject({ code, phase: 'provider_call' });
+    }
   });
 });

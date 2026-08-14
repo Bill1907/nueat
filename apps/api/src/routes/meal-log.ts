@@ -10,6 +10,7 @@ import {
   mealItems,
   mealLogs,
   recognitionAttempts,
+  recognitionDailyUsages,
   releaseActivations,
   resolutionAttempts,
   storedObservations,
@@ -47,6 +48,7 @@ import {
   classifyMealConfirmationCutover,
   MEAL_CONFIRMATION_SAFE_REVIEW_PROTOCOL,
 } from '../services/meal-confirmation-cutover';
+import { isInRecognitionCohort } from '../services/recognition-cohort';
 import {
   resolveCurrentMealItems,
 } from '../services/meal-item-resolution';
@@ -131,7 +133,66 @@ interface MealLogRouteOptions {
   database: Database;
   recognitionCoordinator: MealRecognitionRunner;
   reviewPolicy: ApiEnvironment['mealRecognition']['reviewPolicy'];
+  recoveryEnabled: boolean;
+  v2OneCallAdmitted: boolean;
+  cohortPercent: number;
+  dailyRecognitionQuota: number;
+  responseReserveMs: number;
+
   mealConfirmationCutover: ApiEnvironment['mealConfirmationCutover'];
+}
+type RecognitionRecoveryPolicy = {
+  enabled: boolean;
+  dailyQuota: number;
+  v2OneCallAdmitted: boolean;
+  cohortPercent: number;
+};
+
+type ResponseDeadlineOutcome = {
+  responseDeadlineAt?: Date;
+};
+
+class ResponseBudgetExhaustedError extends Error {
+  statusCode = 503;
+
+  constructor() {
+    super('Recognition response budget exhausted');
+  }
+}
+
+function assertResponseBudget(
+  responseDeadlineAt: Date | undefined,
+  responseReserveMs: number,
+) {
+  if (
+    responseDeadlineAt &&
+    responseDeadlineAt.getTime() - Date.now() <= responseReserveMs
+  )
+    throw new ResponseBudgetExhaustedError();
+}
+
+async function withinResponseBudget<T>(
+  promise: Promise<T>,
+  responseDeadlineAt: Date | undefined,
+  responseReserveMs: number,
+): Promise<T> {
+  if (!responseDeadlineAt) return promise;
+  const remainingMs = responseDeadlineAt.getTime() - Date.now() - responseReserveMs;
+  if (remainingMs <= 0) throw new ResponseBudgetExhaustedError();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new ResponseBudgetExhaustedError()),
+          remainingMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
@@ -142,7 +203,24 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     database: Database,
     mealLog: any,
     items: any[],
-  ) => buildMealLogResponse(database, mealLog, items, options.reviewPolicy);
+    request?: FastifyRequest,
+    reply?: FastifyReply,
+  ) => {
+    const response = (signal?: AbortSignal) => buildMealLogResponse(database, mealLog, items, options.reviewPolicy, {
+      enabled: options.recoveryEnabled,
+      dailyQuota: options.dailyRecognitionQuota,
+      v2OneCallAdmitted: options.v2OneCallAdmitted,
+      cohortPercent: options.cohortPercent,
+    }, options.recognitionCoordinator, signal, options.responseReserveMs);
+    return request && reply
+      ? withRequestAbortSignal(
+          request,
+          reply,
+          response,
+          () => options.recognitionCoordinator.responseLost?.(mealLog.id, mealLog.userId),
+        )
+      : response();
+  };
   const recognitionResponse = (
     database: Database,
     reply: FastifyReply,
@@ -153,11 +231,15 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       retryAfterSeconds?: number;
       code?: string;
       retryable?: boolean;
+      responseDeadlineAt?: Date;
     },
     createdStatus?: number,
   ) => sendRecognitionResponse(
     database,
     options.reviewPolicy,
+    { enabled: options.recoveryEnabled, dailyQuota: options.dailyRecognitionQuota, v2OneCallAdmitted: options.v2OneCallAdmitted, cohortPercent: options.cohortPercent },
+    options.recognitionCoordinator,
+    options.responseReserveMs,
     reply,
     mealLog,
     items,
@@ -173,6 +255,8 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
   ) => sendStaleMealResponse(
     database,
     options.reviewPolicy,
+    { enabled: options.recoveryEnabled, dailyQuota: options.dailyRecognitionQuota, v2OneCallAdmitted: options.v2OneCallAdmitted, cohortPercent: options.cohortPercent },
+    options.recognitionCoordinator,
     reply,
     request,
     code,
@@ -199,17 +283,17 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       userId,
     );
     if (existing) {
-      const outcome = await options.recognitionCoordinator.recognize(
+      const outcome = await withRequestAbortSignal(request, reply, (signal) => options.recognitionCoordinator.recognize(
         existing.id,
         userId,
-      );
-      const current = await findOwnedMealLog(options.database, existing.id, userId);
-      if (!current) return mealLogNotFound(reply, request);
+        'initial',
+        signal,
+      ), () => options.recognitionCoordinator.responseLost?.(existing.id, userId));
       return recognitionResponse(
         options.database,
         reply,
-        current,
-        await findMealItems(options.database, current.id),
+        existing,
+        [],
         outcome,
       );
     }
@@ -250,24 +334,26 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         userId,
       );
       if (!concurrent) return imageUnavailable(reply, request);
-      const outcome = await options.recognitionCoordinator.recognize(
+      const outcome = await withRequestAbortSignal(request, reply, (signal) => options.recognitionCoordinator.recognize(
         concurrent.id,
         userId,
-      );
-      const current = await findOwnedMealLog(options.database, concurrent.id, userId);
-      if (!current) return mealLogNotFound(reply, request);
+        'initial',
+        signal,
+      ), () => options.recognitionCoordinator.responseLost?.(concurrent.id, userId));
       return recognitionResponse(
         options.database,
         reply,
-        current,
-        await findMealItems(options.database, current.id),
+        concurrent,
+        [],
         outcome,
       );
     }
-    const outcome = await options.recognitionCoordinator.recognize(mealLog.id, userId);
-    const current = await findOwnedMealLog(options.database, mealLog.id, userId);
-    if (!current) return mealLogNotFound(reply, request);
-    return recognitionResponse(options.database, reply, current, await findMealItems(options.database, current.id), outcome, 201);
+    const outcome = await withRequestAbortSignal(
+      request, reply,
+      (signal) => options.recognitionCoordinator.recognize(mealLog.id, userId, 'initial', signal),
+      () => options.recognitionCoordinator.responseLost?.(mealLog.id, userId),
+    );
+    return recognitionResponse(options.database, reply, mealLog, [], outcome, 201);
   });
 
   app.get('/api/meal-logs/:mealLogId', async (request, reply) => {
@@ -281,7 +367,6 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       userId,
     );
     if (!mealLog) return mealLogNotFound(reply, request);
-    const items = await findMealItems(options.database, mealLog.id);
     if (mealLog.status === 'confirmed') {
       const [snapshot] = await options.database
         .select(calculationSnapshotSelection)
@@ -303,7 +388,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       }
       return response;
     }
-    return await mealLogResponse(options.database, mealLog, items);
+    return await mealLogResponse(options.database, mealLog, [], request, reply);
   });
 
   app.patch('/api/meal-logs/:mealLogId', async (request, reply) => {
@@ -358,7 +443,7 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       });
     }
     const items = await findMealItems(options.database, mealLog.id);
-    return await mealLogResponse(options.database, mealLog, items);
+    return await mealLogResponse(options.database, mealLog, items, request, reply);
   });
 
   app.post('/api/meal-logs/:mealLogId/items', async (request, reply) => {
@@ -1630,28 +1715,47 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     if (!params.success) return invalidRequest(reply, request);
     const existing = await findOwnedMealLog(options.database, params.data.mealLogId, userId);
     if (!existing) return mealLogNotFound(reply, request);
+    if (existing.recognitionStatus === 'failed') {
+      const recovery = await recognitionRecoveryResponse(
+        options.database,
+        existing,
+        options.dailyRecognitionQuota,
+        options.recoveryEnabled,
+        options.v2OneCallAdmitted,
+        options.cohortPercent,
+      );
+      if (recovery.mode !== 'retry_now') {
+        return reply.status(200).send(
+          await buildMealLogResponse(
+            options.database,
+            existing,
+            await findMealItems(options.database, existing.id),
+            options.reviewPolicy,
+            { enabled: options.recoveryEnabled, dailyQuota: options.dailyRecognitionQuota, v2OneCallAdmitted: options.v2OneCallAdmitted, cohortPercent: options.cohortPercent },
+            options.recognitionCoordinator,
+          ),
+        );
+      }
+      const outcome = await withRequestAbortSignal(request, reply, (signal) => options.recognitionCoordinator.recognize(
+        existing.id,
+        userId,
+        'user_recovery',
+        signal,
+      ), () => options.recognitionCoordinator.responseLost?.(existing.id, userId));
+      return recognitionResponse(
+        options.database,
+        reply,
+        existing,
+        [],
+        outcome,
+      );
+    }
     if (
       existing.status !== 'draft' ||
       existing.recognitionStatus === 'manual' ||
       existing.recognitionStatus === 'processing' ||
-      (existing.recognitionStatus === 'failed' && !existing.recognitionNextAttemptAt)
-    )
-      return invalidMealLogState(reply, request);
-    if (existing.recognitionStatus === 'failed') {
-      const [advanced] = await options.database
-        .update(mealLogs)
-        .set({ recognitionNextAttemptAt: new Date(), updatedAt: new Date() })
-        .where(
-          and(
-            eq(mealLogs.id, existing.id),
-            eq(mealLogs.userId, userId),
-            eq(mealLogs.status, 'draft'),
-            eq(mealLogs.recognitionStatus, 'failed'),
-          ),
-        )
-        .returning({ id: mealLogs.id });
-      if (!advanced) return invalidMealLogState(reply, request);
-    }
+      existing.recognitionStatus === 'pending'
+    ) return invalidMealLogState(reply, request);
     if (existing.recognitionStatus === 'ready' && existing.recognitionResult?.version === 3) {
       const [observation] = await options.database.select({ id: storedObservations.id })
         .from(storedObservations).where(eq(storedObservations.mealLogId, existing.id)).limit(1);
@@ -1663,10 +1767,13 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
           eq(resolutionAttempts.status, 'failed'),
         ));
     }
-    const outcome = await options.recognitionCoordinator.recognize(existing.id, userId);
-    const mealLog = await findOwnedMealLog(options.database, existing.id, userId);
-    if (!mealLog) return mealLogNotFound(reply, request);
-    return recognitionResponse(options.database, reply, mealLog, await findMealItems(options.database, mealLog.id), outcome);
+    // A stored observation is resolved only; this path never invokes a provider.
+    const outcome = await withRequestAbortSignal(
+      request, reply,
+      (signal) => options.recognitionCoordinator.recognize(existing.id, userId, 'initial', signal),
+      () => options.recognitionCoordinator.responseLost?.(existing.id, userId),
+    );
+    return recognitionResponse(options.database, reply, existing, [], outcome);
   });
 
   app.post('/api/meal-logs/:mealLogId/recognition/manual', async (request, reply) => {
@@ -1811,26 +1918,18 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
 async function sendRecognitionResponse(
   database: Database,
   reviewPolicy: ApiEnvironment['mealRecognition']['reviewPolicy'],
+  recoveryPolicy: RecognitionRecoveryPolicy,
+  recognitionCoordinator: MealRecognitionRunner,
+  responseReserveMs: number,
   reply: FastifyReply,
   mealLog: NonNullable<Awaited<ReturnType<typeof findOwnedMealLog>>>,
   items: Awaited<ReturnType<typeof findMealItems>>,
-  outcome: { status: 'ready' | 'active' | 'unavailable'; retryAfterSeconds?: number; code?: string; retryable?: boolean },
+  outcome: { status: 'ready' | 'active' | 'unavailable'; retryAfterSeconds?: number; code?: string; retryable?: boolean; responseDeadlineAt?: Date },
   createdStatus?: number,
 ) {
-  const recognitionOutcome = {
-    status: outcome.status,
-    ...(outcome.status === 'active'
-      ? { retryAfterSeconds: outcome.retryAfterSeconds ?? 1 }
-      : outcome.status === 'unavailable'
-        ? { code: outcome.code ?? 'RECOGNITION_UNAVAILABLE', retryable: outcome.retryable ?? false }
-        : {}),
-  };
   if (outcome.status === 'active') {
     reply.header('Retry-After', String(outcome.retryAfterSeconds ?? 1));
-    return reply.status(202).send({
-      ...(await buildMealLogResponse(database, mealLog, items, reviewPolicy)),
-      recognitionOutcome,
-    });
+    return reply.status(202).send(await buildMealLogResponse(database, mealLog, items, reviewPolicy, recoveryPolicy, recognitionCoordinator, undefined, responseReserveMs, outcome.responseDeadlineAt));
   }
   if (
     outcome.status === 'unavailable' &&
@@ -1846,14 +1945,27 @@ async function sendRecognitionResponse(
       },
     });
   }
-  return reply.status(createdStatus ?? 200).send({
-    ...(await buildMealLogResponse(database, mealLog, items, reviewPolicy)),
-    recognitionOutcome,
-  });
+  if (outcome.status === 'unavailable') {
+    reply.header('Retry-After', String(outcome.retryAfterSeconds ?? 60));
+    return reply.status(503).send({
+      error: {
+        code: outcome.code === 'CLAIM_UNAVAILABLE' ? 'CLAIM_UNAVAILABLE' : 'RECOGNITION_UNAVAILABLE',
+        message: '인식 서비스를 일시적으로 사용할 수 없습니다.',
+        requestId: reply.request.id,
+      },
+      mealLog: await buildMealLogResponse(
+        database, mealLog, items, reviewPolicy, recoveryPolicy, recognitionCoordinator, undefined, responseReserveMs, outcome.responseDeadlineAt,
+      ),
+    });
+  }
+  return reply.status(createdStatus ?? 200).send(
+    await buildMealLogResponse(database, mealLog, items, reviewPolicy, recoveryPolicy, recognitionCoordinator, undefined, responseReserveMs, outcome.responseDeadlineAt),
+  );
 }
 
 const mealLogSelection = {
   id: mealLogs.id,
+  userId: mealLogs.userId,
   eatenAt: mealLogs.eatenAt,
   timezone: mealLogs.eatenTimezone,
   localDate: mealLogs.eatenLocalDate,
@@ -2099,7 +2211,43 @@ async function projectCurrentItemAuthority(
     item.origin === 'model_estimate' && item.recognitionRegionIndex !== null
       ? observationLocalId(observation?.canonicalContent, item.recognitionRegionIndex)
       : `manual:${item.id}`;
-  if (!observation || !localObservationId) return nullAuthority(item.id);
+  if (!observation) {
+    if (item.foodId === null || item.origin === 'model_estimate')
+      return nullAuthority(item.id);
+    const resolutions = await resolveCurrentMealItems(database, [item]);
+    const resolution = resolutions[0];
+    const gramsMg = item.gramsMg ??
+      (item.unit === 'g'
+        ? item.amountMilliunits
+        : resolution?.serving
+          ? servingAmountToGrams(
+              item.amountMilliunits,
+              resolution.serving.amountMilliunits,
+              resolution.serving.gramsMg,
+            )
+          : null);
+    if (!gramsMg) return nullAuthority(item.id, 'STALE_AUTHORITY');
+    return projectMealItemAuthority(catalogEligibilityAdapter(database), {
+      item: {
+        id: item.id,
+        revision: item.itemRevision,
+        foodId: item.foodId,
+        amountMilliunits: item.amountMilliunits,
+        unit: item.unit,
+        gramsMg,
+      },
+      activation: active,
+      mapping: { method: 'manual', decisionId: null, contentSha256: null },
+      calculation: {
+        version: 'meal-nutrition-v1',
+        previewId: null,
+        previewSha256: null,
+        mealDecompositionRevisionId: null,
+        mealDecompositionSha256: null,
+      },
+    });
+  }
+  if (!localObservationId) return nullAuthority(item.id);
   const mappings = await database
     .select({
       id: mappingDecisions.id,
@@ -2265,24 +2413,297 @@ async function mealLogStateOrNotFound(
     : mealLogNotFound(reply, request);
 }
 
+type RecognitionRecovery =
+  | { mode: 'none'; reason: 'in_progress' | 'recognition_complete' | 'not_applicable'; retryAt: null }
+  | { mode: 'retry_now'; reason: 'recoverable_failure'; retryAt: null }
+  | { mode: 'retry_after'; reason: 'cooldown' | 'daily_quota'; retryAt: string }
+  | { mode: 'manual_only'; reason: 'asset_unavailable' | 'recovery_exhausted' | 'terminal_failure'; retryAt: null };
+
+function publicInitialAssessment(value: unknown): unknown {
+  if (!value || typeof value !== 'object') return null;
+  const assessment = value as Record<string, unknown>;
+  const productKeys = [
+    'rawLabel', 'normalizedLabel', 'foodConfidenceBps', 'portionConfidenceBps',
+    'foodCandidateMarginBps', 'questions', 'alternatives', 'initialMappingSource',
+    'initialMatchedLabel', 'initialFoodId', 'initialNutrientProfileId',
+  ] as const;
+  const result: Record<string, unknown> = {};
+  for (const key of productKeys) {
+    if (assessment[key] !== undefined) result[key] = publicAssessmentValue(assessment[key]);
+  }
+  return result;
+}
+
+function publicAssessmentValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(publicAssessmentValue);
+  if (!value || typeof value !== 'object') return value;
+  const source = value as Record<string, unknown>;
+  const allowed = ['label', 'rawLabel', 'normalizedLabel', 'confidenceBps', 'foodConfidenceBps', 'portionConfidenceBps', 'amountMilliunits', 'unit', 'question', 'answer', 'reason'] as const;
+  const result: Record<string, unknown> = {};
+  for (const key of allowed) {
+    if (source[key] !== undefined) result[key] = publicAssessmentValue(source[key]);
+  }
+  return result;
+}
+
+async function withRequestAbortSignal<T>(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  operation: (signal: AbortSignal) => Promise<T>,
+  responseLost?: () => Promise<void> | undefined,
+) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const abortIfIncomplete = () => {
+    if (request.raw.aborted || !request.raw.complete) abort();
+  };
+  const cleanupLifecycle = observeResponseLifecycle(
+    reply.raw,
+    () => {
+      abort();
+      void responseLost?.();
+    },
+  );
+  request.raw.once('aborted', abort);
+  request.raw.once('close', abortIfIncomplete);
+  try {
+    return await operation(controller.signal);
+  } finally {
+    request.raw.removeListener('aborted', abort);
+    request.raw.removeListener('close', abortIfIncomplete);
+    // Keep reply observation active until Fastify delivers or loses the response.
+    if (reply.sent) cleanupLifecycle();
+  }
+}
+
+type ResponseLifecycleEmitter = {
+  once(event: 'finish' | 'close', listener: () => void): unknown;
+  removeListener(event: 'finish' | 'close', listener: () => void): unknown;
+};
+
+export function observeResponseLifecycle(
+  reply: ResponseLifecycleEmitter,
+  responseLost: () => void,
+) {
+  let finished = false;
+  let closed = false;
+  const cleanup = () => {
+    reply.removeListener('finish', finish);
+    reply.removeListener('close', close);
+  };
+  const finish = () => {
+    finished = true;
+    cleanup();
+  };
+  const close = () => {
+    if (!finished && !closed) responseLost();
+    closed = true;
+    cleanup();
+  };
+  reply.once('finish', finish);
+  reply.once('close', close);
+  return cleanup;
+}
+
+/**
+ * This is deliberately projected from durable state rather than coordinator
+ * outcomes: a dropped HTTP response must not alter the recovery contract.
+ */
+async function recognitionRecoveryResponse(
+  database: Database,
+  mealLog: {
+    id: string;
+    userId?: string;
+    status: string;
+    recognitionStatus: string;
+    imageAssetId: string | null;
+  },
+  dailyQuota = 20,
+  recoveryEnabled = false,
+  v2OneCallAdmitted = false,
+  cohortPercent = 0,
+): Promise<RecognitionRecovery> {
+  if (mealLog.status !== 'draft' || mealLog.recognitionStatus === 'manual') {
+    return { mode: 'none', reason: 'not_applicable', retryAt: null };
+  }
+  if (mealLog.recognitionStatus === 'ready') {
+    return { mode: 'none', reason: 'recognition_complete', retryAt: null };
+  }
+  if (mealLog.recognitionStatus === 'pending' || mealLog.recognitionStatus === 'processing') {
+    return { mode: 'none', reason: 'in_progress', retryAt: null };
+  }
+  if (mealLog.recognitionStatus !== 'failed' || !mealLog.imageAssetId) {
+    return { mode: 'manual_only', reason: 'terminal_failure', retryAt: null };
+  }
+  if (
+    !recoveryEnabled ||
+    !v2OneCallAdmitted ||
+    !mealLog.userId ||
+    !isInRecognitionCohort(mealLog.userId, cohortPercent)
+  ) return { mode: 'manual_only', reason: 'terminal_failure', retryAt: null };
+
+  const [[observation], [asset], [workflow]] = await Promise.all([
+    database.select({ id: storedObservations.id }).from(storedObservations)
+      .where(eq(storedObservations.mealLogId, mealLog.id)).limit(1),
+    database.select({
+      userId: imageAssets.userId,
+      status: imageAssets.status,
+      purpose: imageAssets.purpose,
+      expiresAt: imageAssets.expiresAt,
+      byteSize: imageAssets.byteSize,
+      detectedContentType: imageAssets.detectedContentType,
+      sha256: imageAssets.sha256,
+    }).from(imageAssets).where(eq(imageAssets.id, mealLog.imageAssetId)).limit(1),
+    database.select({
+      imageAssetId: recognitionAttempts.imageAssetId,
+      userGrantState: recognitionAttempts.userGrantState,
+      nextAttemptAt: recognitionAttempts.nextAttemptAt,
+      lastErrorCode: recognitionAttempts.lastErrorCode,
+    }).from(recognitionAttempts).where(eq(recognitionAttempts.mealLogId, mealLog.id)).limit(1),
+  ]);
+  if (observation) return { mode: 'none', reason: 'recognition_complete', retryAt: null };
+  const usableAsset =
+    asset &&
+    asset.userId === mealLog.userId &&
+    asset.purpose === 'inference' &&
+    asset.status === 'processed' &&
+    asset.expiresAt !== null &&
+    asset.expiresAt.getTime() > Date.now() &&
+    asset.byteSize !== null &&
+    asset.byteSize > 0 &&
+    asset.detectedContentType !== null &&
+    ['image/jpeg', 'image/png', 'image/webp'].includes(asset.detectedContentType) &&
+    asset.sha256 !== null;
+  if (!usableAsset) return { mode: 'manual_only', reason: 'asset_unavailable', retryAt: null };
+  // Historical drafts predate durable workflows. Core creates an equivalent,
+  // asset-bound v2 workflow atomically when the user submits recovery.
+  if (!workflow) {
+    return { mode: 'retry_now', reason: 'recoverable_failure', retryAt: null };
+  }
+  if (
+    workflow.imageAssetId !== undefined &&
+    workflow.imageAssetId !== mealLog.imageAssetId
+  ) {
+    return { mode: 'manual_only', reason: 'terminal_failure', retryAt: null };
+  }
+  if (workflow.userGrantState !== 'available') {
+    return { mode: 'manual_only', reason: 'recovery_exhausted', retryAt: null };
+  }
+  const day = new Date().toISOString().slice(0, 10);
+  const [usage] = await database.select({ attemptCount: recognitionDailyUsages.attemptCount })
+    .from(recognitionDailyUsages)
+    .where(and(
+      eq(recognitionDailyUsages.userId, mealLog.userId!),
+      eq(recognitionDailyUsages.attemptDate, day),
+    ))
+    .limit(1);
+  // The route uses the configured public quota projection before claiming a
+  // user execution. Core repeats this check atomically at reservation.
+  if (usage && usage.attemptCount >= dailyQuota) {
+    const tomorrow = new Date();
+    tomorrow.setUTCDate(tomorrow.getUTCDate() + 1);
+    tomorrow.setUTCHours(0, 0, 0, 0);
+    return { mode: 'retry_after', reason: 'daily_quota', retryAt: tomorrow.toISOString() };
+  }
+  const retryAt = workflow.nextAttemptAt;
+  if (retryAt && retryAt.getTime() > Date.now()) {
+    return {
+      mode: 'retry_after',
+      reason: workflow.lastErrorCode === 'DAILY_QUOTA_RESERVED' ? 'daily_quota' : 'cooldown',
+      retryAt: retryAt.toISOString(),
+    };
+  }
+  const terminalCodes = new Set([
+    'ASSET_MISMATCH',
+    'ASSET_TYPE_INVALID',
+    'PROVIDER_REQUEST_INVALID',
+    'PROVIDER_AUTH_INVALID',
+    'PROVIDER_REJECTED',
+    'PERSISTENCE_UNAVAILABLE',
+    'INTEGRITY_FAILURE',
+    'CONFIG_INVALID',
+    'AUTH_INVALID',
+    'REQUEST_INVALID',
+    'PROCESS_OUTCOME_UNKNOWN',
+  ]);
+  if (workflow.lastErrorCode && terminalCodes.has(workflow.lastErrorCode)) {
+    return { mode: 'manual_only', reason: 'terminal_failure', retryAt: null };
+  }
+  return { mode: 'retry_now', reason: 'recoverable_failure', retryAt: null };
+}
+
 async function buildMealLogResponse(
   database: Database,
   mealLog: any,
   items: any[],
   _reviewPolicy: ApiEnvironment['mealRecognition']['reviewPolicy'],
+  recoveryPolicy: RecognitionRecoveryPolicy = {
+    enabled: false, dailyQuota: 20, v2OneCallAdmitted: false, cohortPercent: 0,
+  },
+  recognitionCoordinator?: MealRecognitionRunner,
+  signal?: AbortSignal,
+  responseReserveMs = 0,
+  initialResponseDeadlineAt?: Date,
 ) {
-  const resolutions = await resolveCurrentMealItems(database, items);
-  const resolutionByItemId = new Map(resolutions.map((resolution) => [resolution.itemId, resolution]));
-  const authorities = await Promise.all(
-    items.map((item) => projectCurrentItemAuthority(database, item)),
+  const runner = recognitionCoordinator;
+  let responseDeadlineAt = initialResponseDeadlineAt;
+  if (runner && mealLog.userId) {
+    // Immediate outcomes supply their durable deadline. GET obtains exactly
+    // one from reconciliation before any response-state reload.
+    if (!responseDeadlineAt) {
+      const outcome = await runner.reconcile(mealLog.id, mealLog.userId, signal);
+      responseDeadlineAt = (outcome as ResponseDeadlineOutcome).responseDeadlineAt;
+    }
+    assertResponseBudget(responseDeadlineAt, responseReserveMs);
+    mealLog = await withinResponseBudget(
+      findOwnedMealLog(database, mealLog.id, mealLog.userId),
+      responseDeadlineAt,
+      responseReserveMs,
+    ) ?? mealLog;
+    items = await withinResponseBudget(
+      findMealItems(database, mealLog.id),
+      responseDeadlineAt,
+      responseReserveMs,
+    );
+    assertResponseBudget(responseDeadlineAt, responseReserveMs);
+  }
+  const recognitionRecovery = await withinResponseBudget(
+    recognitionRecoveryResponse(
+      database,
+      mealLog,
+      recoveryPolicy.dailyQuota,
+      recoveryPolicy.enabled,
+      recoveryPolicy.v2OneCallAdmitted,
+      recoveryPolicy.cohortPercent,
+    ),
+    responseDeadlineAt,
+    responseReserveMs,
   );
+  const resolutions = await withinResponseBudget(
+    resolveCurrentMealItems(database, items),
+    responseDeadlineAt,
+    responseReserveMs,
+  );
+  assertResponseBudget(responseDeadlineAt, responseReserveMs);
+  const resolutionByItemId = new Map(resolutions.map((resolution) => [resolution.itemId, resolution]));
+  const authorities = await withinResponseBudget(
+    Promise.all(items.map((item) => projectCurrentItemAuthority(database, item))),
+    responseDeadlineAt,
+    responseReserveMs,
+  );
+  assertResponseBudget(responseDeadlineAt, responseReserveMs);
   const authorityByItemId = new Map(
     authorities.map((authority) => [authority.itemId, authority]),
   );
   const isV3Recognition = mealLog.recognitionResult?.version === 3;
   const resolutionMetadata = isV3Recognition
-    ? await loadResolutionMetadata(database, mealLog.id, items)
+    ? await withinResponseBudget(
+      loadResolutionMetadata(database, mealLog.id, items),
+      responseDeadlineAt,
+      responseReserveMs,
+    )
     : emptyResolutionMetadata();
+  assertResponseBudget(responseDeadlineAt, responseReserveMs);
   const recognition = (
     isRecognitionResultV2(mealLog.recognitionResult) ||
     isRecognitionResultV3(mealLog.recognitionResult)
@@ -2291,16 +2712,6 @@ async function buildMealLogResponse(
     : null;
   const responseItems = items.map((item) => {
     const resolution = resolutionByItemId.get(item.id);
-    const hardReasons = resolution?.reason ? [resolverReasonToReviewReason(resolution.reason)] : [];
-    const currentResolution = {
-      mappingSource: item.currentResolutionSource,
-      foodId: resolution?.food?.id ?? null,
-      nutrientProfileId: resolution?.profile?.id ?? null,
-      hardReasons,
-      requiresServingConversion: item.unit !== 'g',
-      hasTrustedServingConversion: item.unit === 'g' || !!resolution?.serving,
-      hasCoreNutrients: !!resolution?.profile,
-    };
     const authority = authorityByItemId.get(item.id)!;
     const reviewed =
       authority.fingerprint !== null &&
@@ -2328,26 +2739,19 @@ async function buildMealLogResponse(
     });
     return {
       ...item,
-      initialAssessment: item.initialEstimateAssessment ?? null,
-      currentResolution: {
-        status: resolution?.reason === null ? 'resolved' as const : 'unresolved' as const,
-        reason: resolution?.reason === null
-          ? null
-          : resolverReasonToReviewReason(resolution?.reason ?? 'MISSING_MAPPING'),
-        raw: item.initialEstimateAssessment?.rawLabel ?? item.recognizedLabel,
-        matched: item.initialEstimateAssessment?.initialMatchedLabel ?? null,
-        canonical: resolution?.food?.canonicalNameKo ?? null,
-        food: resolution?.food ?? null,
-        profile: resolution?.profile ?? null,
-        serving: resolution?.serving ?? null,
-      },
+      initialAssessment: publicInitialAssessment(item.initialEstimateAssessment),
       checkpoint,
     };
   });
   const mealCheckpoint = deriveMealConfirmability({
     items: responseItems.map((item) => item.checkpoint),
   });
-  const preview = await calculateResolvedMealNutrition(database, items, resolutions);
+  const preview = await withinResponseBudget(
+    calculateResolvedMealNutrition(database, items, resolutions),
+    responseDeadlineAt,
+    responseReserveMs,
+  );
+  assertResponseBudget(responseDeadlineAt, responseReserveMs);
   const nutritionPreview = 'details' in preview
     ? null
     : nutritionPreviewResponse(preview.nutrition, resolutionByItemId);
@@ -2421,23 +2825,15 @@ async function buildMealLogResponse(
         },
         nextAction: reviewed ? null : 'review_item',
       },
-      currentResolution: {
-        status: item.currentResolution.status,
-        reason: item.currentResolution.reason,
-        observationId: metadata?.observationId ?? null,
-        decisionId: metadata?.decisionId ?? null,
-        previewId: metadata?.previewId ?? null,
-        decompositionRevisionId: metadata?.decompositionRevisionId ?? null,
-        composition: metadata?.decompositionRevisionId
-          ? 'meal_decomposition'
-          : metadata?.previewId
-            ? 'finished_profile'
-            : null,
-        resolutionStatus: metadata?.resolutionStatus ?? null,
-        resolutionReason: metadata?.resolutionReason ?? null,
-        resolutionRetryAt: metadata?.resolutionRetryAt ?? null,
-        candidates: metadata?.candidates ?? [],
-      },
+      confirmationProof: metadata?.decisionId && metadata.previewId
+        ? {
+            mappingDecisionId: metadata.decisionId,
+            calculationPreviewId: metadata.previewId,
+            ...(metadata.decompositionRevisionId
+              ? { decompositionRevisionId: metadata.decompositionRevisionId }
+              : {}),
+          }
+        : null,
     };
   });
   const reviewedNutrition = reviewedNutritionSummary(items, authorityByItemId);
@@ -2451,37 +2847,13 @@ async function buildMealLogResponse(
       status: mealLog.status,
       imageAssetId: mealLog.imageAssetId,
       recognitionStatus: mealLog.recognitionStatus,
-      recognitionProvider: mealLog.recognitionProvider,
-      recognitionModel: mealLog.recognitionModel,
-      recognitionPromptVersion: mealLog.recognitionPromptVersion,
-      recognitionSchemaVersion: mealLog.recognitionSchemaVersion,
-      recognitionCompletedAt: mealLog.recognitionCompletedAt,
-      recognitionLastErrorCode: mealLog.recognitionLastErrorCode,
-      recognitionAttemptCount: mealLog.recognitionAttemptCount,
-      recognitionNextAttemptAt: mealLog.recognitionNextAttemptAt,
       draftRevision: mealLog.draftRevision,
       confirmedAt: mealLog.confirmedAt,
       recognitionOutcome: recognition?.outcome ?? null,
       recognitionEvidenceReason: recognition?.outcome === 'insufficient_evidence'
         ? recognition.evidenceReason ?? null
         : null,
-      recognitionManualOverride: mealLog.recognitionManualOverride
-        ? {
-            decision: mealLog.recognitionManualOverride.decision,
-            decisionVersion: mealLog.recognitionManualOverride.decisionVersion,
-            fromStatus: mealLog.recognitionManualOverride.fromStatus,
-            fromOutcome: mealLog.recognitionManualOverride.fromOutcome,
-            fromErrorCode: mealLog.recognitionManualOverride.fromErrorCode,
-            expectedDraftRevision: mealLog.recognitionManualOverride.expectedDraftRevision,
-            actorUserId: mealLog.recognitionManualOverride.actorUserId,
-            decidedAt: mealLog.recognitionManualOverride.decidedAt,
-            changedFields: mealLog.recognitionManualOverride.changedFields,
-          }
-        : null,
-      observationId: resolutionMetadata.observationId,
-      resolutionStatus: resolutionMetadata.status,
-      resolutionReason: resolutionMetadata.reason,
-      resolutionRetryAt: resolutionMetadata.retryAt,
+      recognitionRecovery,
     },
     items: publicItems,
     recommendedNextItemId:
@@ -3040,7 +3412,10 @@ async function revalidateConfirmationResolutionTuples(
     return {
       details,
       previewsByItemId,
-      stale: roots.length > 0,
+      // Legacy/manual drafts predate immutable V3 roots. Their persisted
+      // food/profile authority remains guarded by review fingerprints and
+      // unknown-nutrition checks in the normal confirmation path.
+      stale: false,
     };
   }
   const [active] = await database
@@ -3635,6 +4010,8 @@ function imageUnavailable(reply: FastifyReply, request: FastifyRequest) {
 async function sendStaleMealResponse(
   database: Database,
   reviewPolicy: ApiEnvironment['mealRecognition']['reviewPolicy'],
+  recoveryPolicy: RecognitionRecoveryPolicy,
+  recognitionCoordinator: MealRecognitionRunner,
   reply: FastifyReply,
   request: FastifyRequest,
   code: 'MEAL_DRAFT_STALE' | 'MEAL_ITEM_STALE',
@@ -3648,6 +4025,8 @@ async function sendStaleMealResponse(
         mealLog as Record<string, any>,
         items as Array<Record<string, any>>,
         reviewPolicy,
+        recoveryPolicy,
+        recognitionCoordinator,
       )
     : latest;
   return reply.status(409).send({

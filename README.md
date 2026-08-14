@@ -75,6 +75,16 @@ Every review or confirmation mutation requires `X-NUEAT-Meal-Confirmation-Protoc
 
 Follow this order exactly: bridge → operator-approved `0022_meal_confirmation_safe_review` → safe maintenance/normal → soak → separately approved `0023_remove_obsolete_meal_review`. Deploy the bridge first. An operator then reviews and runs only `bun run db:migrate:0022`; migration is never automatic. Use `safe_review_maintenance` for the protected cutover checks, return to `normal` only after those checks pass, and soak the normal path before a separate operator approval and `bun run db:migrate:0023`. Do not use a broad or nonexistent `migrate-all` command.
 
+### Recognition-reliability expansion runbook
+
+Migration `0024_recognition_reliability` is additive and must be applied with the guarded `bun run db:migrate:0024` target, first against an isolated Neon branch copied from migration 23. Before approval, run the rollback-only isolated fixture command exactly as `bun run --cwd packages/database db:validate:recognition-reliability`. It verifies the Neon control-plane target is an allowlisted, ready, direct, non-pooled isolated branch, then migrates and exercises fixtures in one transaction that always rolls back. Do not run this command against production.
+
+The database `.env.local` must provide `DATABASE_URL`, `NUEAT_DATABASE_ENVIRONMENT=isolated_neon_branch`, `NUEAT_NEON_PROJECT_ID`, `NUEAT_NEON_BRANCH_ID`, `NUEAT_ALLOWED_NEON_BRANCH_IDS`, `NUEAT_PRODUCTION_NEON_PROJECT_ID`, `NUEAT_PRODUCTION_NEON_BRANCH_ID`, and `NEON_API_KEY`; use the redacted names in `packages/database/.env.example`, never production credentials in docs or receipts. Verify legacy reads drain, concurrent execution/invocation ordinals, terminal immutability, and the `recognition_reliability_v2` capability/readiness marker before production approval. Production recognition remains disabled during migration and mixed-version rollout. A production guarded migration also requires approved `NUEAT_PRODUCTION_OVERRIDE_TOKEN`, `NUEAT_PRODUCTION_OVERRIDE_ACTOR`, and `NUEAT_PRODUCTION_CHANGE_REFERENCE`; retain the guard's hashed override audit receipt and approval reference, never the token.
+
+After production migration, deploy every replica with `RECOGNITION_RELIABILITY_PROTOCOL_MODE=legacy_observe` and `RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY=true`; do not claim complete receipts until Railway confirms no legacy replica remains. User recovery remains disabled while measuring the existing baseline. SDK retry behavior is owned by the selected protocol mode; there is no independent retry toggle. Promote only to `v2_one_call` after the deadline, privacy, readiness, and non-inferiority gates pass. `v2_auto_retry` requires separately recorded admission evidence and is not part of the initial repair.
+
+Rollback order is user recovery off → `RECOGNITION_RELIABILITY_KILL_SWITCH=true` → protocol `disabled` → wait for active executions to drain/expire → compatible binary rollback. Only after the kill switch and disabled readiness receipt may an operator select `legacy_observe`; never return to a legacy writer while recognition is enabled, delete additive receipts, or reset counters. Operator receipts must contain only deployment IDs, isolated/production branch identity, migration target, capability/readiness status, approval/change reference and hashed override audit, bounded phase/code counts, aggregate latency, and rollback/drain timestamps; never include image bytes, base64, signed URLs, object keys, email, credentials, or raw provider messages.
+
 The Expo client gates product routes behind the session, stores native auth cookies in SecureStore, restores sessions on launch, and provides email entry, six-digit OTP, 60-second resend cooldown, three-attempt UX, and logout. `EXPO_PUBLIC_API_URL` is public configuration and defaults to `https://api-nueat.boseong.dev`; never place secrets in an `EXPO_PUBLIC_*` variable.
 
 Onboarding is an authenticated six-step flow: consent, goal, birth year/calculation sex, body metrics, activity/safety screening, and KDRI result confirmation. Completion writes current consent hashes and either a versioned nutrition profile or a terminal limited-mode status in one Neon transaction.
@@ -140,6 +150,20 @@ MEAL_RECOGNITION_MODE=openai
 OPENAI_API_KEY=...
 OPENAI_MODEL=gpt-5.4-mini-2026-03-17
 MEAL_RECOGNITION_DEADLINE_MS=20000
+RECOGNITION_RELIABILITY_PROTOCOL_MODE=disabled
+RECOGNITION_RELIABILITY_KILL_SWITCH=false
+RECOGNITION_RELIABILITY_SCHEMA_CAPABILITY=false
+RECOGNITION_RELIABILITY_V2_ONE_CALL_ADMISSION_EVIDENCE=
+RECOGNITION_RELIABILITY_AUTO_RETRY_ADMISSION_EVIDENCE=
+RECOGNITION_RELIABILITY_COHORT_PERCENT=0
+RECOGNITION_RECOVERY_ENABLED=false
+MEAL_RECOGNITION_FINALIZATION_RESERVE_MS=2000
+MEAL_RECOGNITION_RESPONSE_RESERVE_MS=2000
+MEAL_RECOGNITION_PROVIDER_CALL_MAX_MS=15000
+MEAL_RECOGNITION_PROVIDER_CALL_MIN_MS=1000
+MEAL_RECOGNITION_DB_LOCK_CAP_MS=1000
+MEAL_RECOGNITION_DB_STATEMENT_CAP_MS=1500
+MEAL_RECOGNITION_LEASE_MARGIN_MS=1000
 MEAL_RECOGNITION_MAX_OUTPUT_TOKENS=2000
 MEAL_RECOGNITION_MAX_ATTEMPTS=2
 MEAL_RECOGNITION_DAILY_ATTEMPT_QUOTA=20

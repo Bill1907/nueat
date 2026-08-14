@@ -169,6 +169,13 @@
       "when": 1786520780637,
       "tag": "0023_remove_obsolete_meal_review",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1786618320649,
+      "tag": "0024_recognition_reliability",
+      "breakpoints": true
     }
   ]
 }

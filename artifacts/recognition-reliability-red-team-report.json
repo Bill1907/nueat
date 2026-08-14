@@ -1,0 +1,151 @@
+{
+  "schemaVersion": 4,
+  "recordedAt": "2026-08-13T15:07:01Z",
+  "sourceHash": "sha256:00f11c144f8409a5b0ff10f5a53bfa8ac7d657517c9b35395ac71dbc7eba8347",
+  "sourceHashVerification": {
+    "status": "passed",
+    "evidence": "The immutable target hash exactly matches artifacts/recognition-reliability-test-report.json; its approved-plan digest was independently recomputed as 80512a1324e4042a379a86f213f63826deb3c1b3ef799e1dc939b4527edd22ea."
+  },
+  "approvedPlan": {
+    "path": ".gjc/_session-019ff936-0e40-7000-8200-037ac82a6ae5/plans/ralplan/recognition-reliability-20260813/pending-approval.md",
+    "sha256": "80512a1324e4042a379a86f213f63826deb3c1b3ef799e1dc939b4527edd22ea"
+  },
+  "verdict": "passed",
+  "productionMutation": false,
+  "commands": [
+    {
+      "command": "bun test apps/api/test/meal-recognition-coordinator.test.ts apps/api/test/meal-log.test.ts apps/api/test/env.test.ts apps/api/test/server.test.ts apps/api/test/openai-meal-recognizer.test.ts apps/api/test/meal-resolution-coordinator.test.ts apps/mobile/test/meal-recognition-policy.test.ts apps/mobile/test/meal-confirmation-review-policy.test.ts apps/mobile/test/food-selection-policy.test.ts packages/database/src/recognition-reliability-validation.test.ts packages/database/src/recognition-reliability-schema.test.ts packages/database/src/migration-target-guard.test.ts",
+      "result": "passed: 171 tests, 0 failures, 717 assertions"
+    },
+    {
+      "command": "bun test",
+      "result": "passed: 387 tests across 47 files, 0 failures, 1623 assertions"
+    },
+    {
+      "command": "bun run typecheck",
+      "result": "passed: domain, database, mobile, and API packages"
+    },
+    {
+      "command": "bun run lint",
+      "result": "passed: mobile lint, zero warnings"
+    },
+    {
+      "command": "bun run --cwd packages/database db:check",
+      "result": "passed: Drizzle configuration and schema check"
+    },
+    {
+      "command": "git diff --no-ext-diff --check",
+      "result": "passed: no whitespace errors"
+    }
+  ],
+  "blockers": [],
+  "executorQa": {
+    "contractCoverage": [
+      {
+        "contract": "Context-gated V2 coordinator admission and legacy-observe adapter isolation",
+        "status": "passed",
+        "evidence": "Focused server/coordinator coverage and source inspection confirm cohort routing selects the V2 ledger runner only when admitted, legacy_observe rejects recovery, and the compatibility runner never writes V2 execution or invocation records."
+      },
+      {
+        "contract": "Sequential eligibility, historical recovery binding, and conservative reservation",
+        "status": "passed",
+        "evidence": "Focused coordinator and route tests cover reconciliation before claim, a maxed historical failure with one eligible recovery, same-bound legacy workflow upgrade, single-grant consumption, quota/invocation reservation before SDK dispatch, and duplicate/replay exclusion."
+      },
+      {
+        "contract": "One absolute execution deadline reserves provider finalization and HTTP response time",
+        "status": "passed",
+        "evidence": "Source inspection confirms one ExecutionDeadline is propagated through claim, reconciliation, object read, provider cap, persistence, and resolution; provider admission requires min provider time plus finalization reserve. Focused environment, coordinator, and route tests cover invalid budgets, exhaustion, and response-reserve 503 behavior."
+      },
+      {
+        "contract": "Abort is context-propagated, terminalized safely, and cleaned up within the execution deadline",
+        "status": "passed",
+        "evidence": "Route source wires incomplete request close and aborted events to an AbortSignal and retains reply lifecycle observation until delivery/loss. Coordinator source cancels a reserved pre-call invocation under transaction caps, terminalizes the execution through fail(), and bounds DB work by remaining deadline. Focused coordinator/server tests cover pre-claim, post-reservation, and provider-work aborts."
+      },
+      {
+        "contract": "Resolution is deadline-aware with commit reserve and cannot mutate after the deadline",
+        "status": "passed",
+        "evidence": "The coordinator passes monotonic and wall deadlines plus commit reserve into MealResolutionCoordinator. Focused resolution/coordinator tests cover exhausted budgets, lease loss, exact terminal convergence, and no late resolution mutation."
+      },
+      {
+        "contract": "V3 proof and public mobile recovery/confirmation contracts remain closed and omission-safe",
+        "status": "passed",
+        "evidence": "Focused meal-log, mobile policy, confirmation-review, and food-selection tests cover immutable V3 proof projection, stale authority revalidation, decomposed proof IDs, absent optional field omission, and server-authored closed recovery states."
+      },
+      {
+        "contract": "Database state machine, migration target guard, and isolated validator preserve terminal immutability",
+        "status": "passed",
+        "evidence": "Focused schema, validation, and target-guard tests passed. db:check passed. No validator invocation against a database was run because this QA prohibits state mutation and that validator is intentionally database-connected."
+      }
+    ],
+    "surfaceEvidence": [
+      {
+        "surface": "API recognition route, lifecycle abort handling, coordinator, cohort adapter, environment, and OpenAI adapter",
+        "status": "passed",
+        "evidence": "Focused 171-test suite passed; full workspace suite passed. Static review covered request-close abort wiring, bounded cancellation terminalization, sequential admission, provider reserve, and response reload reserve."
+      },
+      {
+        "surface": "Database schema, migration wrapper, guard, and validator",
+        "status": "passed",
+        "evidence": "Focused database reliability tests and db:check passed without connecting to or mutating a database."
+      },
+      {
+        "surface": "Mobile draft recovery, recognition DTO policy, and confirmation review",
+        "status": "passed",
+        "evidence": "Focused mobile policy tests passed; workspace typecheck and zero-warning mobile lint passed."
+      },
+      {
+        "surface": "Production, deployment, and migration execution",
+        "status": "not_applicable",
+        "evidence": "No deploy, migration, database connection, production request, or state-changing command was issued."
+      }
+    ],
+    "adversarialCases": [
+      {
+        "case": "Caller aborts before claim, after reservation, and during the provider request",
+        "status": "passed",
+        "evidence": "Focused coordinator/server coverage verifies abort propagation, no premature dispatch, provider signal forwarding, durable cancellation, safe terminal codes, and bounded cleanup."
+      },
+      {
+        "case": "Deadline is exhausted during sequential reconciliation, object/provider work, finalization, resolution, or response reload",
+        "status": "passed",
+        "evidence": "Focused environment, coordinator, resolution, and route coverage verifies deadline-aware admission, finalization/commit reserves, no late mutation, and response-reserve 503 behavior."
+      },
+      {
+        "case": "Recovery pressure includes maxed failed drafts, missing/legacy workflows, stale leases, stored observations, and duplicate retries",
+        "status": "passed",
+        "evidence": "Focused coordinator and route tests verify durable historical binding, one grant consumption, reconciliation before provider work, resolution-only observation handling, and no coordinator automatic replay."
+      },
+      {
+        "case": "Adapter context is absent or legacy and a recovery trigger attempts to cross cohorts",
+        "status": "passed",
+        "evidence": "Focused server/coordinator tests and source inspection verify cohort isolation and that legacy_observe rejects user recovery without a V2 fallback ledger."
+      },
+      {
+        "case": "Malformed V3 output, stale confirmation facts, omitted proof IDs, invalid reliability settings, and migration target mismatch",
+        "status": "passed",
+        "evidence": "Focused recognizer, meal-log, mobile, environment, schema, target-guard, and validator tests cover the failure-closed paths."
+      }
+    ],
+    "artifactRefs": [
+      {
+        "path": "artifacts/recognition-reliability-red-team-report.json",
+        "purpose": "Immutable final red-team receipt bound to sha256:00f11c144f8409a5b0ff10f5a53bfa8ac7d657517c9b35395ac71dbc7eba8347."
+      },
+      {
+        "path": "artifacts/recognition-reliability-test-report.json",
+        "purpose": "Prior full-gate source-hash receipt whose target hash and approved-plan binding were rechecked."
+      },
+      {
+        "path": "artifacts/recognition-provider-probe.json",
+        "purpose": "Non-secret provider contract probe receipt."
+      }
+    ]
+  },
+  "privacy": {
+    "containsSecrets": false,
+    "containsPrivateImageData": false,
+    "containsSignedUrls": false,
+    "containsObjectKeys": false,
+    "containsProviderBodies": false
+  }
+}
