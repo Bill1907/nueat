@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "kind": "black-box-api-receipt",
+  "recordedAt": "2026-08-14T13:13:00Z",
+  "incident": {
+    "symptom": "POST /api/meal-logs returned 503 after image upload and validation succeeded",
+    "rootCause": "Recognition reliability source was deployed before guarded production migration 0024 and rollout configuration; the safe default protocol mode disabled recognition execution.",
+    "failedDeploymentId": "75ba8265-5964-4ae9-8f43-f50f1e13d738",
+    "failedCommit": "3f26d8b31725d42159a55a8f65578ddff7ceb1a0"
+  },
+  "containment": {
+    "strategy": "Restore the last production-proven safe-review API while keeping the guarded 0024 migration unapplied rather than bypassing its Neon control-plane verification.",
+    "deploymentId": "c5843ec6-e4f7-4e8d-9627-3481d28f7e47",
+    "sourceCommit": "954fb26c036d7470df64fc4c9dd9d8461f6d4a6e",
+    "deploymentStatus": "SUCCESS",
+    "readinessStatus": 200,
+    "database": "up",
+    "mealConfirmationProtocol": "meal-confirmation-safe-review-v1"
+  },
+  "mobile": {
+    "commit": "71cff0c91276f1dd2ada7c847160ee169004f58e",
+    "build": "1.0.0 (10)",
+    "submissionId": "c3a444e8-2384-446b-8ef8-b462f405c836",
+    "uploadStatus": "accepted_by_app_store_connect_processing"
+  },
+  "verification": {
+    "commands": [
+      "bun run lint",
+      "bun run typecheck",
+      "bun test",
+      "git diff --check",
+      "GET https://api-nueat.boseong.dev/health/ready"
+    ],
+    "tests": {
+      "passed": 387,
+      "failed": 0,
+      "expectCalls": 1623,
+      "files": 47
+    }
+  },
+  "remainingGuardedRollout": {
+    "status": "human_credential_blocked",
+    "missing": [
+      "NEON_API_KEY",
+      "NUEAT_NEON_PROJECT_ID",
+      "NUEAT_NEON_BRANCH_ID",
+      "NUEAT_PRODUCTION_NEON_PROJECT_ID",
+      "NUEAT_PRODUCTION_NEON_BRANCH_ID",
+      "NUEAT_ALLOWED_NEON_BRANCH_IDS",
+      "NUEAT_PRODUCTION_OVERRIDE_TOKEN",
+      "NUEAT_PRODUCTION_OVERRIDE_ACTOR",
+      "NUEAT_PRODUCTION_CHANGE_REFERENCE"
+    ],
+    "invariant": "Do not bypass migration-target-guard.ts; recognition remains served by the production-proven compatible API until guarded rollout credentials are supplied."
+  }
+}
