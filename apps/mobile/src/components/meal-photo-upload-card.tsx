@@ -231,9 +231,11 @@ export function MealPhotoUploadCard({
           ? 'recognizing'
           : 'success',
       );
-    } catch (cause) {
+    } catch {
       if (!isCurrentOperation(generation)) return;
-      setError(errorMessage(cause));
+      setError(
+        '사진은 안전하게 업로드했지만 식사 초안을 만들지 못했어요. 다시 시도해 주세요.',
+      );
       setPhase('uploaded');
     } finally {
       if (isCurrentOperation(generation)) linkingMealDraft.current = false;
