@@ -129,7 +129,12 @@ describe('NUEAT API server', () => {
 
   test('reports readiness only when Neon is reachable', async () => {
     const readyServer = await createTestServer({
-      execute: async () => [{ ready: true }],
+      execute: async (query?: unknown) => {
+        if (JSON.stringify(query).includes('schema_capability')) {
+          throw new Error('relation "schema_capability" does not exist');
+        }
+        return [{ ready: true }];
+      },
     });
     const unavailableServer = await createTestServer({
       execute: async () => {
@@ -258,7 +263,7 @@ describe('NUEAT API server', () => {
 });
 
 async function createTestServer(
-  database: { execute: () => Promise<unknown> },
+  database: { execute: (query?: unknown) => Promise<unknown> },
   auth = createAuthMock(async () => Response.json({ ok: true })),
   cutoverMode: 'normal' | 'maintenance_bridge' | 'safe_review_maintenance' = 'normal',
 ) {

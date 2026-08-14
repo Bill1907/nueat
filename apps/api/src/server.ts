@@ -278,16 +278,18 @@ export async function buildServer(dependencies: ServerDependencies) {
               from pg_trigger
               where tgname = 'meal_log_confirmed_review_checkpoint_guard'
                 and not tgisinternal
-            )
-            and (
-              ${environment.mealRecognition.reliability.protocolMode === 'disabled'}
-              or exists (
-                select 1 from schema_capability
-                where name = 'recognition_reliability_v2'
-              )
             ) as ready
         `);
-        if (capability?.ready === true) return;
+        if (capability?.ready === true) {
+          if (environment.mealRecognition.reliability.protocolMode === 'disabled') return;
+          const [recognitionCapability] = await dependencies.database.execute(sql`
+            select exists (
+              select 1 from schema_capability
+              where name = 'recognition_reliability_v2'
+            ) as ready
+          `);
+          if (recognitionCapability?.ready === true) return;
+        }
       } catch {
         reply.hijack();
         reply.raw.statusCode = 503;
