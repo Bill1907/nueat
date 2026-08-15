@@ -2442,6 +2442,7 @@ async function createServer(
     recognitionCoordinator: {
       async enqueueInitial() {
         state.recognitionEnqueueCalls += 1;
+        return true;
       },
       async responseLost() {
         state.responseLostCalls += 1;

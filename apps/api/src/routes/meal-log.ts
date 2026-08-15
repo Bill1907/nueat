@@ -22,7 +22,6 @@ import {
 } from '@nueat/database';
 import {
   calculateMealNutrition,
-  calculateReviewedMealNutrition,
   deriveCurrentItemReviewCheckpoint,
   deriveMealConfirmability,
   MEAL_ITEM_REVIEW_FINGERPRINT_VERSION,
@@ -2967,30 +2966,22 @@ function reviewedNutritionSummary(
   items: Awaited<ReturnType<typeof findMealItems>>,
   authorityByItemId: Map<string, Awaited<ReturnType<typeof projectCurrentItemAuthority>>>,
 ) {
-  const inputs = items.map((item) => {
+  let reviewedItemCount = 0;
+  let reviewedUnknownItemCount = 0;
+  const inputs = items.flatMap((item) => {
     const authority = authorityByItemId.get(item.id);
     const reviewed =
       authority !== undefined &&
       item.reviewedItemRevision === item.itemRevision &&
       item.reviewedAuthorityFingerprintVersion === authority.fingerprintVersion &&
       item.reviewedAuthorityFingerprint === authority.fingerprint;
+    if (reviewed) reviewedItemCount += 1;
     if (!authority?.selected) {
-      return {
-        mealItemId: item.id,
-        amountMilliunits: 1,
-        unit: 'g' as const,
-        nutrientProfile: {
-          basisAmountMg: 1,
-          energyMillicalories: null,
-          carbohydrateMg: null,
-          proteinMg: null,
-          fatMg: null,
-          fiberMg: null,
-        },
-        userReview: reviewed ? 'current' as const : 'unreviewed' as const,
-      };
+      if (reviewed) reviewedUnknownItemCount += 1;
+      return [];
     }
-    return {
+    if (!reviewed) return [];
+    return [{
       mealItemId: item.id,
       amountMilliunits: item.amountMilliunits,
       unit: item.unit,
@@ -3002,19 +2993,66 @@ function reviewedNutritionSummary(
         fatMg: authority.selected.profile.fatMg,
         fiberMg: authority.selected.profile.fiberMg,
       },
-      ...(authority.selected.serving &&
+      ...(item.unit !== 'g' &&
+      authority.selected.serving &&
       authority.selected.serving.unit !== 'g'
         ? {
             serving: {
-              ...authority.selected.serving,
-              unit: authority.selected.serving.unit,
+              id: authority.selected.serving.id,
+              unit: item.unit,
+              amountMilliunits:
+                authority.selected.serving.amountMilliunits,
+              gramsMg: authority.selected.serving.gramsMg,
+              sourceRegistryId:
+                authority.selected.serving.sourceRegistryId,
+              qualityGrade: authority.selected.serving.qualityGrade,
             },
           }
         : {}),
-      userReview: reviewed ? 'current' as const : 'unreviewed' as const,
-    };
+    }];
   });
-  return calculateReviewedMealNutrition(inputs);
+  const nutrition = calculateMealNutrition(inputs);
+  const unreviewedItemCount = items.length - reviewedItemCount;
+  const totals = Object.fromEntries(
+    nutritionKeysForComposition.map((key) => {
+      const aggregate = nutrition.totals[key];
+      const missingItemCount =
+        aggregate.missingItemCount + reviewedUnknownItemCount;
+      const status =
+        reviewedItemCount === 0
+          ? 'pending' as const
+          : unreviewedItemCount === 0 && missingItemCount === 0
+            ? 'complete' as const
+            : 'subtotal' as const;
+      return [key, {
+        value: status === 'complete' ? aggregate.knownValue : null,
+        knownValue: aggregate.knownValue,
+        missingItemCount,
+        status,
+      }];
+    }),
+  ) as Record<
+    (typeof nutritionKeysForComposition)[number],
+    {
+      value: number | null;
+      knownValue: number;
+      missingItemCount: number;
+      status: 'pending' | 'subtotal' | 'complete';
+          }
+  >;
+  return {
+    status:
+      reviewedItemCount === 0
+        ? 'pending' as const
+        : unreviewedItemCount === 0 &&
+            Object.values(totals).every((total) => total.status === 'complete')
+          ? 'complete' as const
+          : 'subtotal' as const,
+    reviewedItemCount,
+    unreviewedItemCount,
+    items: nutrition.items,
+    totals,
+    };
 }
 
 type ResolutionMetadata = {

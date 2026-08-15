@@ -1,4 +1,9 @@
-import { mealLogs, type Database } from '@nueat/database';
+import {
+  mealLogs,
+  recognitionAttempts,
+  recognitionExecutions,
+  type Database,
+} from '@nueat/database';
 import { and, asc, eq, lte } from 'drizzle-orm';
 
 import type { MealRecognitionRunner } from './meal-recognition-coordinator';
@@ -12,6 +17,17 @@ export interface MealRecognitionWorkerOptions {
 }
 
 export type MealRecognitionWorkerStatus = 'idle' | 'running' | 'stopped';
+
+export function recognitionWorkerEnabled(input: {
+  reliabilityDisabled: boolean;
+  isTest: boolean;
+  hasInjectedRunner: boolean;
+  hasObjectStore: boolean;
+}) {
+  return !input.reliabilityDisabled &&
+    !input.isTest &&
+    (input.hasInjectedRunner || input.hasObjectStore);
+}
 
 export class MealRecognitionWorker {
   private readonly pollIntervalMs: number;
@@ -51,6 +67,34 @@ export class MealRecognitionWorker {
   async runOnce(signal?: AbortSignal): Promise<number> {
     if (signal?.aborted) return 0;
     const now = new Date();
+    const expired = await this.options.database
+      .select({
+        id: mealLogs.id,
+        userId: mealLogs.userId,
+      })
+      .from(recognitionExecutions)
+      .innerJoin(
+        recognitionAttempts,
+        eq(recognitionAttempts.id, recognitionExecutions.workflowId),
+      )
+      .innerJoin(mealLogs, eq(mealLogs.id, recognitionAttempts.mealLogId))
+      .where(and(
+        eq(recognitionExecutions.status, 'open'),
+        lte(recognitionExecutions.wallDeadlineAt, now),
+        eq(mealLogs.status, 'draft'),
+      ))
+      .orderBy(
+        asc(recognitionExecutions.wallDeadlineAt),
+        asc(recognitionExecutions.id),
+      )
+      .limit(this.batchSize);
+    let processed = 0;
+    for (const mealLog of expired) {
+      if (signal?.aborted) return processed;
+      await this.options.runner.reconcile(mealLog.id, mealLog.userId, signal);
+      processed += 1;
+    }
+
     const due = await this.options.database
       .select({ id: mealLogs.id, userId: mealLogs.userId })
       .from(mealLogs)
@@ -62,10 +106,47 @@ export class MealRecognitionWorker {
       .orderBy(asc(mealLogs.recognitionNextAttemptAt), asc(mealLogs.id))
       .limit(this.batchSize);
 
-    let processed = 0;
     for (const mealLog of due) {
       if (signal?.aborted) break;
-      await this.options.runner.enqueueInitial?.(mealLog.id, mealLog.userId);
+      const queued =
+        await this.options.runner.enqueueInitial?.(
+          mealLog.id,
+          mealLog.userId,
+        ) ?? false;
+      if (!queued) {
+        await this.options.runner.recognize(
+          mealLog.id,
+          mealLog.userId,
+          'initial',
+          signal,
+        );
+        processed += 1;
+      }
+    }
+
+    const queued = await this.options.database
+      .select({
+        id: mealLogs.id,
+        userId: mealLogs.userId,
+      })
+      .from(recognitionExecutions)
+      .innerJoin(
+        recognitionAttempts,
+        eq(recognitionAttempts.id, recognitionExecutions.workflowId),
+      )
+      .innerJoin(mealLogs, eq(mealLogs.id, recognitionAttempts.mealLogId))
+      .where(and(
+        eq(recognitionExecutions.status, 'queued'),
+        eq(mealLogs.status, 'draft'),
+        eq(mealLogs.recognitionStatus, 'pending'),
+      ))
+      .orderBy(
+        asc(recognitionExecutions.createdAt),
+        asc(recognitionExecutions.id),
+      )
+      .limit(this.batchSize);
+    for (const mealLog of queued) {
+      if (signal?.aborted) break;
       await this.options.runner.recognize(
         mealLog.id,
         mealLog.userId,

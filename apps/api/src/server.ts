@@ -52,7 +52,10 @@ import { nutritionTargetRoutes } from './routes/nutrition-target';
 import { sessionRoutes } from './routes/session';
 import { recommendationRoutes } from './routes/recommendation';
 import { isInRecognitionCohort } from './services/recognition-cohort';
-import { MealRecognitionWorker } from './services/meal-recognition-worker';
+import {
+  MealRecognitionWorker,
+  recognitionWorkerEnabled,
+} from './services/meal-recognition-worker';
 
 export interface ServerDependencies {
   environment: ApiEnvironment;
@@ -221,15 +224,20 @@ export async function buildServer(dependencies: ServerDependencies) {
     }),
   });
   const recognitionWorker =
-    reliabilityMode === 'disabled' || environment.nodeEnv === 'test'
-      ? null
-      : new MealRecognitionWorker({
+    recognitionWorkerEnabled({
+      reliabilityDisabled: reliabilityMode === 'disabled',
+      isTest: environment.nodeEnv === 'test',
+      hasInjectedRunner: dependencies.recognitionCoordinator !== undefined,
+      hasObjectStore: imageObjectStore !== null,
+    })
+      ? new MealRecognitionWorker({
           database: dependencies.database,
           runner: recognitionCoordinator,
           onError(code) {
             app.log.error({ code }, 'Recognition worker poll failed');
           },
-        });
+        })
+      : null;
   if (recognitionWorker) {
     app.addHook('onReady', async () => {
       recognitionWorker.start();
@@ -509,7 +517,7 @@ export function cohortGatedRecognitionRunner(
   if (reliability.protocolMode === 'legacy_observe') {
     return {
       async enqueueInitial(mealLogId, userId) {
-        await legacyRunner.enqueueInitial?.(mealLogId, userId);
+        return await legacyRunner.enqueueInitial?.(mealLogId, userId) ?? false;
       },
       async reconcile(mealLogId, userId) {
         return legacyRunner.reconcile(mealLogId, userId);
@@ -527,10 +535,9 @@ export function cohortGatedRecognitionRunner(
   return {
     async enqueueInitial(mealLogId, userId) {
       if (!isInRecognitionCohort(userId, reliability.cohortPercent)) {
-        await legacyRunner.enqueueInitial?.(mealLogId, userId);
-        return;
+        return await legacyRunner.enqueueInitial?.(mealLogId, userId) ?? false;
       }
-      await v2Runner.enqueueInitial?.(mealLogId, userId);
+      return await v2Runner.enqueueInitial?.(mealLogId, userId) ?? false;
     },
     async reconcile(mealLogId, userId) {
       return v2Runner.reconcile(mealLogId, userId);

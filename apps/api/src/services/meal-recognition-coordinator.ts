@@ -164,7 +164,7 @@ export function failureTransition(
   } as const;
 }
 export interface MealRecognitionRunner {
-  enqueueInitial?(mealLogId: string, userId: string): Promise<void>;
+  enqueueInitial?(mealLogId: string, userId: string): Promise<boolean>;
   recognize(
     mealLogId: string,
     userId: string,
@@ -214,11 +214,11 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
     this.options.eventSink?.(event);
   }
 
-  async enqueueInitial(mealLogId: string, userId: string): Promise<void> {
+  async enqueueInitial(mealLogId: string, userId: string): Promise<boolean> {
     const now = new Date();
     const workflowId = randomUUID();
     const executionId = randomUUID();
-    await this.options.database.transaction(async (tx) => {
+    return this.options.database.transaction(async (tx) => {
       const [mealLog] = await tx.select({
         id: mealLogs.id,
         imageAssetId: mealLogs.imageAssetId,
@@ -231,7 +231,7 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
       if (
         !mealLog?.imageAssetId ||
         mealLog.recognitionStatus !== 'pending'
-      ) return;
+      ) return false;
 
       const [createdWorkflow] = await tx.insert(recognitionAttempts).values({
         id: workflowId,
@@ -249,7 +249,14 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
       }).onConflictDoNothing({
         target: recognitionAttempts.mealLogId,
       }).returning({ id: recognitionAttempts.id });
-      if (!createdWorkflow) return;
+      if (!createdWorkflow) {
+        const [existingWorkflow] = await tx.select({
+          protocolVersion: recognitionAttempts.protocolVersion,
+        }).from(recognitionAttempts).where(
+          eq(recognitionAttempts.mealLogId, mealLogId),
+        ).limit(1);
+        return existingWorkflow?.protocolVersion === 'v2_option_b';
+      }
 
       await tx.insert(recognitionExecutions).values({
         id: executionId,
@@ -261,6 +268,7 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
         phase: 'claim',
         status: 'queued',
       });
+      return true;
     });
   }
 
@@ -415,37 +423,33 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
       if (!(await this.setPhase(claimed, phase))) return this.currentOutcome(claimed.mealLogId, claimed.userId);
       await this.succeedInvocation(invocation, claimed.deadline);
       this.event({ type: 'provider_acknowledged', executionId: invocation.executionId });
-      if (parsedV3.success) {
-        phase = 'observation_persist';
-        // Valid V3 output ends external work. Its finalization budget is independent of
-        // the just-finished provider cap, so an edge-of-window response is not discarded.
-        const finalizationDeadline = deadline;
-        if (remainingMs(finalizationDeadline) === 0) {
-          return this.fail(claimed, 'PERSISTENCE_UNAVAILABLE', invocation);
-        }
-        const persisted = await this.persistV3Observation(
-          claimed,
-          invocation.id,
-          output,
-          parseRecognitionResultV3(output.result),
-          finalizationDeadline,
-        );
-        if (persisted.status !== 'ready') return persisted;
-        this.event({ type: 'terminal', executionId: invocation.executionId, code: 'SUCCEEDED' });
-        try {
-          await this.resolvePendingObservation(
-            mealLogId,
-            userId,
-            deadline,
-            execution.signal,
-          );
-        } catch {
-          // The immutable observation is already committed. Catalog resolution
-          // has its own durable retry state and cannot rewrite recognition.
-        }
-        return { status: 'ready' };
+      // Valid V3 output ends external work. Its finalization budget is
+      // independent of the just-finished provider cap.
+      const finalizationDeadline = deadline;
+      if (remainingMs(finalizationDeadline) === 0) {
+        return this.fail(claimed, 'PERSISTENCE_UNAVAILABLE', invocation);
       }
-      return this.fail(claimed, 'INVALID_PROVIDER_RESPONSE', invocation);
+      const persisted = await this.persistV3Observation(
+        claimed,
+        invocation.id,
+        output,
+        parsedV3.data,
+        finalizationDeadline,
+      );
+      if (persisted.status !== 'ready') return persisted;
+      this.event({ type: 'terminal', executionId: invocation.executionId, code: 'SUCCEEDED' });
+      try {
+        await this.resolvePendingObservation(
+          mealLogId,
+          userId,
+          deadline,
+          execution.signal,
+        );
+      } catch {
+        // The immutable observation is already committed. Catalog resolution
+        // has its own durable retry state and cannot rewrite recognition.
+      }
+      return { status: 'ready' };
     } catch (error) {
       const code = execution.signal.aborted
         ? abortCode(execution.reason())

@@ -6,57 +6,69 @@ import type {
 } from '../src/services/meal-recognition-coordinator';
 import {
   MealRecognitionWorker,
+  recognitionWorkerEnabled,
 } from '../src/services/meal-recognition-worker';
 
-function databaseWithDueMeals(
-  meals: Array<{ id: string; userId: string }>,
+type Work = { id: string; userId: string };
+
+function databaseWithWork(
+  ...queryResults: Work[][]
 ): Database {
+  let queryIndex = 0;
   return {
     select() {
-      return {
+      const query = {
         from() {
-          return {
-            where() {
-              return {
-                orderBy() {
-                  return {
-                    async limit(limit: number) {
-                      return meals.slice(0, limit);
-                    },
-                  };
-                },
-              };
-            },
-          };
+          return query;
+        },
+        innerJoin() {
+          return query;
+        },
+        where() {
+          return query;
+        },
+        orderBy() {
+          return query;
+        },
+        async limit(limit: number) {
+          return (queryResults[queryIndex++] ?? []).slice(0, limit);
         },
       };
+      return query;
     },
   } as unknown as Database;
 }
 
-function runnerWithCalls(calls: string[]): MealRecognitionRunner {
+function runnerWithCalls(
+  calls: string[],
+  durableQueue = true,
+): MealRecognitionRunner {
   return {
     async enqueueInitial(mealLogId, userId) {
       calls.push(`enqueue:${mealLogId}:${userId}`);
+      return durableQueue;
     },
     async recognize(mealLogId, userId, trigger) {
       calls.push(`recognize:${mealLogId}:${userId}:${trigger}`);
       return { status: 'ready' };
     },
-    async reconcile() {
+    async reconcile(mealLogId, userId) {
+      calls.push(`reconcile:${mealLogId}:${userId}`);
       return { status: 'ready' };
     },
   };
 }
 
+const meals = [
+  { id: 'meal-a', userId: 'user-a' },
+  { id: 'meal-b', userId: 'user-b' },
+];
+
 describe('MealRecognitionWorker', () => {
-  test('admits and executes due drafts in stable queue order', async () => {
+  test('admits drafts then executes durable queue rows in stable order', async () => {
     const calls: string[] = [];
     const worker = new MealRecognitionWorker({
-      database: databaseWithDueMeals([
-        { id: 'meal-a', userId: 'user-a' },
-        { id: 'meal-b', userId: 'user-b' },
-      ]),
+      database: databaseWithWork([], meals, meals),
       runner: runnerWithCalls(calls),
       batchSize: 2,
     });
@@ -64,16 +76,16 @@ describe('MealRecognitionWorker', () => {
     expect(await worker.runOnce()).toBe(2);
     expect(calls).toEqual([
       'enqueue:meal-a:user-a',
-      'recognize:meal-a:user-a:initial',
       'enqueue:meal-b:user-b',
+      'recognize:meal-a:user-a:initial',
       'recognize:meal-b:user-b:initial',
     ]);
   });
 
-  test('does not claim another draft after shutdown aborts a batch', async () => {
+  test('runs legacy work inline and stops after shutdown aborts a batch', async () => {
     const calls: string[] = [];
     const controller = new AbortController();
-    const runner = runnerWithCalls(calls);
+    const runner = runnerWithCalls(calls, false);
     const originalRecognize = runner.recognize.bind(runner);
     runner.recognize = async (...args) => {
       const result = await originalRecognize(...args);
@@ -81,10 +93,7 @@ describe('MealRecognitionWorker', () => {
       return result;
     };
     const worker = new MealRecognitionWorker({
-      database: databaseWithDueMeals([
-        { id: 'meal-a', userId: 'user-a' },
-        { id: 'meal-b', userId: 'user-b' },
-      ]),
+      database: databaseWithWork([], meals, []),
       runner,
     });
 
@@ -93,5 +102,52 @@ describe('MealRecognitionWorker', () => {
       'enqueue:meal-a:user-a',
       'recognize:meal-a:user-a:initial',
     ]);
+  });
+
+  test('reconciles expired open executions without a client request', async () => {
+    const calls: string[] = [];
+    const worker = new MealRecognitionWorker({
+      database: databaseWithWork([meals[0]!], [], []),
+      runner: runnerWithCalls(calls),
+    });
+
+    expect(await worker.runOnce()).toBe(1);
+    expect(calls).toEqual(['reconcile:meal-a:user-a']);
+  });
+
+  test('starts one polling loop and stops it at a safe boundary', async () => {
+    const worker = new MealRecognitionWorker({
+      database: databaseWithWork([], [], []),
+      runner: runnerWithCalls([]),
+      pollIntervalMs: 100,
+    });
+
+    worker.start();
+    worker.start();
+    expect(['idle', 'running']).toContain(worker.status());
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    await worker.stop();
+    expect(worker.status()).toBe('stopped');
+  });
+
+  test('does not start with only unavailable internally constructed runners', () => {
+    expect(recognitionWorkerEnabled({
+      reliabilityDisabled: false,
+      isTest: false,
+      hasInjectedRunner: false,
+      hasObjectStore: false,
+    })).toBe(false);
+    expect(recognitionWorkerEnabled({
+      reliabilityDisabled: false,
+      isTest: false,
+      hasInjectedRunner: true,
+      hasObjectStore: false,
+    })).toBe(true);
+    expect(recognitionWorkerEnabled({
+      reliabilityDisabled: false,
+      isTest: false,
+      hasInjectedRunner: false,
+      hasObjectStore: true,
+    })).toBe(true);
   });
 });
