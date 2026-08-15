@@ -106,6 +106,24 @@ describe('OpenAIMealRecognizer', () => {
     await expect(recognizeOutput({ ...recognized, observations: [{ ...recognized.observations[0], rawLabel: '비빔밥 K-FCDB-12345' }] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
   });
 
+  test('rejects missing, zero, or fabricated observation quantities', async () => {
+    const observation = recognized.observations[0]!;
+    const { amountMilliunits: _amountMilliunits, ...missingAmount } = observation;
+
+    await expect(recognizeOutput({
+      ...recognized,
+      observations: [missingAmount],
+    })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+    await expect(recognizeOutput({
+      ...recognized,
+      observations: [{ ...observation, amountMilliunits: 0 }],
+    })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+    await expect(recognizeOutput({
+      ...recognized,
+      observations: [{ ...observation, amountMilliunits: null }],
+    })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });
+  });
+
   test('rejects duplicate regions, forbidden fields, and non-unique or unordered alternatives', async () => {
     const food = recognized.observations[0]!;
     await expect(recognizeOutput({ ...recognized, observations: [food, { ...food }] })).rejects.toMatchObject({ code: 'INVALID_PROVIDER_RESPONSE' });

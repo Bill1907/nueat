@@ -1,11 +1,18 @@
 import { describe, expect, test } from 'bun:test';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { getTableName } from 'drizzle-orm';
 import {
+  calculationPreviews,
+  mappingDecisions,
+  mealDecompositionComponents,
+  mealDecompositionRevisions,
   recognitionAttempts,
   recognitionExecutions,
   recognitionProviderInvocations,
+  resolutionAttempts,
   schemaCapabilities,
+  storedObservations,
 } from './schema/meal';
 
 const migrationPath = join(import.meta.dir, '..', 'drizzle', '0024_recognition_reliability.sql');
@@ -16,6 +23,35 @@ async function migrationSql() {
 }
 
 describe('recognition reliability schema', () => {
+  test('exports every additive 0024 table in the declared inventory', async () => {
+    const sql = await migrationSql();
+    const baseline = await Promise.all([
+      '0015_recognition_v3_resolution_foundation.sql',
+      '0017_composite_meal_foundation.sql',
+      '0023_remove_obsolete_meal_review.sql',
+    ].map((name) => readFile(
+      join(import.meta.dir, '..', 'drizzle', name),
+      'utf8',
+    )));
+    const inventorySql = `${baseline.join('\n')}\n${sql}`;
+    const tables = [
+      schemaCapabilities,
+      recognitionAttempts,
+      recognitionExecutions,
+      recognitionProviderInvocations,
+      storedObservations,
+      resolutionAttempts,
+      mappingDecisions,
+      calculationPreviews,
+      mealDecompositionRevisions,
+      mealDecompositionComponents,
+    ];
+    for (const table of tables) {
+      const name = getTableName(table);
+      expect(inventorySql).toContain(`CREATE TABLE \"${name}\"`);
+    }
+  });
+
   test('keeps the attempt aggregate legacy-safe and lease-compatible', async () => {
     const sql = await migrationSql();
 

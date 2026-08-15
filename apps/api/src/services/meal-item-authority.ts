@@ -3,6 +3,7 @@ import {
   mealItemReviewFingerprint,
   type MealItemAuthorityFingerprintInput,
 } from '@nueat/domain';
+import { createHash } from 'node:crypto';
 
 import {
   selectTrustedNutrition,
@@ -13,6 +14,8 @@ import {
 } from './catalog-eligibility-selector';
 
 export const MEAL_ITEM_AUTHORITY_PROJECTION_VERSION = 'meal-item-authority-projection-v1';
+export const MANUAL_REVIEW_FINGERPRINT_VERSION =
+  'meal-manual-review-authority-v1';
 
 export type MealItemAuthorityInput = {
   item: {
@@ -105,6 +108,40 @@ export async function projectMealItemAuthority(
     fingerprint,
     canonicalFingerprintHash: fingerprint,
   };
+}
+
+export function projectManualMealItemAuthority(input: {
+  id: string;
+  itemRevision: number;
+  recognizedLabel: string;
+  amountMilliunits: number;
+  unit: CatalogServingUnit;
+  origin: string;
+}) {
+  const canonicalFingerprintInput = {
+    version: MANUAL_REVIEW_FINGERPRINT_VERSION,
+    itemId: input.id,
+    itemRevision: input.itemRevision,
+    recognizedLabel: input.recognizedLabel.normalize('NFC'),
+    amountMilliunits: input.amountMilliunits,
+    unit: input.unit,
+    origin: input.origin,
+  };
+  const fingerprint = createHash('sha256')
+    .update(JSON.stringify(canonicalFingerprintInput))
+    .digest('hex');
+  return {
+    version: MEAL_ITEM_AUTHORITY_PROJECTION_VERSION,
+    itemId: input.id,
+    selected: null,
+    officialSource: null,
+    invalidReason: null,
+    calculationIdentity: null,
+    canonicalFingerprintInput,
+    fingerprintVersion: MANUAL_REVIEW_FINGERPRINT_VERSION,
+    fingerprint,
+    canonicalFingerprintHash: fingerprint,
+  } as const;
 }
 
 function invalidProjection(

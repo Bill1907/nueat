@@ -65,14 +65,18 @@ const meals = [
 ];
 
 describe('MealRecognitionWorker', () => {
-  test('admits drafts then executes durable queue rows in stable order', async () => {
+  test('admits drafts and executes their durable rows on the next poll', async () => {
     const calls: string[] = [];
     const worker = new MealRecognitionWorker({
-      database: databaseWithWork([], meals, meals),
+      database: databaseWithWork(
+        [], [], meals,
+        [], meals, [],
+      ),
       runner: runnerWithCalls(calls),
       batchSize: 2,
     });
 
+    expect(await worker.runOnce()).toBe(0);
     expect(await worker.runOnce()).toBe(2);
     expect(calls).toEqual([
       'enqueue:meal-a:user-a',
@@ -93,7 +97,7 @@ describe('MealRecognitionWorker', () => {
       return result;
     };
     const worker = new MealRecognitionWorker({
-      database: databaseWithWork([], meals, []),
+      database: databaseWithWork([], [], meals),
       runner,
     });
 
@@ -115,6 +119,26 @@ describe('MealRecognitionWorker', () => {
     expect(calls).toEqual(['reconcile:meal-a:user-a']);
   });
 
+  test('relies on coordinator fencing when two replicas poll the same queue row', async () => {
+    let claimed = false;
+    let providerCalls = 0;
+    const runner = runnerWithCalls([]);
+    runner.recognize = async () => {
+      if (claimed) return { status: 'active', retryAfterSeconds: 1 };
+      claimed = true;
+      providerCalls += 1;
+      await Promise.resolve();
+      return { status: 'ready' };
+    };
+    const workers = [0, 1].map(() => new MealRecognitionWorker({
+      database: databaseWithWork([], [meals[0]!], []),
+      runner,
+    }));
+
+    await Promise.all(workers.map((worker) => worker.runOnce()));
+    expect(providerCalls).toBe(1);
+  });
+
   test('starts one polling loop and stops it at a safe boundary', async () => {
     const worker = new MealRecognitionWorker({
       database: databaseWithWork([], [], []),
@@ -134,19 +158,11 @@ describe('MealRecognitionWorker', () => {
     expect(recognitionWorkerEnabled({
       reliabilityDisabled: false,
       isTest: false,
-      hasInjectedRunner: false,
       hasObjectStore: false,
     })).toBe(false);
     expect(recognitionWorkerEnabled({
       reliabilityDisabled: false,
       isTest: false,
-      hasInjectedRunner: true,
-      hasObjectStore: false,
-    })).toBe(true);
-    expect(recognitionWorkerEnabled({
-      reliabilityDisabled: false,
-      isTest: false,
-      hasInjectedRunner: false,
       hasObjectStore: true,
     })).toBe(true);
   });

@@ -35,6 +35,10 @@ import {
   type MealRecognizer,
   type RecognitionResultV2,
 } from '../src/services/meal-recognizer';
+import { recognitionLedgerFixture } from './fixtures/recognition-ledger';
+import {
+  recognitionLedgerInvariantErrors,
+} from './harness/recognition-coordinator-harness';
 
 const bytes = new Uint8Array([1, 2, 3]);
 const sha256 = createHash('sha256').update(bytes).digest('hex');
@@ -411,6 +415,25 @@ function makeLegacyRunner(s: State, options: {
 }
 
 describe('MealRecognitionCoordinator', () => {
+  test('keeps the durable fixture one-execution and one-invocation fenced', () => {
+    expect(recognitionLedgerInvariantErrors({
+      workflowId: recognitionLedgerFixture.workflow.id,
+      executions: [recognitionLedgerFixture.execution],
+      invocations: [recognitionLedgerFixture.invocation],
+    })).toEqual([]);
+    expect(recognitionLedgerInvariantErrors({
+      workflowId: recognitionLedgerFixture.workflow.id,
+      executions: [
+        recognitionLedgerFixture.execution,
+        {
+          ...recognitionLedgerFixture.execution,
+          id: 'duplicate-execution',
+        },
+      ],
+      invocations: [],
+    })).toContain('duplicate_execution_ordinal');
+  });
+
   test('durably queues the initial execution before provider work starts', async () => {
     const s = state();
     await makeCoordinator(s).enqueueInitial('meal', 'user');

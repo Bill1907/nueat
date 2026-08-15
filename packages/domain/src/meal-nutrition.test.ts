@@ -9,6 +9,7 @@ import {
   type NutrientProfileValues,
   type ServingConversion,
 } from './meal-nutrition';
+import { partialNutritionFixture } from '../test/fixtures/partial-nutrition';
 
 const riceBowl: ServingConversion = {
   id: 'serving-rice-bowl',
@@ -129,6 +130,18 @@ describe('nutrient calculation', () => {
 });
 
 describe('meal totals', () => {
+  test('keeps the fixture unknown item null instead of converting it to zero', () => {
+    const result = calculateMealNutrition(partialNutritionFixture);
+
+    expect(result.items[1]?.nutrients.energyMillicalories).toBeNull();
+    expect(result.totals.energyMillicalories).toEqual({
+      value: null,
+      knownValue: 120_000,
+      missingItemCount: 1,
+      completeness: 'partial',
+    });
+  });
+
   test('calculates known totals and marks a nutrient partial when any item is missing', () => {
     const result = calculateMealNutrition([
       {

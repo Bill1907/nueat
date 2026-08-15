@@ -55,9 +55,12 @@ import {
   selectTrustedNutrition,
   type TrustedNutritionSelection,
 } from '../services/catalog-eligibility-selector';
-import { projectMealItemAuthority } from '../services/meal-item-authority';
+import {
+  MANUAL_REVIEW_FINGERPRINT_VERSION,
+  projectManualMealItemAuthority,
+  projectMealItemAuthority,
+} from '../services/meal-item-authority';
 import { catalogEligibilityAdapter } from '../services/meal-resolution-coordinator';
-const MANUAL_REVIEW_FINGERPRINT_VERSION = 'meal-manual-review-authority-v1';
 const mealTypeSchema = z.enum(['breakfast', 'lunch', 'dinner', 'snack']);
 const servingUnitSchema = z.enum(['g', 'ml', 'serving', 'bowl', 'piece']);
 const dateTimeSchema = z.iso
@@ -2235,7 +2238,14 @@ async function projectCurrentItemAuthority(
 ) {
   if (
     item.foodId === null
-  ) return manualReviewAuthority(item);
+  ) return projectManualMealItemAuthority({
+    id: item.id,
+    itemRevision: item.itemRevision,
+    recognizedLabel: item.recognizedLabel,
+    amountMilliunits: item.amountMilliunits,
+    unit: item.unit,
+    origin: item.origin,
+  });
   const [active] = await database
     .select({
       id: activeCatalogReleasePointers.activationId,
@@ -2413,33 +2423,6 @@ async function projectCurrentItemAuthority(
       mealDecompositionSha256: null,
     },
   });
-}
-
-function manualReviewAuthority(
-  item: Awaited<ReturnType<typeof findMealItems>>[number],
-) {
-  const canonicalFingerprintInput = {
-    version: MANUAL_REVIEW_FINGERPRINT_VERSION,
-    itemId: item.id,
-    itemRevision: item.itemRevision,
-    recognizedLabel: item.recognizedLabel.normalize('NFC'),
-    amountMilliunits: item.amountMilliunits,
-    unit: item.unit,
-    origin: item.origin,
-  };
-  const fingerprint = hash(JSON.stringify(canonicalFingerprintInput));
-  return {
-    version: 'meal-item-authority-projection-v1' as const,
-    itemId: item.id,
-    selected: null,
-    officialSource: null,
-    invalidReason: null,
-    calculationIdentity: null,
-    canonicalFingerprintInput,
-    fingerprintVersion: MANUAL_REVIEW_FINGERPRINT_VERSION,
-    fingerprint,
-    canonicalFingerprintHash: fingerprint,
-  };
 }
 
 function nullAuthority(

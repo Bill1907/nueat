@@ -4,6 +4,9 @@ import { createAuth } from './auth/auth';
 import { parseEnvironment } from './config/env';
 import { buildServer } from './server';
 import { createResendOtpMailer } from './services/otp-mailer';
+import {
+  recognitionEventLogFields,
+} from './services/recognition-observability';
 
 const environment = parseEnvironment(process.env);
 const database = createDatabase(environment.databaseUrl);
@@ -15,13 +18,10 @@ app = await buildServer({
   database,
   auth,
   recognitionEventSink(event) {
-    app?.log.info({
-      recognitionEvent: event.type,
-      executionId: 'executionId' in event ? event.executionId : undefined,
-      workflowId: 'workflowId' in event ? event.workflowId : undefined,
-      code: event.type === 'terminal' ? event.code : undefined,
-      phase: event.type === 'phase' ? event.phase : undefined,
-    }, 'Recognition execution event');
+    app?.log.info(
+      recognitionEventLogFields(event),
+      'Recognition execution event',
+    );
   },
 });
 

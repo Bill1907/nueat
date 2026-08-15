@@ -18,6 +18,7 @@
     "db:migrate:0023": "bun run scripts/migrate.ts 0023",
     "db:migrate:0024": "bun run scripts/migrate.ts 0024",
     "db:validate:recognition-reliability": "bun run scripts/validate-recognition-reliability.ts",
+    "validate:recognition-reliability": "bun run scripts/validate-recognition-reliability.ts",
     "db:check": "bun run scripts/check.ts",
     "db:import:data-go-foods": "bun run scripts/import-data-go-foods.ts",
     "db:catalog:backfill": "bun run scripts/catalog-release.ts --apply --action backfill",

@@ -21,12 +21,11 @@ export type MealRecognitionWorkerStatus = 'idle' | 'running' | 'stopped';
 export function recognitionWorkerEnabled(input: {
   reliabilityDisabled: boolean;
   isTest: boolean;
-  hasInjectedRunner: boolean;
   hasObjectStore: boolean;
 }) {
   return !input.reliabilityDisabled &&
     !input.isTest &&
-    (input.hasInjectedRunner || input.hasObjectStore);
+    input.hasObjectStore;
 }
 
 export class MealRecognitionWorker {
@@ -95,35 +94,6 @@ export class MealRecognitionWorker {
       processed += 1;
     }
 
-    const due = await this.options.database
-      .select({ id: mealLogs.id, userId: mealLogs.userId })
-      .from(mealLogs)
-      .where(and(
-        eq(mealLogs.status, 'draft'),
-        eq(mealLogs.recognitionStatus, 'pending'),
-        lte(mealLogs.recognitionNextAttemptAt, now),
-      ))
-      .orderBy(asc(mealLogs.recognitionNextAttemptAt), asc(mealLogs.id))
-      .limit(this.batchSize);
-
-    for (const mealLog of due) {
-      if (signal?.aborted) break;
-      const queued =
-        await this.options.runner.enqueueInitial?.(
-          mealLog.id,
-          mealLog.userId,
-        ) ?? false;
-      if (!queued) {
-        await this.options.runner.recognize(
-          mealLog.id,
-          mealLog.userId,
-          'initial',
-          signal,
-        );
-        processed += 1;
-      }
-    }
-
     const queued = await this.options.database
       .select({
         id: mealLogs.id,
@@ -154,6 +124,34 @@ export class MealRecognitionWorker {
         signal,
       );
       processed += 1;
+    }
+
+    const due = await this.options.database
+      .select({ id: mealLogs.id, userId: mealLogs.userId })
+      .from(mealLogs)
+      .where(and(
+        eq(mealLogs.status, 'draft'),
+        eq(mealLogs.recognitionStatus, 'pending'),
+        lte(mealLogs.recognitionNextAttemptAt, now),
+      ))
+      .orderBy(asc(mealLogs.recognitionNextAttemptAt), asc(mealLogs.id))
+      .limit(this.batchSize);
+    for (const mealLog of due) {
+      if (signal?.aborted) break;
+      const admitted =
+        await this.options.runner.enqueueInitial?.(
+          mealLog.id,
+          mealLog.userId,
+        ) ?? false;
+      if (!admitted) {
+        await this.options.runner.recognize(
+          mealLog.id,
+          mealLog.userId,
+          'initial',
+          signal,
+        );
+        processed += 1;
+      }
     }
     return processed;
   }

@@ -1,10 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 
 import {
+  projectManualMealItemAuthority,
   projectMealItemAuthority,
   type MealItemAuthorityInput,
 } from '../src/services/meal-item-authority';
-import type { TrustedNutritionSelectorRows } from '../src/services/catalog-eligibility-selector';
+import type {
+  TrustedNutritionSelectorRows,
+} from '../src/services/catalog-eligibility-selector';
+import { manualAuthorityFixture } from './fixtures/manual-authority';
 
 const hash = 'a'.repeat(64);
 const input: MealItemAuthorityInput = {
@@ -48,6 +52,25 @@ function rows(overrides: Partial<TrustedNutritionSelectorRows> = {}): TrustedNut
 }
 
 describe('meal item authority projection', () => {
+  test('binds manual authority to exact reviewed content and revision', () => {
+    const authority = projectManualMealItemAuthority(
+      manualAuthorityFixture,
+    );
+    const revised = projectManualMealItemAuthority({
+      ...manualAuthorityFixture,
+      itemRevision: manualAuthorityFixture.itemRevision + 1,
+    });
+
+    expect(authority).toMatchObject({
+      selected: null,
+      officialSource: null,
+      invalidReason: null,
+      fingerprintVersion: 'meal-manual-review-authority-v1',
+    });
+    expect(authority.fingerprint).toHaveLength(64);
+    expect(revised.fingerprint).not.toBe(authority.fingerprint);
+  });
+
   test('selects only release-member nutrition and exposes official source display', async () => {
     const authority = await projectMealItemAuthority({ load: async () => rows() }, input);
 

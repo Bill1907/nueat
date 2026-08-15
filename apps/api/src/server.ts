@@ -227,7 +227,6 @@ export async function buildServer(dependencies: ServerDependencies) {
     recognitionWorkerEnabled({
       reliabilityDisabled: reliabilityMode === 'disabled',
       isTest: environment.nodeEnv === 'test',
-      hasInjectedRunner: dependencies.recognitionCoordinator !== undefined,
       hasObjectStore: imageObjectStore !== null,
     })
       ? new MealRecognitionWorker({
@@ -281,6 +280,14 @@ export async function buildServer(dependencies: ServerDependencies) {
           protocol: MEAL_CONFIRMATION_SAFE_REVIEW_PROTOCOL,
           barrier: 'required',
           recognitionWorker: recognitionWorker?.status() ?? 'disabled',
+          recognitionReliability: {
+            mode: reliabilityMode,
+            cohortPercent: environment.mealRecognition.reliability.cohortPercent,
+            recoveryEnabled:
+              environment.mealRecognition.reliability.recoveryEnabled,
+            schemaCapabilityRequired: reliabilityMode !== 'disabled',
+            sdkMaxRetries: 0,
+          },
         },
       });
       return;

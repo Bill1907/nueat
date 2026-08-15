@@ -62,14 +62,14 @@ import {
   deriveReviewNutritionCopy,
   isConfirmedMealResponseProjection,
 } from '@/meals/meal-confirmation-review-policy';
+import {
+  mergeObservationRefreshForms,
+  type MealDraftItemForm,
+} from '@/meals/meal-observation-merge';
 
 const units: MealUnit[] = ['g', 'ml', 'serving', 'bowl', 'piece'];
 
-type ItemForm = {
-  recognizedLabel: string;
-  amount: string;
-  unit: MealUnit;
-};
+type ItemForm = MealDraftItemForm;
 type FoodSearchState =
   | { status: 'idle' | 'loading' | 'empty'; foods: CanonicalFood[] }
   | { status: 'error'; foods: CanonicalFood[]; message: string };
@@ -147,8 +147,15 @@ export function MealConfirmationModal({
       setData(response);
       setLoadedMealLogId(response.mealLog.id);
       if (isDraftMealDraftResponse(response)) {
+        const previousItems = itemsRef.current;
         itemsRef.current = response.items;
-        setForms(formsFromItems(response.items));
+        setForms((current) =>
+          mergeObservationRefreshForms(
+            current,
+            previousItems,
+            response.items,
+          ),
+        );
         setMappedFoods((current) =>
           Object.fromEntries(
             response.items.flatMap((item) => {
@@ -1311,19 +1318,6 @@ export function MealConfirmationModal({
         )}
       </ThemedView>
     </Modal>
-  );
-}
-
-function formsFromItems(items: MealDraftItem[]) {
-  return Object.fromEntries(
-    items.map((item) => [
-      item.id,
-      {
-        recognizedLabel: item.recognizedLabel,
-        amount: (item.amountMilliunits / 1000).toString(),
-        unit: item.unit,
-      },
-    ]),
   );
 }
 
