@@ -637,6 +637,11 @@ export function MealConfirmationModal({
   const recognitionRecoveryPolicy = deriveRecognitionRecoveryPolicy({
     recovery: draftData?.mealLog.recognitionRecovery,
     localPollingTimedOut: recognitionTimedOut,
+    recognitionStatus: draftData?.mealLog.recognitionStatus,
+    hasStoredObservation: draftData
+      ? draftData.items.length > 0 ||
+        draftData.mealLog.recognitionOutcome !== null
+      : false,
   });
   const canOverrideZeroItemRecognition =
     draftData?.mealLog.recognitionStatus === 'ready' &&
@@ -1267,7 +1272,11 @@ export function MealConfirmationModal({
                 {nutritionKeys.map((key) => (
                   <ThemedText key={key} type="small" themeColor="textSecondary">
                     {nutritionLabel(key)}:{' '}
-                    {formatConfirmedNutritionValue(confirmedNutrition.totals[key], key)}
+                    {formatConfirmedNutritionValue(
+                      confirmedNutrition.totals[key],
+                      key,
+                      confirmedNutrition.items.length,
+                    )}
                   </ThemedText>
                 ))}
                 <ThemedText type="small" themeColor="textSecondary">
@@ -1384,8 +1393,10 @@ function nutritionLabel(key: (typeof nutritionKeys)[number]) {
 function formatConfirmedNutritionValue(
   total: ConfirmedNutrientValue,
   key: (typeof nutritionKeys)[number],
+  itemCount: number,
 ) {
   if (total.completeness === 'partial') {
+    if (total.missingItemCount >= itemCount) return '— · 영양 정보 없음';
     return `${formatNutritionValue(total.knownValue, key)} · 일부 항목 확인 필요`;
   }
   return total.value === null ? '확인 필요' : formatNutritionValue(total.value, key);
@@ -1394,6 +1405,9 @@ function formatConfirmedNutritionValue(
 function confirmedItemSourceLabel(
   item: ConfirmedMealNutrition['items'][number],
 ) {
+  if (item.source.foodId === null) {
+    return '사용자 확인 · 공식 영양 정보 없음';
+  }
   const serving = item.source.servingId
     ? ` · 제공량 ${item.source.servingId} (${item.source.servingQualityGrade ?? '품질 정보 없음'}${
         item.source.servingSourceRegistryId

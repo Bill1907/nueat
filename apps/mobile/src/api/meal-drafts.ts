@@ -35,7 +35,7 @@ interface MealLogBase {
   mealType: MealType;
   imageAssetId: string | null;
   recognitionStatus: RecognitionStatus;
-  recognitionRecovery: RecognitionRecovery;
+  recognitionRecovery?: RecognitionRecovery;
   draftRevision: number;
   recognitionOutcome: 'recognized' | 'no_food' | 'insufficient_evidence' | null;
   recognitionEvidenceReason: string | null;
@@ -172,7 +172,7 @@ export interface ConfirmedMealNutritionItem {
   mealItemId: string;
   amountMilliunits: number;
   unit: MealUnit;
-  gramsMg: number;
+  gramsMg: number | null;
   nutrients: {
     energyMillicalories: number | null;
     carbohydrateMg: number | null;
@@ -182,7 +182,7 @@ export interface ConfirmedMealNutritionItem {
   };
   calculationPreview: unknown | null;
   source: {
-    foodId: string;
+    foodId: string | null;
     nutrientProfileId: string | null;
     sourceRegistryId: string | null;
     sourceItemId: string | null;
@@ -207,7 +207,7 @@ export interface ConfirmedMealNutrition {
 
 export interface ConfirmedMealDraftItem {
   mealItemId: string;
-  foodId: string;
+  foodId: string | null;
   nutrientProfileId: string | null;
   nutrients: ConfirmedMealNutritionItem['nutrients'];
   provenance: {

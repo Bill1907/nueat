@@ -131,7 +131,6 @@ export function createConfirmMealDraftInput(
   for (const item of draft.items) {
     const proof = item.confirmationProof;
     if (proof === null) {
-      if (item.origin === 'model_estimate') return null;
       items.push({
         itemId: item.id,
         expectedItemRevision: item.itemRevision,
@@ -188,12 +187,43 @@ function isRecognitionRecovery(value: unknown): value is RecognitionRecovery {
 export function deriveRecognitionRecoveryPolicy({
   recovery,
   localPollingTimedOut,
+  recognitionStatus,
+  hasStoredObservation = false,
 }: {
   recovery: RecognitionRecovery | null | undefined | unknown;
   localPollingTimedOut: boolean;
+  recognitionStatus?: RecognitionStatus;
+  hasStoredObservation?: boolean;
 }): RecognitionRecoveryPolicy {
   if (localPollingTimedOut) return localTimeoutRecoveryPolicy;
-  if (!isRecognitionRecovery(recovery)) return unknownRecoveryPolicy;
+  if (!isRecognitionRecovery(recovery)) {
+    if (
+      hasStoredObservation ||
+      recognitionStatus === 'ready'
+    ) {
+      return {
+        canRetryRecognition: false,
+        canStartDirectEntry: false,
+        retryLabel: null,
+        showRefresh: false,
+        showProgress: false,
+        message: '음식 인식 결과를 확인해 주세요. 인식 복구 기능은 현재 사용할 수 없어요.',
+      };
+    }
+    if (
+      recognitionStatus === 'pending' ||
+      recognitionStatus === 'processing'
+    ) return inProgressRecoveryPolicy;
+    if (recognitionStatus === 'manual') {
+      return {
+        ...inProgressRecoveryPolicy,
+        canStartDirectEntry: true,
+        showProgress: false,
+        message: '직접 입력으로 식사를 기록할 수 있어요.',
+      };
+    }
+    return unknownRecoveryPolicy;
+  }
 
   switch (recovery.mode) {
     case 'none':

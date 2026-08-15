@@ -228,6 +228,39 @@ describe('meal recognition polling policy', () => {
     }
   });
 
+  test('keeps stored observations visible when an older API omits recovery metadata', () => {
+    const policy = deriveRecognitionRecoveryPolicy({
+      recovery: undefined,
+      localPollingTimedOut: false,
+      recognitionStatus: 'ready',
+      hasStoredObservation: true,
+    });
+
+    expect(policy).toMatchObject({
+      canRetryRecognition: false,
+      canStartDirectEntry: false,
+      showRefresh: false,
+      showProgress: false,
+    });
+    expect(policy.message).toContain('음식 인식 결과를 확인해 주세요');
+    expect(policy.message).toContain('복구 기능은 현재 사용할 수 없어요');
+  });
+
+  test('derives legacy in-progress state when recovery metadata is absent', () => {
+    const policy = deriveRecognitionRecoveryPolicy({
+      recovery: undefined,
+      localPollingTimedOut: false,
+      recognitionStatus: 'pending',
+      hasStoredObservation: false,
+    });
+
+    expect(policy).toMatchObject({
+      canRetryRecognition: false,
+      canStartDirectEntry: false,
+      showProgress: true,
+    });
+  });
+
   test('treats a local polling timeout as presentation-only refresh and direct entry', () => {
     const policy = deriveRecognitionRecoveryPolicy({
       recovery: { mode: 'none', reason: 'in_progress', retryAt: null },
@@ -272,7 +305,7 @@ describe('meal recognition polling policy', () => {
     }));
   });
 
-  test('uses decomposition proof IDs and omits absent proof or optional keys', () => {
+  test('uses decomposition proof IDs and sends reviewed unmapped model items without proof IDs', () => {
     const decomposed = createConfirmMealDraftInput(
       resolvedDraft({
         id: 'item-2',
@@ -305,7 +338,14 @@ describe('meal recognition polling policy', () => {
         decompositionRevisionId: 'decomposition-opaque',
       }],
     }));
-    expect(missingProof).toBeNull();
+    expect(missingProof).toEqual({
+      expectedDraftRevision: 7,
+      idempotencyKey: 'idempotency-opaque',
+      items: [{
+        itemId: 'item-3',
+        expectedItemRevision: 3,
+      }],
+    });
   });
 
   test('allows reviewed canonical legacy persisted item without V3 proof', () => {
@@ -326,6 +366,26 @@ describe('meal recognition polling policy', () => {
         expectedItemRevision: 3,
       }],
     }));
+  });
+
+  test('allows reviewed manual intake without synthesized nutrition proof', () => {
+    const request = createConfirmMealDraftInput(
+      resolvedDraft({
+        id: 'manual-item',
+        origin: 'manual_entry',
+        confirmationProof: null,
+      }),
+      'manual-review-confirm',
+    );
+
+    expect(request).toMatchObject({
+      expectedDraftRevision: 7,
+      idempotencyKey: 'manual-review-confirm',
+      items: [{
+        itemId: 'manual-item',
+        expectedItemRevision: 3,
+      }],
+    });
   });
 
   test('backs off with a bounded delay', () => {
