@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "kind": "executor-qa-report",
+  "sourceHash": "sha256:e7f6eb023eb134bca717d229dd3cde93d4a6ae22a181d876031158849036e07d",
+  "generatedAt": "2026-08-15T04:58:00.000Z",
+  "status": "blocked_on_production_credentials",
+  "e2eStatus": "passed_local_package_surfaces",
+  "redTeamStatus": "passed_code_blocked_release",
+  "contractCoverage": [
+    "draft-before-recognition and idempotent queue admission",
+    "queued/open lease and CAS fencing across API replicas",
+    "expired execution reconciliation without a client request",
+    "one invocation per execution and no coordinator replay",
+    "immutable V3 observations independent from catalog resolution",
+    "manual edits win over late observations",
+    "reviewed unmapped AI intake with all unknown nutrition preserved as null",
+    "revision-bound review invalidation without time expiry",
+    "current and previous mobile recovery/observation compatibility",
+    "ownership, deletion schema, privacy-safe logs and receipts",
+    "additive migration inventory, guard, rollback-only harness and readiness probe"
+  ],
+  "surfaceEvidence": [
+    "420 tests passed, 0 failed, 1777 assertions across 55 files",
+    "17 database, 119 API, 17 mobile and 21 domain exact-plan tests passed",
+    "workspace typecheck, mobile lint, database script typecheck, db:check and git diff --check passed",
+    "iOS production export passed",
+    "TestFlight 1.0.0 (12) uploaded under submission 3c01d012-947c-465e-a8f8-1358140bb8bc",
+    "production safe-review health remained ready after the mobile compatibility release"
+  ],
+  "adversarialCases": [
+    "two replicas polling one queued execution",
+    "queued deadline expiry and open execution crash recovery",
+    "provider success followed by catalog failure",
+    "manual switch during provider finalization",
+    "missing, zero and null observation quantities",
+    "missing, legacy and unsupported recovery metadata with stored observations",
+    "late observation refresh during local label/amount/unit edits",
+    "all-null confirmed nutrition and no false zero display",
+    "mode, cohort, SDK retry, readiness and privacy probe mismatch"
+  ],
+  "artifactRefs": [
+    "artifacts/recognition-observation-first-test-report.json",
+    "artifacts/recognition-observation-first-red-team-report.json"
+  ],
+  "blockers": [
+    "Guarded isolated Neon validation and production migration require operator-controlled credentials and change metadata unavailable in this session.",
+    "The minimum 24-hour production v2 canary and its SLO/privacy/replay/compatibility receipts cannot begin before the guarded migration and rollout."
+  ]
+}

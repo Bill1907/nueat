@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "sourceHash": "sha256:e7f6eb023eb134bca717d229dd3cde93d4a6ae22a181d876031158849036e07d",
+  "generatedAt": "2026-08-15T03:56:00.000Z",
+  "status": "blocked_on_production_credentials",
+  "passed": [
+    {
+      "command": "bun run typecheck",
+      "result": "all four workspace packages passed"
+    },
+    {
+      "command": "bun test",
+      "result": "420 passed, 0 failed, 1777 assertions across 55 files"
+    },
+    {
+      "command": "bun run lint",
+      "result": "mobile Expo lint passed"
+    },
+    {
+      "command": "bun run --cwd packages/database typecheck:scripts",
+      "result": "passed"
+    },
+    {
+      "command": "bun test packages/database/src/recognition-reliability-schema.test.ts packages/database/src/recognition-reliability-validation.test.ts packages/database/src/migration-target-guard.test.ts",
+      "result": "15 passed, 0 failed, 76 assertions"
+    },
+    {
+      "command": "bun run --cwd packages/database db:check",
+      "result": "Drizzle schema and committed snapshot are consistent"
+    },
+    {
+      "command": "exact approved database/API/mobile/domain test commands",
+      "result": "17 database, 119 API, 17 mobile, and 21 domain tests passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "bunx expo export --platform ios --output-dir /tmp/nueat-ios-export-redesign",
+      "result": "iOS production bundle exported"
+    },
+    {
+      "command": "local EAS iOS production build and submit",
+      "result": "1.0.0 (12) signed and uploaded; submission 3c01d012-947c-465e-a8f8-1358140bb8bc"
+    },
+    {
+      "command": "GET https://api-nueat.boseong.dev/health/ready",
+      "result": "200 ready after mobile-only release; database up; safe-review protocol"
+    }
+  ],
+  "blocked": [
+    {
+      "command": "bun run --cwd packages/database db:validate:recognition-reliability",
+      "result": "Database target verification failed",
+      "reason": "Operator-controlled Neon project/branch credentials and guarded isolated target are unavailable in this session. No guard was bypassed and no production migration was attempted."
+    },
+    {
+      "surface": "production rollout",
+      "reason": "Migration 0024 and the API commit fc8ced8 cannot be pushed safely until guarded migration credentials and production change metadata are supplied."
+    }
+  ]
+}
