@@ -62,6 +62,51 @@ describe('calculation input snapshots', () => {
     });
   });
 
+  test('preserves reviewed unmapped intake with null nutrition authority', () => {
+    const manualItem: CalculationInputSnapshotV2['mealItems'][number] = {
+      ...v2Item,
+      origin: 'manual_entry',
+      currentResolutionSource: null,
+      foodId: null,
+      nutrientProfileId: null,
+      gramsMg: null,
+      sourceRegistryId: null,
+      sourceItemId: null,
+      datasetVersion: null,
+      nutrientProfileQualityGrade: null,
+      nutrientProfile: null,
+      nutrients: {
+        energyMillicalories: null,
+        carbohydrateMg: null,
+        proteinMg: null,
+        fatMg: null,
+        fiberMg: null,
+      },
+      authority: {
+        fingerprintVersion: 'meal-manual-review-authority-v1',
+        fingerprint: hash,
+      },
+      provenance: {
+        calculationVersion: 'meal-nutrition-v1',
+        sourceRegistryId: null,
+        sourceItemId: null,
+        datasetVersion: null,
+        nutrientProfileId: null,
+      },
+    };
+    const snapshot = { ...v2, mealItems: [manualItem] };
+    const parsed = parseCalculationInputSnapshot(snapshot);
+
+    expect(parsed).toEqual({ kind: 'v2', snapshot });
+    expect(parsed && projectCalculationInputSnapshot(parsed)).toMatchObject({
+      mealItems: [{
+        foodId: null,
+        nutrients: { energyMillicalories: null },
+        authority: manualItem.authority,
+      }],
+    });
+  });
+
   test('parses the V2 writer confirmation fixture for every supported manual origin', () => {
     for (const [fromStatus, fromOutcome] of [
       ['ready', 'no_food'],

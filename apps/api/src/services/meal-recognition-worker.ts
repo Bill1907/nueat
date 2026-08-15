@@ -1,0 +1,97 @@
+import { mealLogs, type Database } from '@nueat/database';
+import { and, asc, eq, lte } from 'drizzle-orm';
+
+import type { MealRecognitionRunner } from './meal-recognition-coordinator';
+
+export interface MealRecognitionWorkerOptions {
+  database: Database;
+  runner: MealRecognitionRunner;
+  pollIntervalMs?: number;
+  batchSize?: number;
+  onError?: (code: 'RECOGNITION_WORKER_POLL_FAILED') => void;
+}
+
+export type MealRecognitionWorkerStatus = 'idle' | 'running' | 'stopped';
+
+export class MealRecognitionWorker {
+  private readonly pollIntervalMs: number;
+  private readonly batchSize: number;
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private controller: AbortController | undefined;
+  private activeRun: Promise<number> | undefined;
+  private stopped = true;
+
+  constructor(private readonly options: MealRecognitionWorkerOptions) {
+    this.pollIntervalMs = options.pollIntervalMs ?? 1_000;
+    this.batchSize = options.batchSize ?? 4;
+  }
+
+  status(): MealRecognitionWorkerStatus {
+    if (this.stopped) return 'stopped';
+    return this.activeRun ? 'running' : 'idle';
+  }
+
+  start() {
+    if (!this.stopped) return;
+    this.stopped = false;
+    this.controller = new AbortController();
+    this.schedule(0);
+  }
+
+  async stop() {
+    this.stopped = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    this.controller?.abort();
+    await this.activeRun;
+    this.activeRun = undefined;
+    this.controller = undefined;
+  }
+
+  async runOnce(signal?: AbortSignal): Promise<number> {
+    if (signal?.aborted) return 0;
+    const now = new Date();
+    const due = await this.options.database
+      .select({ id: mealLogs.id, userId: mealLogs.userId })
+      .from(mealLogs)
+      .where(and(
+        eq(mealLogs.status, 'draft'),
+        eq(mealLogs.recognitionStatus, 'pending'),
+        lte(mealLogs.recognitionNextAttemptAt, now),
+      ))
+      .orderBy(asc(mealLogs.recognitionNextAttemptAt), asc(mealLogs.id))
+      .limit(this.batchSize);
+
+    let processed = 0;
+    for (const mealLog of due) {
+      if (signal?.aborted) break;
+      await this.options.runner.enqueueInitial?.(mealLog.id, mealLog.userId);
+      await this.options.runner.recognize(
+        mealLog.id,
+        mealLog.userId,
+        'initial',
+        signal,
+      );
+      processed += 1;
+    }
+    return processed;
+  }
+
+  private schedule(delayMs: number) {
+    if (this.stopped) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      const signal = this.controller?.signal;
+      this.activeRun = this.runOnce(signal)
+        .catch(() => {
+          this.options.onError?.('RECOGNITION_WORKER_POLL_FAILED');
+          return 0;
+        })
+        .finally(() => {
+          this.activeRun = undefined;
+          this.schedule(this.pollIntervalMs);
+        });
+    }, delayMs);
+    this.timer.unref();
+  }
+}

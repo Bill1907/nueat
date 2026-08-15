@@ -235,7 +235,7 @@ NUEAT은 한국 식문화에 맞춘 개인 영양 의사결정 앱이다. 사용
 - 이미지·base64·signed URL·object key·EXIF·이메일은 분석 및 오류 로그에 기록하지 않는다. 이미지 학습 사용은 별도 opt-in 전까지 금지한다.
 - 업로드 API는 인증된 `POST /api/image-assets/upload-intents` → signed PUT → `POST /api/image-assets/:id/complete` 순서다. 완료 API가 실제 객체를 다시 읽어 계약 일치, 디코딩, 형식, 1,600px 제한, 민감 EXIF/GPS 제거, SHA-256을 검증한 뒤에만 `validated`로 전환한다.
 - 모바일은 원본을 그대로 업로드하지 않는다. 재인코딩 과정에서 원본 위치·기기·촬영시각 등 식별 메타데이터를 제거하고, 서버는 GPS와 허용된 정규화 방향/크기 필드 외 EXIF를 거부한다. 네트워크 실패·취소 시 로컬 초안 하나를 최대 24시간 보존한다.
-- 검증된 이미지는 하나의 MealLog에만 연결한다. `POST /api/meal-logs`는 이미지 기준 멱등성을 보장하고, 소유한 `validated` 이미지를 트랜잭션 안에서 claim한 뒤 `draft`만 생성한다. 앱은 연결 응답을 받기 전에 로컬 `validatedAssetId`를 저장해 재시작 후에도 업로드 없이 연결을 재시도한다.
+- 검증된 이미지는 하나의 MealLog에만 연결한다. `POST /api/meal-logs`는 이미지 기준 멱등성을 보장하고, 소유한 `validated` 이미지를 트랜잭션 안에서 claim한 뒤 `draft`와 durable recognition execution을 먼저 생성·응답한다. AI 인식은 API 프로세스가 PostgreSQL queue를 polling해 비동기로 수행하며, provider·catalog·recovery 실패가 초안 생성을 실패로 바꾸면 안 된다. 저장된 관찰은 recovery metadata와 독립적으로 표시하고, 직접 입력 전환 뒤 도착한 관찰은 보존하되 사용자 항목에 자동 병합하지 않는다. 앱은 연결 응답을 받기 전에 로컬 `validatedAssetId`를 저장해 재시작 후에도 업로드 없이 연결을 재시도한다.
 - AI 제공자 결정 전 vertical slice와 로컬 개발은 `mock-recognition-v2`의 고정 V2 음식·양·confidence/outcome을 사용한다. mock 값에는 영양 수치나 공식 Food/Profile ID가 없고 확정 섭취로 집계하지 않으며, 확인 화면에서 모든 인식 항목을 보고 필요한 음식명·양·단위만 교정할 수 있다.
 
 ### 9.6 영양 목표 계산 기준

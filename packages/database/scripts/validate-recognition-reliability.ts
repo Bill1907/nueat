@@ -152,15 +152,21 @@ const stateFixtures = `
 
   -- Expired initial and user-recovery executions have separate reservation paths.
   INSERT INTO "recognition_execution" (
-    "id", "workflow_id", "execution_ordinal", "trigger", "wall_deadline_at", "lease_token"
+    "id", "workflow_id", "execution_ordinal", "trigger", "wall_deadline_at", "status"
   ) VALUES (
     '00000000-0000-0000-0000-000000000104',
     '00000000-0000-0000-0000-000000000103',
     1,
     'initial',
     now() - interval '1 minute',
-    '00000000-0000-0000-0000-000000000201'
+    'queued'
   );
+  UPDATE "recognition_execution"
+  SET status = 'open',
+      phase = 'asset_read',
+      lease_token = '00000000-0000-0000-0000-000000000201'
+  WHERE id = '00000000-0000-0000-0000-000000000104'
+    AND status = 'queued';
 
   UPDATE "recognition_attempt"
   SET next_execution_ordinal = 3

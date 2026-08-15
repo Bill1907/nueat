@@ -71,6 +71,21 @@ describe('current item review checkpoint', () => {
       nextAction: 'refresh_official_source',
     });
   });
+
+  test('allows explicit manual authority without inventing catalog authority', () => {
+    expect(deriveCurrentItemReviewCheckpoint(checkpoint({
+      selectedFoodId: null,
+      officialSourceRevision: null,
+      currentOfficialSourceRevision: null,
+      manualAuthority: true,
+    }))).toMatchObject({
+      selection: 'selected',
+      officialSource: 'current',
+      userReview: 'current',
+      nextAction: 'none',
+      confirmable: true,
+    });
+  });
 });
 
 describe('meal confirmability', () => {

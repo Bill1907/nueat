@@ -1,7 +1,17 @@
 import { createHash } from 'node:crypto';
 
 import { describe, expect, test } from 'bun:test';
-import { foodAliases, imageAssets, nutrientProfiles, recognitionAttempts, recognitionDailyUsages, recognitionExecutions, recognitionProviderInvocations, storedObservations } from '@nueat/database';
+import {
+  foodAliases,
+  imageAssets,
+  nutrientProfiles,
+  recognitionAttempts,
+  recognitionDailyUsages,
+  recognitionExecutions,
+  recognitionProviderInvocations,
+  resolutionAttempts,
+  storedObservations,
+} from '@nueat/database';
 
 import {
   MealRecognitionCoordinator,
@@ -60,6 +70,7 @@ type State = {
   executions: Record<string, unknown>[];
   invocations: Record<string, unknown>[];
   workflows: Record<string, unknown>[];
+  observations: Record<string, unknown>[];
 };
 
 function state(overrides: Partial<State> = {}): State {
@@ -85,6 +96,7 @@ function state(overrides: Partial<State> = {}): State {
     executions: [],
     invocations: [],
     workflows: [],
+    observations: [],
     ...overrides,
   };
 }
@@ -100,7 +112,11 @@ function fakeDatabase(s: State) {
           }
           if (table === storedObservations) return [];
           if (table === recognitionAttempts) return s.workflows.length ? [s.workflows[0]] : [];
-          if (table === recognitionExecutions) return [];
+          if (table === recognitionExecutions) {
+            return Object.hasOwn(fields, 'executionOrdinal')
+              ? s.executions
+              : [];
+          }
           if (table === nutrientProfiles) {
             if (s.mappingLookupFails) throw new Error('mapping lookup failed');
             return s.profiles;
@@ -120,7 +136,10 @@ function fakeDatabase(s: State) {
           if (table === recognitionDailyUsages) return [];
           if (s.deleted) return [];
           return [{
-            id: 'meal', recognitionStatus: s.status,
+            id: 'meal',
+            status: s.deleted ? 'deleted' : 'draft',
+            recognitionStatus: s.status,
+            recognitionLeaseToken: s.leaseToken,
             recognitionLeaseExpiresAt: s.leaseExpiresAt,
             recognitionNextAttemptAt: s.nextAttemptAt,
             recognitionAttemptCount: s.attempts,
@@ -141,12 +160,13 @@ function fakeDatabase(s: State) {
           },
         };
       };
-      return {
+      const joinable = {
         where: applyWhere,
         innerJoin() {
-          return { where: applyWhere };
+          return joinable;
         },
       };
+      return joinable;
     },
   });
 
@@ -256,11 +276,43 @@ function fakeDatabase(s: State) {
           }
           if (table === recognitionAttempts) {
             s.workflows.push(...(Array.isArray(rows) ? rows : [rows]));
-            return { then: async (resolve: (value: unknown) => unknown) => resolve(undefined) };
+            return {
+              then: async (resolve: (value: unknown) => unknown) =>
+                resolve(undefined),
+              onConflictDoNothing() {
+                return {
+                  returning: async () => [{ id: 'workflow' }],
+                };
+              },
+            };
           }
           if (table === recognitionProviderInvocations) {
             s.invocations.push(...(Array.isArray(rows) ? rows : [rows]));
             return { then: async (resolve: (value: unknown) => unknown) => resolve(undefined) };
+          }
+          if (table === storedObservations) {
+            s.observations.push(
+              ...(Array.isArray(rows) ? rows : [rows]).map((row) => ({
+                id: 'observation',
+                ...row,
+              })),
+            );
+            return {
+              returning: async () => [{ id: 'observation' }],
+              onConflictDoNothing() {
+                return {
+                  returning: async () => [{ id: 'observation' }],
+                  then: async (resolve: (value: unknown) => unknown) =>
+                    resolve(undefined),
+                };
+              },
+            };
+          }
+          if (table === resolutionAttempts) {
+            return {
+              then: async (resolve: (value: unknown) => unknown) =>
+                resolve(undefined),
+            };
           }
           return { then: async (resolve: (value: unknown) => unknown) => resolve(s.items.push(...(Array.isArray(rows) ? rows : [rows]))) };
         },
@@ -359,6 +411,37 @@ function makeLegacyRunner(s: State, options: {
 }
 
 describe('MealRecognitionCoordinator', () => {
+  test('durably queues the initial execution before provider work starts', async () => {
+    const s = state();
+    await makeCoordinator(s).enqueueInitial('meal', 'user');
+
+    expect(s.workflows).toHaveLength(1);
+    expect(s.workflows[0]).toMatchObject({
+      mealLogId: 'meal',
+      imageAssetId: 'asset',
+      status: 'pending',
+      protocolVersion: 'v2_option_b',
+      nextExecutionOrdinal: 2,
+      automaticExecutionCount: 1,
+      automaticInvocationReservationCount: 0,
+    });
+    expect(s.executions).toHaveLength(1);
+    expect(s.executions[0]).toMatchObject({
+      workflowId: expect.any(String),
+      executionOrdinal: 1,
+      trigger: 'initial',
+      leaseToken: null,
+      phase: 'claim',
+      status: 'queued',
+    });
+
+    await expect(
+      makeCoordinator(s).recognize('meal', 'user'),
+    ).resolves.toMatchObject({ status: 'ready' });
+    expect(s.executions).toHaveLength(1);
+    expect(s.invocations).toHaveLength(1);
+  });
+
   test('caller abort before reservation prevents provider dispatch and emits only bounded events', async () => {
     const s = state();
     const controller = new AbortController();
@@ -974,8 +1057,15 @@ describe('MealRecognitionCoordinator', () => {
         return { provider: 'mock', model: 'test', promptVersion: MEAL_RECOGNITION_PROMPT_VERSION, schemaVersion: MEAL_RECOGNITION_SCHEMA_VERSION, inputTokens: 1, outputTokens: 1, result };
       } });
       const outcome = await coordinator.recognize('meal', 'user');
-      expect(outcome.status).toBe(mutation === 'stale' ? 'active' : 'unavailable');
+      expect(outcome.status).toBe(
+        mutation === 'stale'
+          ? 'active'
+          : mutation === 'manual'
+            ? 'ready'
+            : 'unavailable',
+      );
       expect(s.items).toHaveLength(0);
+      expect(s.observations).toHaveLength(mutation === 'manual' ? 1 : 0);
     }
   });
   test('persists no_food as a ready, zero-item immutable recognition result', async () => {
@@ -996,7 +1086,9 @@ describe('MealRecognitionCoordinator', () => {
 
   test('persists recognized model origin and immutable V2 assessment', async () => {
     const s = state();
-    await expect(makeCoordinator(s).recognize('meal', 'user')).resolves.toEqual({ status: 'ready' });
+    expect(await makeCoordinator(s).recognize('meal', 'user')).toEqual({
+      status: 'ready',
+    });
     expect(s.items).toEqual([]);
   });
 

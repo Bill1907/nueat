@@ -52,6 +52,7 @@ import { nutritionTargetRoutes } from './routes/nutrition-target';
 import { sessionRoutes } from './routes/session';
 import { recommendationRoutes } from './routes/recommendation';
 import { isInRecognitionCohort } from './services/recognition-cohort';
+import { MealRecognitionWorker } from './services/meal-recognition-worker';
 
 export interface ServerDependencies {
   environment: ApiEnvironment;
@@ -219,6 +220,24 @@ export async function buildServer(dependencies: ServerDependencies) {
       disableRequestLogging: environment.nodeEnv === 'test',
     }),
   });
+  const recognitionWorker =
+    reliabilityMode === 'disabled' || environment.nodeEnv === 'test'
+      ? null
+      : new MealRecognitionWorker({
+          database: dependencies.database,
+          runner: recognitionCoordinator,
+          onError(code) {
+            app.log.error({ code }, 'Recognition worker poll failed');
+          },
+        });
+  if (recognitionWorker) {
+    app.addHook('onReady', async () => {
+      recognitionWorker.start();
+    });
+    app.addHook('onClose', async () => {
+      await recognitionWorker.stop();
+    });
+  }
 
   await app.register(cors, {
     credentials: true,
@@ -253,6 +272,7 @@ export async function buildServer(dependencies: ServerDependencies) {
           mode: environment.mealConfirmationCutover.mode,
           protocol: MEAL_CONFIRMATION_SAFE_REVIEW_PROTOCOL,
           barrier: 'required',
+          recognitionWorker: recognitionWorker?.status() ?? 'disabled',
         },
       });
       return;
@@ -488,6 +508,9 @@ export function cohortGatedRecognitionRunner(
   if (reliability.protocolMode === 'disabled') return unavailableRecognitionRunner;
   if (reliability.protocolMode === 'legacy_observe') {
     return {
+      async enqueueInitial(mealLogId, userId) {
+        await legacyRunner.enqueueInitial?.(mealLogId, userId);
+      },
       async reconcile(mealLogId, userId) {
         return legacyRunner.reconcile(mealLogId, userId);
       },
@@ -502,6 +525,13 @@ export function cohortGatedRecognitionRunner(
     };
   }
   return {
+    async enqueueInitial(mealLogId, userId) {
+      if (!isInRecognitionCohort(userId, reliability.cohortPercent)) {
+        await legacyRunner.enqueueInitial?.(mealLogId, userId);
+        return;
+      }
+      await v2Runner.enqueueInitial?.(mealLogId, userId);
+    },
     async reconcile(mealLogId, userId) {
       return v2Runner.reconcile(mealLogId, userId);
     },

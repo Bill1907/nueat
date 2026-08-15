@@ -88,6 +88,7 @@ export const recognitionExecutionPhaseEnum = pgEnum('recognition_execution_phase
   'reconciliation',
 ]);
 export const recognitionExecutionStatusEnum = pgEnum('recognition_execution_status', [
+  'queued',
   'open',
   'succeeded',
   'failed',
@@ -687,7 +688,7 @@ export const recognitionExecutions = pgTable(
     executionOrdinal: integer('execution_ordinal').notNull(),
     trigger: recognitionExecutionTriggerEnum('trigger').notNull(),
     wallDeadlineAt: timestamp('wall_deadline_at', { withTimezone: true }).notNull(),
-    leaseToken: uuid('lease_token').notNull(),
+    leaseToken: uuid('lease_token'),
     phase: recognitionExecutionPhaseEnum('phase').default('claim').notNull(),
     status: recognitionExecutionStatusEnum('status').default('open').notNull(),
     terminalCode: recognitionFailureCodeEnum('terminal_code'),
@@ -702,11 +703,12 @@ export const recognitionExecutions = pgTable(
     ),
     index('recognition_execution_open_deadline_idx')
       .on(table.wallDeadlineAt)
-      .where(sql`${table.status} = 'open'`),
+      .where(sql`${table.status} in ('queued', 'open')`),
     check('recognition_execution_ordinal_check', sql`${table.executionOrdinal} > 0`),
     check(
       'recognition_execution_terminal_check',
-      sql`(${table.status} = 'open' and ${table.completedAt} is null and ${table.terminalCode} is null)
+      sql`(${table.status} = 'queued' and ${table.leaseToken} is null and ${table.completedAt} is null and ${table.terminalCode} is null)
+        or (${table.status} = 'open' and ${table.leaseToken} is not null and ${table.completedAt} is null and ${table.terminalCode} is null)
         or (${table.status} = 'succeeded' and ${table.completedAt} is not null and ${table.terminalCode} is null)
         or (${table.status} in ('failed', 'abandoned') and ${table.completedAt} is not null and ${table.terminalCode} is not null)`,
     ),

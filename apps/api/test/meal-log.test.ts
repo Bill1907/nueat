@@ -576,7 +576,7 @@ describe('meal log routes', () => {
     expect(JSON.parse(response.body).error.code).toBe('UNAUTHORIZED');
   });
 
-  test('creates a processed draft with the deterministic mock recognizer', async () => {
+  test('creates and returns a queued draft before recognition runs', async () => {
     const { server, state } = await createServer(true);
     const response = await server.inject({
       method: 'POST',
@@ -589,36 +589,22 @@ describe('meal log routes', () => {
       id: mealId,
       imageAssetId: imageId,
       status: 'draft',
-      recognitionStatus: 'ready',
-      recognitionRecovery: { mode: 'none', reason: 'recognition_complete', retryAt: null },
+      recognitionStatus: 'pending',
+      recognitionRecovery: { mode: 'none', reason: 'in_progress', retryAt: null },
       localDate: '2026-08-10',
     });
-    expect(
-      body.items.map(
-        (item: {
-          recognizedLabel: string;
-          amountMilliunits: number;
-          unit: string;
-        }) => [item.recognizedLabel, item.amountMilliunits, item.unit],
-      ),
-    ).toEqual([
-      ['흰쌀밥', 1000, 'bowl'],
-      ['김치찌개', 1000, 'serving'],
-      ['배추김치', 500, 'serving'],
-    ]);
-    expect(state.asset.status).toBe('processed');
+    expect(body.items).toEqual([]);
+    expect(state.asset.status).toBe('processing');
+    expect(state.recognitionEnqueueCalls).toBe(1);
+    expect(state.recognitionCalls).toEqual([]);
     expect(body.review.confirmable).toBeFalse();
-    expect(body.review.reasons).toContainEqual({
-      code: 'FOOD_MAPPING_MISSING',
-      itemId,
-    });
     expect(body.review).toMatchObject({
       nextAction: 'select_item',
-      nextItemId: itemId,
+      nextItemId: null,
       reviewedNutrition: {
         status: 'pending',
         reviewedItemCount: 0,
-        unreviewedItemCount: 3,
+        unreviewedItemCount: 0,
       },
     });
   });
@@ -650,10 +636,10 @@ describe('meal log routes', () => {
     const body = JSON.parse(response.body);
     expect(body).toMatchObject({
       mealLog: {
-        recognitionStatus: 'ready',
+        recognitionStatus: 'pending',
         recognitionRecovery: {
           mode: 'none',
-          reason: 'recognition_complete',
+          reason: 'in_progress',
           retryAt: null,
         },
       },
@@ -673,7 +659,7 @@ describe('meal log routes', () => {
     expect(Array.isArray(body.items)).toBe(true);
   });
 
-  test('returns a retryable 503 when catalog resolution is unavailable', async () => {
+  test('returns the draft when downstream catalog resolution is unavailable', async () => {
     const { server } = await createServer(true, {
       mealUserId: 'user-id',
       recognitionOutcome: {
@@ -688,13 +674,17 @@ describe('meal log routes', () => {
       payload: createPayload(),
     });
 
-    expect(response.statusCode).toBe(503);
-    expect(response.headers['retry-after']).toBe('60');
-    expect(JSON.parse(response.body).error).toMatchObject({
-      code: 'CATALOG_UNAVAILABLE',
+    expect(response.statusCode).toBe(200);
+    expect(JSON.parse(response.body).mealLog).toMatchObject({
+      recognitionStatus: 'ready',
+      recognitionRecovery: {
+        mode: 'none',
+        reason: 'recognition_complete',
+        retryAt: null,
+      },
     });
   });
-  test('returns a bounded 503 instead of projecting a claim failure as pending', async () => {
+  test('does not project an initial claim failure onto draft creation', async () => {
     const { server } = await createServer(true, {
       recognitionOutcome: {
         status: 'unavailable',
@@ -707,9 +697,9 @@ describe('meal log routes', () => {
       method: 'POST', url: '/api/meal-logs', payload: createPayload(),
     });
 
-    expect(response.statusCode).toBe(503);
+    expect(response.statusCode).toBe(201);
     expect(JSON.parse(response.body)).toMatchObject({
-      error: { code: 'CLAIM_UNAVAILABLE' },
+      mealLog: { recognitionStatus: 'pending' },
     });
   });
 
@@ -753,7 +743,7 @@ describe('meal log routes', () => {
     });
     expect((await withinHydrationBound(create.server.inject({
       method: 'POST', url: '/api/meal-logs', payload: createPayload(),
-    }))).statusCode).toBe(503);
+    }))).statusCode).toBe(201);
 
     const concurrent = await createServer(true, {
       mealUserId: 'user-id',
@@ -766,7 +756,7 @@ describe('meal log routes', () => {
     concurrent.state.asset.status = 'processed';
     expect((await withinHydrationBound(concurrent.server.inject({
       method: 'POST', url: '/api/meal-logs', payload: createPayload(),
-    }))).statusCode).toBe(503);
+    }))).statusCode).toBe(201);
 
     const recovery = await createServer(true, {
       mealUserId: 'user-id',
@@ -1122,6 +1112,92 @@ describe('meal log routes', () => {
     });
     expect(confirmed.statusCode, confirmed.body).toBe(200);
     expect(state.storedObservation).toBeUndefined();
+  });
+  test('confirms explicitly reviewed unmapped AI intake with unknown nutrition', async () => {
+    const { server, state } = await createServer(true);
+    configureConfirmableDraft(state, 'g');
+    state.meal = {
+      ...draftMeal(),
+      recognitionResult: {
+        version: 3,
+        outcome: 'recognized',
+        imageQualityConfidenceBps: 9_000,
+        observations: [],
+      },
+    };
+    Object.assign(state.items[0]!, {
+      recognizedLabel: '사용자 확인 음식',
+      foodId: null,
+      nutrientProfileId: null,
+      gramsMg: null,
+      origin: 'model_estimate',
+      recognitionRegionIndex: 0,
+      currentResolutionSource: null,
+    });
+    state.mappingDecisions = [];
+    state.calculationPreviews = [];
+
+    const initial = JSON.parse((await server.inject({
+      method: 'GET',
+      url: `/api/meal-logs/${mealId}`,
+    })).body);
+    expect(initial.items[0].review).toMatchObject({
+      status: 'required',
+      authority: {
+        fingerprintVersion: 'meal-manual-review-authority-v1',
+        invalidReason: null,
+      },
+      nextAction: 'review_item',
+    });
+
+    const reviewed = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/items/${itemId}/review`,
+      payload: {
+        expectedDraftRevision: initial.mealLog.draftRevision,
+        expectedItemRevision: initial.items[0].itemRevision,
+        idempotencyKey: 'manual-unmapped-review',
+        displayedAuthorityFingerprintVersion:
+          initial.items[0].review.authority.fingerprintVersion,
+        displayedAuthorityFingerprint:
+          initial.items[0].review.authority.fingerprint,
+      },
+    });
+    expect(reviewed.statusCode, reviewed.body).toBe(200);
+    const current = JSON.parse(reviewed.body);
+    expect(current.review.confirmable).toBe(true);
+
+    const confirmed = await server.inject({
+      method: 'POST',
+      url: `/api/meal-logs/${mealId}/confirm`,
+      payload: {
+        expectedDraftRevision: current.mealLog.draftRevision,
+        idempotencyKey: 'manual-unmapped-confirm',
+        items: [{
+          itemId,
+          expectedItemRevision: current.items[0].itemRevision,
+        }],
+      },
+    });
+    expect(confirmed.statusCode, confirmed.body).toBe(200);
+    const body = JSON.parse(confirmed.body);
+    expect(body.items[0]).toMatchObject({
+      foodId: null,
+      nutrientProfileId: null,
+      nutrients: {
+        energyMillicalories: null,
+        carbohydrateMg: null,
+        proteinMg: null,
+        fatMg: null,
+        fiberMg: null,
+      },
+    });
+    expect(body.nutrition.totals.energyMillicalories).toEqual({
+      value: null,
+      knownValue: 0,
+      missingItemCount: 1,
+      completeness: 'partial',
+    });
   });
   test('confirms a decomposition item using only the proof returned by GET', async () => {
     const { server, state } = await createServer(true);
@@ -2282,6 +2358,7 @@ async function createServer(
     rejectItemUpdate?: boolean;
     rejectItemDelete?: boolean;
     recognitionAttempt?: Record<string, unknown>;
+    recognitionEnqueueCalls: number;
     recognitionCalls: Array<'initial' | 'user_recovery' | undefined>;
     recognitionSignals: AbortSignal[];
     responseLostCalls: number;
@@ -2311,6 +2388,7 @@ async function createServer(
     calculationPreviews: [],
     decompositionRevisions: [],
     decompositionComponents: [],
+    recognitionEnqueueCalls: 0,
     recognitionCalls: [],
     recognitionSignals: [],
     responseLostCalls: 0,
@@ -2362,6 +2440,9 @@ async function createServer(
     auth,
     database,
     recognitionCoordinator: {
+      async enqueueInitial() {
+        state.recognitionEnqueueCalls += 1;
+      },
       async responseLost() {
         state.responseLostCalls += 1;
       },

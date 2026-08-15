@@ -164,6 +164,7 @@ export function failureTransition(
   } as const;
 }
 export interface MealRecognitionRunner {
+  enqueueInitial?(mealLogId: string, userId: string): Promise<void>;
   recognize(
     mealLogId: string,
     userId: string,
@@ -211,6 +212,56 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
 
   private event(event: RecognitionExecutionEvent) {
     this.options.eventSink?.(event);
+  }
+
+  async enqueueInitial(mealLogId: string, userId: string): Promise<void> {
+    const now = new Date();
+    const workflowId = randomUUID();
+    const executionId = randomUUID();
+    await this.options.database.transaction(async (tx) => {
+      const [mealLog] = await tx.select({
+        id: mealLogs.id,
+        imageAssetId: mealLogs.imageAssetId,
+        recognitionStatus: mealLogs.recognitionStatus,
+      }).from(mealLogs).where(and(
+        eq(mealLogs.id, mealLogId),
+        eq(mealLogs.userId, userId),
+        eq(mealLogs.status, 'draft'),
+      )).limit(1);
+      if (
+        !mealLog?.imageAssetId ||
+        mealLog.recognitionStatus !== 'pending'
+      ) return;
+
+      const [createdWorkflow] = await tx.insert(recognitionAttempts).values({
+        id: workflowId,
+        mealLogId,
+        imageAssetId: mealLog.imageAssetId,
+        status: 'pending',
+        protocolVersion: 'v2_option_b',
+        nextExecutionOrdinal: 2,
+        automaticExecutionCount: 1,
+        automaticInvocationReservationCount: 0,
+        userGrantState: 'available',
+        attemptCount: 0,
+        nextAttemptAt: now,
+        updatedAt: now,
+      }).onConflictDoNothing({
+        target: recognitionAttempts.mealLogId,
+      }).returning({ id: recognitionAttempts.id });
+      if (!createdWorkflow) return;
+
+      await tx.insert(recognitionExecutions).values({
+        id: executionId,
+        workflowId,
+        executionOrdinal: 1,
+        trigger: 'initial',
+        wallDeadlineAt: new Date(now.getTime() + this.options.timeoutMs),
+        leaseToken: null,
+        phase: 'claim',
+        status: 'queued',
+      });
+    });
   }
 
   private async setPhase(claim: ClaimedRecognition, phase: RecognitionPhase): Promise<boolean> {
@@ -381,7 +432,18 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
         );
         if (persisted.status !== 'ready') return persisted;
         this.event({ type: 'terminal', executionId: invocation.executionId, code: 'SUCCEEDED' });
-        return this.resolvePendingObservation(mealLogId, userId, deadline, execution.signal);
+        try {
+          await this.resolvePendingObservation(
+            mealLogId,
+            userId,
+            deadline,
+            execution.signal,
+          );
+        } catch {
+          // The immutable observation is already committed. Catalog resolution
+          // has its own durable retry state and cannot rewrite recognition.
+        }
+        return { status: 'ready' };
       }
       return this.fail(claimed, 'INVALID_PROVIDER_RESPONSE', invocation);
     } catch (error) {
@@ -466,6 +528,7 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
         .where(and(eq(recognitionExecutions.workflowId, workflow.id), eq(recognitionExecutions.status, 'open'), lte(recognitionExecutions.wallDeadlineAt, now)));
       const transition = reconciliationTransition();
       for (const execution of expired) {
+        if (!execution.leaseToken) continue;
         const [invocation] = await tx.select({
           status: recognitionProviderInvocations.status,
           terminalCode: recognitionProviderInvocations.terminalCode,
@@ -669,12 +732,119 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
       const [existingWorkflow] = await tx.select({
         id: recognitionAttempts.id,
         imageAssetId: recognitionAttempts.imageAssetId,
+        status: recognitionAttempts.status,
         protocolVersion: recognitionAttempts.protocolVersion,
         nextExecutionOrdinal: recognitionAttempts.nextExecutionOrdinal,
         automaticExecutionCount: recognitionAttempts.automaticExecutionCount,
         automaticInvocationReservationCount: recognitionAttempts.automaticInvocationReservationCount,
         userGrantState: recognitionAttempts.userGrantState,
       }).from(recognitionAttempts).where(eq(recognitionAttempts.mealLogId, mealLog.id)).limit(1);
+
+      if (
+        trigger === 'initial' &&
+        existingWorkflow?.protocolVersion === 'v2_option_b' &&
+        existingWorkflow.imageAssetId === asset.id
+      ) {
+        const [queuedExecution] = await tx.select({
+          id: recognitionExecutions.id,
+          executionOrdinal: recognitionExecutions.executionOrdinal,
+          wallDeadlineAt: recognitionExecutions.wallDeadlineAt,
+        }).from(recognitionExecutions).where(and(
+          eq(recognitionExecutions.workflowId, existingWorkflow.id),
+          eq(recognitionExecutions.trigger, 'initial'),
+          eq(recognitionExecutions.status, 'queued'),
+        )).limit(1);
+        if (queuedExecution) {
+          if (queuedExecution.wallDeadlineAt <= now) {
+            await tx.update(recognitionExecutions).set({
+              status: 'failed',
+              terminalCode: 'EXECUTION_DEADLINE',
+              completedAt: now,
+              updatedAt: now,
+            }).where(and(
+              eq(recognitionExecutions.id, queuedExecution.id),
+              eq(recognitionExecutions.status, 'queued'),
+            ));
+            await tx.update(recognitionAttempts).set({
+              status: 'failed',
+              lastErrorCode: 'EXECUTION_DEADLINE',
+              completedAt: now,
+              updatedAt: now,
+            }).where(eq(recognitionAttempts.id, existingWorkflow.id));
+            await tx.update(mealLogs).set({
+              recognitionStatus: 'failed',
+              recognitionLeaseToken: null,
+              recognitionLeaseExpiresAt: null,
+              recognitionLastErrorCode: 'EXECUTION_DEADLINE',
+              recognitionNextAttemptAt: null,
+              updatedAt: now,
+            }).where(eq(mealLogs.id, mealLog.id));
+            return {
+              kind: 'unavailable' as const,
+              outcome: unavailable('EXECUTION_DEADLINE', false),
+            };
+          }
+          const queuedDeadline = executionDeadline(
+            performance.now(),
+            queuedExecution.wallDeadlineAt.getTime() - now.getTime(),
+          );
+          const queuedLeaseExpiresAt = new Date(
+            queuedExecution.wallDeadlineAt.getTime() +
+              leaseMarginMs(this.options),
+          );
+          const [claimedExecution] = await tx.update(recognitionExecutions).set({
+            status: 'open',
+            leaseToken,
+            phase: 'asset_read',
+            updatedAt: now,
+          }).where(and(
+            eq(recognitionExecutions.id, queuedExecution.id),
+            eq(recognitionExecutions.status, 'queued'),
+          )).returning({ id: recognitionExecutions.id });
+          if (!claimedExecution) {
+            return {
+              kind: 'unavailable' as const,
+              outcome: await this.currentOutcomeFrom(tx, mealLogId, userId),
+            };
+          }
+          await tx.update(recognitionAttempts).set({
+            status: 'processing',
+            attemptCount: sql`${recognitionAttempts.attemptCount} + 1`,
+            leaseToken,
+            leaseExpiresAt: queuedLeaseExpiresAt,
+            updatedAt: now,
+          }).where(and(
+            eq(recognitionAttempts.id, existingWorkflow.id),
+            eq(recognitionAttempts.status, 'pending'),
+          ));
+          await tx.update(mealLogs).set({
+            recognitionLeaseExpiresAt: queuedLeaseExpiresAt,
+            updatedAt: now,
+          }).where(and(
+            eq(mealLogs.id, mealLog.id),
+            eq(mealLogs.recognitionStatus, 'processing'),
+            eq(mealLogs.recognitionLeaseToken, leaseToken),
+          ));
+          return {
+            kind: 'claimed' as const,
+            mealLogId: mealLog.id,
+            userId,
+            leaseToken,
+            imageAssetId: asset.id,
+            objectKey: asset.objectKey,
+            byteSize: asset.byteSize,
+            contentType: asset.contentType,
+            sha256: asset.sha256,
+            attemptCount: mealLog.recognitionAttemptCount + 1,
+            workflowId: existingWorkflow.id,
+            executionId: queuedExecution.id,
+            trigger,
+            executionOrdinal: queuedExecution.executionOrdinal,
+            deadline: queuedDeadline,
+            expiresAt: asset.expiresAt,
+          };
+        }
+      }
 
       if (trigger === 'user_recovery' && existingWorkflow && (
         existingWorkflow.imageAssetId !== asset.id
@@ -1093,6 +1263,22 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
     const contentSha256 = createHash('sha256').update(JSON.stringify(storedResult)).digest('hex');
     const completed = await this.options.database.transaction(async (tx) => {
       await applyTransactionTimeouts(tx, this.options, remainingMs(finalizationDeadline));
+      const [mealState] = await tx.select({
+        status: mealLogs.status,
+        recognitionStatus: mealLogs.recognitionStatus,
+        recognitionLeaseToken: mealLogs.recognitionLeaseToken,
+      }).from(mealLogs).where(and(
+        eq(mealLogs.id, claim.mealLogId),
+        eq(mealLogs.userId, claim.userId),
+      )).limit(1);
+      const activeClaim =
+        mealState?.status === 'draft' &&
+        mealState.recognitionStatus === 'processing' &&
+        mealState.recognitionLeaseToken === claim.leaseToken;
+      const manualWinner =
+        mealState?.status === 'draft' &&
+        mealState.recognitionStatus === 'manual';
+      if (!activeClaim && !manualWinner) return false;
       if (claim.executionId) {
         const [execution] = await tx.update(recognitionExecutions).set({
           status: 'succeeded', phase: 'resolution_handoff', completedAt: now, updatedAt: now,
@@ -1102,6 +1288,45 @@ export class MealRecognitionCoordinator implements MealRecognitionRunner {
           eq(recognitionExecutions.leaseToken, claim.leaseToken),
         )).returning({ id: recognitionExecutions.id });
         if (!execution) return false;
+      }
+      if (manualWinner) {
+        await tx.update(recognitionAttempts).set({
+          status: 'ready',
+          provider: output.provider,
+          model: output.model,
+          promptVersion: output.promptVersion,
+          schemaVersion: output.schemaVersion,
+          providerRequestId: output.providerRequestId ?? null,
+          inputTokens: output.inputTokens,
+          outputTokens: output.outputTokens,
+          completedAt: now,
+          leaseToken: null,
+          leaseExpiresAt: null,
+          updatedAt: now,
+        }).where(eq(recognitionAttempts.id, claim.workflowId));
+        await tx.insert(storedObservations).values({
+          mealLogId: claim.mealLogId,
+          recognitionAttemptId: claim.workflowId,
+          provider: output.provider,
+          model: output.model,
+          promptVersion: output.promptVersion,
+          schemaVersion: output.schemaVersion,
+          providerRequestId: output.providerRequestId ?? null,
+          inputTokens: output.inputTokens,
+          outputTokens: output.outputTokens,
+          canonicalContent: storedResult,
+          contentSha256,
+        }).onConflictDoNothing();
+        await tx.update(recognitionProviderInvocations).set({
+          status: 'succeeded',
+          providerAcknowledgedAt: now,
+          completedAt: now,
+          updatedAt: now,
+        }).where(and(
+          eq(recognitionProviderInvocations.id, invocationId),
+          eq(recognitionProviderInvocations.status, 'reserved'),
+        ));
+        return true;
       }
       const [updated] = await tx.update(mealLogs).set({
         recognitionStatus: 'ready', recognitionProvider: output.provider, recognitionModel: output.model,

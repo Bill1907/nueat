@@ -60,6 +60,28 @@ describe('recognition reliability schema', () => {
     expect(recognitionProviderInvocations.workflowInvocationOrdinal.name).toBe('workflow_invocation_ordinal');
   });
 
+  test('admits a lease-free queued execution before an API worker claims it', async () => {
+    const sql = await migrationSql();
+
+    expect(sql).toContain(
+      "CREATE TYPE \"recognition_execution_status\" AS ENUM ('queued', 'open', 'succeeded', 'failed', 'abandoned')",
+    );
+    expect(sql).toContain('"lease_token" uuid,');
+    expect(sql).toContain(
+      "\"status\" = 'queued' AND \"lease_token\" IS NULL",
+    );
+    expect(sql).toContain(
+      "\"status\" = 'open' AND \"lease_token\" IS NOT NULL",
+    );
+    expect(sql).toContain(
+      "WHERE \"status\" IN ('queued', 'open')",
+    );
+    expect(sql).toContain(
+      "OLD.status = 'queued' AND NEW.status = 'open'",
+    );
+    expect(recognitionExecutions.leaseToken.notNull).toBe(false);
+  });
+
   test('publishes the migration capability and a rollback-only isolated validation fixture', async () => {
     const [sql, validationScript] = await Promise.all([
       migrationSql(),
@@ -75,6 +97,7 @@ describe('recognition reliability schema', () => {
     expect(validationScript).toContain('terminal execution mutation fixture unexpectedly succeeded');
     expect(validationScript).toContain('terminal invocation mutation fixture unexpectedly succeeded');
     expect(validationScript).toContain('user_grant_state = \'consumed\'');
+    expect(validationScript).toContain("AND status = 'queued'");
     expect(validationScript).toContain("'recognition_daily_usage'");
     expect(validationScript).toContain("'cancelled_before_call', 'outcome_unknown'");
   });

@@ -6,7 +6,7 @@ CREATE TYPE "recognition_execution_trigger" AS ENUM ('initial', 'automatic_lease
 --> statement-breakpoint
 CREATE TYPE "recognition_execution_phase" AS ENUM ('claim', 'asset_read', 'asset_verify', 'invocation_reserve', 'provider_call', 'provider_output', 'observation_persist', 'resolution_handoff', 'response_delivery', 'reconciliation');
 --> statement-breakpoint
-CREATE TYPE "recognition_execution_status" AS ENUM ('open', 'succeeded', 'failed', 'abandoned');
+CREATE TYPE "recognition_execution_status" AS ENUM ('queued', 'open', 'succeeded', 'failed', 'abandoned');
 --> statement-breakpoint
 CREATE TYPE "recognition_provider_invocation_status" AS ENUM ('reserved', 'succeeded', 'failed_known', 'cancelled_before_call', 'outcome_unknown');
 --> statement-breakpoint
@@ -40,7 +40,7 @@ CREATE TABLE "recognition_execution" (
   "execution_ordinal" integer NOT NULL,
   "trigger" "recognition_execution_trigger" NOT NULL,
   "wall_deadline_at" timestamp with time zone NOT NULL,
-  "lease_token" uuid NOT NULL,
+  "lease_token" uuid,
   "phase" "recognition_execution_phase" DEFAULT 'claim' NOT NULL,
   "status" "recognition_execution_status" DEFAULT 'open' NOT NULL,
   "terminal_code" "recognition_failure_code",
@@ -49,7 +49,8 @@ CREATE TABLE "recognition_execution" (
   "updated_at" timestamp with time zone DEFAULT now() NOT NULL,
   CONSTRAINT "recognition_execution_ordinal_check" CHECK ("execution_ordinal" > 0),
   CONSTRAINT "recognition_execution_terminal_check" CHECK (
-    ("status" = 'open' AND "completed_at" IS NULL AND "terminal_code" IS NULL)
+    ("status" = 'queued' AND "lease_token" IS NULL AND "completed_at" IS NULL AND "terminal_code" IS NULL)
+    OR ("status" = 'open' AND "lease_token" IS NOT NULL AND "completed_at" IS NULL AND "terminal_code" IS NULL)
     OR ("status" = 'succeeded' AND "completed_at" IS NOT NULL AND "terminal_code" IS NULL)
     OR ("status" IN ('failed', 'abandoned') AND "completed_at" IS NOT NULL AND "terminal_code" IS NOT NULL)
   )
@@ -57,7 +58,7 @@ CREATE TABLE "recognition_execution" (
 --> statement-breakpoint
 CREATE UNIQUE INDEX "recognition_execution_workflow_ordinal_unique" ON "recognition_execution" USING btree ("workflow_id", "execution_ordinal");
 --> statement-breakpoint
-CREATE INDEX "recognition_execution_open_deadline_idx" ON "recognition_execution" USING btree ("wall_deadline_at") WHERE "status" = 'open';
+CREATE INDEX "recognition_execution_open_deadline_idx" ON "recognition_execution" USING btree ("wall_deadline_at") WHERE "status" IN ('queued', 'open');
 --> statement-breakpoint
 CREATE TABLE "recognition_provider_invocation" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
@@ -132,16 +133,26 @@ DECLARE workflow "recognition_attempt"%ROWTYPE;
 DECLARE automatic_execution_total integer;
 BEGIN
   IF TG_OP = 'UPDATE' THEN
-    IF OLD.status <> 'open' THEN
+    IF OLD.status NOT IN ('queued', 'open') THEN
       RAISE EXCEPTION 'terminal recognition execution is immutable';
     END IF;
     IF NEW.id IS DISTINCT FROM OLD.id
       OR NEW.workflow_id IS DISTINCT FROM OLD.workflow_id
       OR NEW.execution_ordinal IS DISTINCT FROM OLD.execution_ordinal
       OR NEW.trigger IS DISTINCT FROM OLD.trigger
-      OR NEW.wall_deadline_at IS DISTINCT FROM OLD.wall_deadline_at
-      OR NEW.lease_token IS DISTINCT FROM OLD.lease_token THEN
+      OR NEW.wall_deadline_at IS DISTINCT FROM OLD.wall_deadline_at THEN
       RAISE EXCEPTION 'recognition execution binding is immutable';
+    END IF;
+    IF OLD.status = 'queued' AND NEW.status = 'open'
+      AND OLD.lease_token IS NULL AND NEW.lease_token IS NOT NULL THEN
+      RETURN NEW;
+    END IF;
+    IF OLD.status = 'queued' AND NEW.status IN ('failed', 'abandoned')
+      AND OLD.lease_token IS NULL AND NEW.lease_token IS NULL THEN
+      RETURN NEW;
+    END IF;
+    IF OLD.status = 'open' AND NEW.lease_token IS DISTINCT FROM OLD.lease_token THEN
+      RAISE EXCEPTION 'open recognition execution lease binding is immutable';
     END IF;
     IF NEW.status = 'open' THEN
       RETURN NEW;

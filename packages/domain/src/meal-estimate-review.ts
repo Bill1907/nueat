@@ -21,6 +21,7 @@ export interface CurrentItemReviewCheckpointInput {
   itemId: string;
   itemRevision: number;
   selectedFoodId: string | null;
+  manualAuthority?: boolean;
   officialSourceRevision: number | null;
   currentOfficialSourceRevision: number | null;
   reviewedItemRevision: number | null;
@@ -48,9 +49,9 @@ export interface MealConfirmabilityStatus {
 }
 
 /**
- * Derives the current checkpoint only from independently persisted selection,
- * official-source, and user-review revisions. A review never substitutes for
- * a selection or official source, and an item edit invalidates only review.
+ * Derives the current checkpoint from persisted catalog authority or an
+ * explicit manual-review authority, plus the current item revision. Manual
+ * authority never supplies nutrition and any item edit still invalidates it.
  */
 export function deriveCurrentItemReviewCheckpoint(
   input: CurrentItemReviewCheckpointInput,
@@ -60,8 +61,11 @@ export function deriveCurrentItemReviewCheckpoint(
   assertNullablePositiveInteger(input.currentOfficialSourceRevision, 'currentOfficialSourceRevision');
   assertNullablePositiveInteger(input.reviewedItemRevision, 'reviewedItemRevision');
 
-  const selection: ItemSelectionStatus = input.selectedFoodId === null ? 'missing' : 'selected';
-  const officialSource = deriveOfficialSourceStatus(input);
+  const selection: ItemSelectionStatus =
+    input.selectedFoodId === null && !input.manualAuthority ? 'missing' : 'selected';
+  const officialSource = input.manualAuthority
+    ? 'current'
+    : deriveOfficialSourceStatus(input);
   const userReview = deriveUserReviewStatus(input);
   const nextAction = deriveItemNextAction(selection, officialSource, userReview);
 

@@ -86,8 +86,13 @@ export interface CalculationSnapshotProvenance {
 
 export type CalculationSnapshotItemV2 = Omit<
   LegacyCalculationSnapshotItem,
-  'foodAcknowledgedRevision' | 'portionAcknowledgedRevision'
+  | 'foodAcknowledgedRevision'
+  | 'portionAcknowledgedRevision'
+  | 'foodId'
+  | 'gramsMg'
 > & {
+  foodId: string | null;
+  gramsMg: number | null;
   checkpoint: CalculationReviewCheckpoint;
   authority: CalculationSnapshotAuthorityTuple;
   provenance: CalculationSnapshotProvenance;
@@ -111,7 +116,7 @@ export interface CalculationSnapshotProjection {
   reviewEvidence: 'legacy_unknown' | 'explicit_v2';
   mealItems: Array<{
     mealItemId: string;
-    foodId: string;
+    foodId: string | null;
     nutrientProfileId: string | null;
     nutrients: SnapshotNutrients;
     provenance: CalculationSnapshotProvenance;
@@ -218,8 +223,13 @@ function parseLegacyItem(value: unknown): LegacyCalculationSnapshotItem | null {
 function parseV2Item(value: unknown): CalculationInputSnapshotV2['mealItems'][number] | null {
   if (!isRecord(value)) return null;
   const { authority, checkpoint, provenance, ...legacyValue } = value;
+  const foodId = legacyValue.foodId;
+  const gramsMg = legacyValue.gramsMg;
+  if (!isNullableString(foodId) || !isNullableSafeInteger(gramsMg)) return null;
   const legacy = parseLegacyItem({
     ...legacyValue,
+    foodId: foodId ?? 'manual-unmapped',
+    gramsMg: gramsMg ?? 1,
     foodAcknowledgedRevision: null,
     portionAcknowledgedRevision: null,
   });
@@ -234,6 +244,8 @@ function parseV2Item(value: unknown): CalculationInputSnapshotV2['mealItems'][nu
   } = legacy;
   return {
     ...current,
+    foodId,
+    gramsMg,
     checkpoint: parsedCheckpoint,
     authority: parsedAuthority,
     provenance: parsedProvenance,

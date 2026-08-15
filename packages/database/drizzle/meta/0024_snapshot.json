@@ -5516,7 +5516,7 @@
           "name": "lease_token",
           "type": "uuid",
           "primaryKey": false,
-          "notNull": true
+          "notNull": false
         },
         "phase": {
           "name": "phase",
@@ -5595,7 +5595,7 @@
             }
           ],
           "isUnique": false,
-          "where": "\"recognition_execution\".\"status\" = 'open'",
+          "where": "\"recognition_execution\".\"status\" in ('queued', 'open')",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -5626,7 +5626,7 @@
         },
         "recognition_execution_terminal_check": {
           "name": "recognition_execution_terminal_check",
-          "value": "(\"recognition_execution\".\"status\" = 'open' and \"recognition_execution\".\"completed_at\" is null and \"recognition_execution\".\"terminal_code\" is null)\n        or (\"recognition_execution\".\"status\" = 'succeeded' and \"recognition_execution\".\"completed_at\" is not null and \"recognition_execution\".\"terminal_code\" is null)\n        or (\"recognition_execution\".\"status\" in ('failed', 'abandoned') and \"recognition_execution\".\"completed_at\" is not null and \"recognition_execution\".\"terminal_code\" is not null)"
+          "value": "(\"recognition_execution\".\"status\" = 'queued' and \"recognition_execution\".\"lease_token\" is null and \"recognition_execution\".\"completed_at\" is null and \"recognition_execution\".\"terminal_code\" is null)\n        or (\"recognition_execution\".\"status\" = 'open' and \"recognition_execution\".\"lease_token\" is not null and \"recognition_execution\".\"completed_at\" is null and \"recognition_execution\".\"terminal_code\" is null)\n        or (\"recognition_execution\".\"status\" = 'succeeded' and \"recognition_execution\".\"completed_at\" is not null and \"recognition_execution\".\"terminal_code\" is null)\n        or (\"recognition_execution\".\"status\" in ('failed', 'abandoned') and \"recognition_execution\".\"completed_at\" is not null and \"recognition_execution\".\"terminal_code\" is not null)"
         }
       },
       "isRLSEnabled": false
@@ -6792,6 +6792,7 @@
       "name": "recognition_execution_status",
       "schema": "public",
       "values": [
+        "queued",
         "open",
         "succeeded",
         "failed",

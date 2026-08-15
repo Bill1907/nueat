@@ -58,6 +58,7 @@ import {
 } from '../services/catalog-eligibility-selector';
 import { projectMealItemAuthority } from '../services/meal-item-authority';
 import { catalogEligibilityAdapter } from '../services/meal-resolution-coordinator';
+const MANUAL_REVIEW_FINGERPRINT_VERSION = 'meal-manual-review-authority-v1';
 const mealTypeSchema = z.enum(['breakfast', 'lunch', 'dinner', 'snack']);
 const servingUnitSchema = z.enum(['g', 'ml', 'serving', 'bowl', 'piece']);
 const dateTimeSchema = z.iso
@@ -124,7 +125,10 @@ const reviewMealItemSchema = z.object({
   expectedDraftRevision: z.int().positive(),
   expectedItemRevision: z.int().positive(),
   idempotencyKey: z.string().trim().min(1).max(200),
-  displayedAuthorityFingerprintVersion: z.literal(MEAL_ITEM_REVIEW_FINGERPRINT_VERSION),
+  displayedAuthorityFingerprintVersion: z.enum([
+    MEAL_ITEM_REVIEW_FINGERPRINT_VERSION,
+    MANUAL_REVIEW_FINGERPRINT_VERSION,
+  ]),
   displayedAuthorityFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
 }).strict();
 
@@ -246,6 +250,35 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
     outcome,
     createdStatus,
   );
+  const queuedDraftResponse = (mealLog: any, items: any[] = []) =>
+    buildMealLogResponse(
+      options.database,
+      mealLog,
+      items,
+      options.reviewPolicy,
+      {
+        enabled: options.recoveryEnabled,
+        dailyQuota: options.dailyRecognitionQuota,
+        v2OneCallAdmitted: options.v2OneCallAdmitted,
+        cohortPercent: options.cohortPercent,
+      },
+    );
+  const enqueueInitialRecognition = async (
+    mealLog: { id: string; userId: string },
+    request: FastifyRequest,
+  ) => {
+    try {
+      await options.recognitionCoordinator.enqueueInitial?.(
+        mealLog.id,
+        mealLog.userId,
+      );
+    } catch {
+      request.log.error(
+        { code: 'RECOGNITION_QUEUE_ADMISSION_FAILED' },
+        'Recognition queue admission failed',
+      );
+    }
+  };
   const staleMealResponse = (
     database: Database,
     reply: FastifyReply,
@@ -283,19 +316,8 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       userId,
     );
     if (existing) {
-      const outcome = await withRequestAbortSignal(request, reply, (signal) => options.recognitionCoordinator.recognize(
-        existing.id,
-        userId,
-        'initial',
-        signal,
-      ), () => options.recognitionCoordinator.responseLost?.(existing.id, userId));
-      return recognitionResponse(
-        options.database,
-        reply,
-        existing,
-        [],
-        outcome,
-      );
+      await enqueueInitialRecognition(existing, request);
+      return reply.status(200).send(await queuedDraftResponse(existing));
     }
     const mealLog = await options.database.transaction(async (tx) => {
       const [claimedAsset] = await tx
@@ -334,26 +356,11 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
         userId,
       );
       if (!concurrent) return imageUnavailable(reply, request);
-      const outcome = await withRequestAbortSignal(request, reply, (signal) => options.recognitionCoordinator.recognize(
-        concurrent.id,
-        userId,
-        'initial',
-        signal,
-      ), () => options.recognitionCoordinator.responseLost?.(concurrent.id, userId));
-      return recognitionResponse(
-        options.database,
-        reply,
-        concurrent,
-        [],
-        outcome,
-      );
+      await enqueueInitialRecognition(concurrent, request);
+      return reply.status(200).send(await queuedDraftResponse(concurrent));
     }
-    const outcome = await withRequestAbortSignal(
-      request, reply,
-      (signal) => options.recognitionCoordinator.recognize(mealLog.id, userId, 'initial', signal),
-      () => options.recognitionCoordinator.responseLost?.(mealLog.id, userId),
-    );
-    return recognitionResponse(options.database, reply, mealLog, [], outcome, 201);
+    await enqueueInitialRecognition(mealLog, request);
+    return reply.status(201).send(await queuedDraftResponse(mealLog));
   });
 
   app.get('/api/meal-logs/:mealLogId', async (request, reply) => {
@@ -1322,11 +1329,6 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       );
       if ('details' in resolvedNutrition) return { kind: 'invalid' as const, details: resolvedNutrition.details };
       const { nutrition, resolutionsByItemId } = resolvedNutrition;
-      if (!Object.values(nutrition.totals).some(
-        (total) => total.missingItemCount < items.length,
-      )) {
-        return { kind: 'invalid' as const, details: [{ code: 'NO_KNOWN_NUTRIENTS' }] };
-      }
 
       const now = new Date();
       const calculatedByItemId = new Map(
@@ -1335,7 +1337,10 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
       for (const item of items) {
         await tx
           .update(mealItems)
-          .set({ gramsMg: calculatedByItemId.get(item.id)!.gramsMg, updatedAt: now })
+          .set({
+            gramsMg: calculatedByItemId.get(item.id)?.gramsMg ?? null,
+            updatedAt: now,
+          })
           .where(eq(mealItems.id, item.id));
       }
 
@@ -1378,6 +1383,51 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
               );
               if (!authority?.fingerprint)
                 throw new Error('Confirmed item is missing review authority');
+              const calculated = calculatedByItemId.get(item.id)!;
+              if (item.foodId === null) {
+                return {
+                  mealItemId: item.id,
+                  origin: item.origin,
+                  initialEstimateAssessment: item.initialEstimateAssessment,
+                  currentResolutionSource: null,
+                  itemRevision: item.itemRevision,
+                  foodRevision: item.foodRevision,
+                  portionRevision: item.portionRevision,
+                  foodId: null,
+                  nutrientProfileId: null,
+                  amountMilliunits: item.amountMilliunits,
+                  unit: item.unit,
+                  gramsMg: calculated.gramsMg,
+                  sourceRegistryId: null,
+                  sourceItemId: null,
+                  datasetVersion: null,
+                  nutrientProfileQualityGrade: null,
+                  nutrientProfile: null,
+                  serving: null,
+                  nutrients: calculated.nutrients,
+                  checkpoint: {
+                    reviewedItemRevision: item.reviewedItemRevision!,
+                    reviewedAuthorityFingerprintVersion:
+                      item.reviewedAuthorityFingerprintVersion!,
+                    reviewedAuthorityFingerprint:
+                      item.reviewedAuthorityFingerprint!,
+                    reviewIdempotencyKey: item.reviewIdempotencyKey!,
+                    reviewRequestFingerprint: item.reviewRequestFingerprint!,
+                    reviewedAt: item.reviewedAt!.toISOString(),
+                  },
+                  authority: {
+                    fingerprintVersion: authority.fingerprintVersion,
+                    fingerprint: authority.fingerprint,
+                  },
+                  provenance: {
+                    calculationVersion: 'meal-nutrition-v1',
+                    sourceRegistryId: null,
+                    sourceItemId: null,
+                    datasetVersion: null,
+                    nutrientProfileId: null,
+                  },
+                };
+              }
               const resolution = resolutionsByItemId.get(item.id)!;
               const previewValue =
                 resolutionTuple.previewsByItemId.get(item.id);
@@ -1410,7 +1460,6 @@ export const mealLogRoutes: FastifyPluginAsync<MealLogRouteOptions> = async (
                     qualityGrade: directLeaf.servingQualityGrade!,
                   }
                 : resolution.serving;
-              const calculated = calculatedByItemId.get(item.id)!;
               return {
                 mealItemId: item.id,
                 origin: item.origin,
@@ -2185,6 +2234,9 @@ async function projectCurrentItemAuthority(
   database: Database,
   item: Awaited<ReturnType<typeof findMealItems>>[number],
 ) {
+  if (
+    item.foodId === null
+  ) return manualReviewAuthority(item);
   const [active] = await database
     .select({
       id: activeCatalogReleasePointers.activationId,
@@ -2362,6 +2414,33 @@ async function projectCurrentItemAuthority(
       mealDecompositionSha256: null,
     },
   });
+}
+
+function manualReviewAuthority(
+  item: Awaited<ReturnType<typeof findMealItems>>[number],
+) {
+  const canonicalFingerprintInput = {
+    version: MANUAL_REVIEW_FINGERPRINT_VERSION,
+    itemId: item.id,
+    itemRevision: item.itemRevision,
+    recognizedLabel: item.recognizedLabel.normalize('NFC'),
+    amountMilliunits: item.amountMilliunits,
+    unit: item.unit,
+    origin: item.origin,
+  };
+  const fingerprint = hash(JSON.stringify(canonicalFingerprintInput));
+  return {
+    version: 'meal-item-authority-projection-v1' as const,
+    itemId: item.id,
+    selected: null,
+    officialSource: null,
+    invalidReason: null,
+    calculationIdentity: null,
+    canonicalFingerprintInput,
+    fingerprintVersion: MANUAL_REVIEW_FINGERPRINT_VERSION,
+    fingerprint,
+    canonicalFingerprintHash: fingerprint,
+  };
 }
 
 function nullAuthority(
@@ -2723,6 +2802,9 @@ async function buildMealLogResponse(
       itemRevision: item.itemRevision,
       selectedFoodId:
         authority.invalidReason === 'MISSING_FOOD_MAPPING' ? null : item.foodId,
+      manualAuthority:
+        item.foodId === null &&
+        authority.fingerprintVersion === MANUAL_REVIEW_FINGERPRINT_VERSION,
       officialSourceRevision:
         authority.invalidReason === 'STALE_AUTHORITY'
           ? 1
@@ -2905,7 +2987,7 @@ function reviewedNutritionSummary(
           fatMg: null,
           fiberMg: null,
         },
-        userReview: 'unreviewed' as const,
+        userReview: reviewed ? 'current' as const : 'unreviewed' as const,
       };
     }
     return {
@@ -3159,7 +3241,13 @@ async function calculateResolvedMealNutrition(
   previewsByItemId = new Map<string, unknown>(),
 ) {
   const resolutions = resolvedItems ?? await resolveCurrentMealItems(database, items);
+  const unknownItemIds = new Set(
+    items
+      .filter((item) => item.foodId === null)
+      .map((item) => item.id),
+  );
   const details = resolutions.flatMap((resolution) =>
+    unknownItemIds.has(resolution.itemId) ||
     resolution.reason === null ||
       isCalculationPreviewIdentity(previewsByItemId.get(resolution.itemId))
       ? []
@@ -3169,6 +3257,7 @@ async function calculateResolvedMealNutrition(
   const resolutionsByItemId = new Map(resolutions.map((resolution) => [resolution.itemId, resolution]));
   const compositeRoots = new Map<string, Array<{ mealItemId: string; amountMilliunits: number; unit: 'g'; nutrientProfile: any }>>();
   const inputs: MealNutritionInput[] = items.flatMap((item) => {
+    if (unknownItemIds.has(item.id)) return [];
     const identity = previewsByItemId.get(item.id);
     if (isCalculationPreviewIdentity(identity)) {
       const leaves = identity.leaves.map((leaf) => ({
@@ -3215,10 +3304,57 @@ async function calculateResolvedMealNutrition(
   });
   try {
     const leafNutrition = calculateMealNutrition(inputs);
+    const unknownNutritionItems = items
+      .filter((item) => unknownItemIds.has(item.id))
+      .map((item) => ({
+        mealItemId: item.id,
+        gramsMg: item.unit === 'g' ? item.amountMilliunits : null,
+        nutrients: Object.fromEntries(
+          nutritionKeysForComposition.map((key) => [key, null]),
+        ) as Record<(typeof nutritionKeysForComposition)[number], null>,
+      }));
+    const withUnknownItems = (nutritionItems: Array<{
+      mealItemId: string;
+      gramsMg: number | null;
+      nutrients: Record<(typeof nutritionKeysForComposition)[number], number | null>;
+    }>) => {
+      const totals = Object.fromEntries(nutritionKeysForComposition.map((key) => {
+        const total = leafNutrition.totals[key];
+        const missingItemCount =
+          total.missingItemCount + unknownNutritionItems.length;
+        return [key, {
+          value: missingItemCount === 0 ? total.knownValue : null,
+          knownValue: total.knownValue,
+          missingItemCount,
+          completeness: missingItemCount === 0
+            ? 'complete' as const
+            : 'partial' as const,
+        }];
+      })) as Record<
+        (typeof nutritionKeysForComposition)[number],
+        {
+          value: number | null;
+          knownValue: number;
+          missingItemCount: number;
+          completeness: 'complete' | 'partial';
+        }
+      >;
+      return { items: nutritionItems, totals };
+    };
     if (compositeRoots.size === 0)
-      return { nutrition: leafNutrition, resolutionsByItemId };
+      return {
+        nutrition: withUnknownItems([
+          ...leafNutrition.items,
+          ...unknownNutritionItems,
+        ]),
+        resolutionsByItemId,
+      };
     const byLeafId = new Map(leafNutrition.items.map((item) => [item.mealItemId, item]));
     const rootItems = items.map((item) => {
+      if (unknownItemIds.has(item.id))
+        return unknownNutritionItems.find(
+          (candidate) => candidate.mealItemId === item.id,
+        )!;
       const leaves = compositeRoots.get(item.id);
       if (!leaves) return byLeafId.get(item.id)!;
       const leafValues = leaves.map((leaf) => byLeafId.get(leaf.mealItemId)!);
@@ -3235,7 +3371,10 @@ async function calculateResolvedMealNutrition(
         })) as any,
       };
     });
-    return { nutrition: { ...leafNutrition, items: rootItems }, resolutionsByItemId };
+    return {
+      nutrition: withUnknownItems(rootItems),
+      resolutionsByItemId,
+    };
   } catch (error) {
     return {
       details: [{
@@ -3379,7 +3518,13 @@ function servingAmountToGrams(
 async function revalidateConfirmationResolutionTuples(
   database: Database,
   mealLogId: string,
-  roots: Array<{ id: string; recognitionRegionIndex: number | null; itemRevision: number }>,
+  roots: Array<{
+    id: string;
+    recognitionRegionIndex: number | null;
+    itemRevision: number;
+    origin: string;
+    foodId: string | null;
+  }>,
   requested: Array<{
     itemId: string;
     mappingDecisionId?: string | undefined;
@@ -3390,6 +3535,16 @@ async function revalidateConfirmationResolutionTuples(
   const details: Array<{ itemId: string; code: string }> = [];
   const previewsByItemId = new Map<string, unknown>();
   const requestedByItemId = new Map(requested.map((item) => [item.itemId, item]));
+  const authoritativeRoots = roots.filter((root) => {
+    const request = requestedByItemId.get(root.id);
+    return root.foodId !== null ||
+      request?.mappingDecisionId !== undefined ||
+      request?.calculationPreviewId !== undefined ||
+      request?.decompositionRevisionId !== undefined;
+  });
+  if (authoritativeRoots.length === 0) {
+    return { details, previewsByItemId, stale: false };
+  }
   const [observation] = await database
     .select({
       id: storedObservations.id,
@@ -3428,9 +3583,9 @@ async function revalidateConfirmationResolutionTuples(
     root.recognitionRegionIndex === null
       ? `manual:${root.id}`
       : localIdByRegion.get(root.recognitionRegionIndex) ?? null;
-  if (roots.some((root) => localIdForRoot(root) === null))
+  if (authoritativeRoots.some((root) => localIdForRoot(root) === null))
     return { details, previewsByItemId, stale: true };
-  const rootLocalIds = roots.map((root) => localIdForRoot(root)!);
+  const rootLocalIds = authoritativeRoots.map((root) => localIdForRoot(root)!);
   if (rootLocalIds.length === 0) return { details, previewsByItemId, stale: false };
   const decisions = await database
     .select({
@@ -3456,7 +3611,7 @@ async function revalidateConfirmationResolutionTuples(
     if (!decisionByLocalId.has(decision.localObservationId))
       decisionByLocalId.set(decision.localObservationId, decision);
   }
-  for (const root of roots) {
+  for (const root of authoritativeRoots) {
     const decision = decisionByLocalId.get(localIdForRoot(root)!);
     if (
       !decision ||
@@ -3767,26 +3922,45 @@ function isComponentPreviewIdentityCurrent(
     value.leaves.length > 0;
 }
 function nutritionPreviewResponse(
-  nutrition: ReturnType<typeof calculateMealNutrition>,
+  nutrition: {
+    items: Array<{
+      mealItemId: string;
+      gramsMg: number | null;
+      nutrients: Record<
+        (typeof nutritionKeysForComposition)[number],
+        number | null
+      >;
+    }>;
+    totals: Record<
+      (typeof nutritionKeysForComposition)[number],
+      {
+        value: number | null;
+        knownValue: number;
+        missingItemCount: number;
+        completeness: 'complete' | 'partial';
+      }
+    >;
+  },
   resolutionsByItemId: Map<string, Awaited<ReturnType<typeof resolveCurrentMealItems>>[number]>,
 ) {
   const items = nutrition.items.map((item) => {
-    const resolution = resolutionsByItemId.get(item.mealItemId)!;
-    const profile = resolution.profile!;
+    const resolution = resolutionsByItemId.get(item.mealItemId);
+    const profile = resolution?.profile;
     return {
       mealItemId: item.mealItemId,
       gramsMg: item.gramsMg,
       nutrients: item.nutrients,
       source: {
-        foodId: resolution.food!.id,
-        nutrientProfileId: profile.id,
-        sourceRegistryId: profile.sourceRegistryId,
-        sourceItemId: profile.sourceItemId,
-        datasetVersion: profile.datasetVersion,
-        qualityGrade: profile.qualityGrade,
-        servingId: resolution.serving?.id ?? null,
-        servingSourceRegistryId: resolution.serving?.sourceRegistryId ?? null,
-        servingQualityGrade: resolution.serving?.qualityGrade ?? null,
+        foodId: resolution?.food?.id ?? null,
+        nutrientProfileId: profile?.id ?? null,
+        sourceRegistryId: profile?.sourceRegistryId ?? null,
+        sourceItemId: profile?.sourceItemId ?? null,
+        datasetVersion: profile?.datasetVersion ?? null,
+        qualityGrade: profile?.qualityGrade ?? null,
+        servingId: resolution?.serving?.id ?? null,
+        servingSourceRegistryId:
+          resolution?.serving?.sourceRegistryId ?? null,
+        servingQualityGrade: resolution?.serving?.qualityGrade ?? null,
       },
     };
   });
