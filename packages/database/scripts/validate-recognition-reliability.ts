@@ -49,7 +49,17 @@ const fixtureAssertions = `
     SELECT pg_get_functiondef('recognition_provider_invocation_guard()'::regprocedure) INTO invocation_guard;
 
     -- Legacy defaults and immutable meal/image binding preserve existing observations.
-    IF position('legacy_v1' IN attempt_guard) = 0
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_attribute attribute
+      JOIN pg_class relation ON relation.oid = attribute.attrelid
+      JOIN pg_attrdef default_value
+        ON default_value.adrelid = attribute.attrelid
+        AND default_value.adnum = attribute.attnum
+      WHERE relation.relname = 'recognition_attempt'
+        AND attribute.attname = 'protocol_version'
+        AND position('legacy_v1' IN pg_get_expr(default_value.adbin, default_value.adrelid)) > 0
+    )
       OR position('workflow binding is immutable' IN attempt_guard) = 0
       OR position('reserved recognition user grant must be consumed' IN attempt_guard) = 0 THEN
       RAISE EXCEPTION 'legacy or grant fixture missing';
@@ -145,9 +155,7 @@ const stateFixtures = `
   UPDATE "recognition_attempt"
   SET protocol_version = 'v2_option_b',
       next_execution_ordinal = 2,
-      automatic_execution_count = 1,
-      user_grant_state = 'reserved',
-      user_grant_execution_id = '00000000-0000-0000-0000-000000000105'
+      automatic_execution_count = 1
   WHERE id = '00000000-0000-0000-0000-000000000103';
 
   -- Expired initial and user-recovery executions have separate reservation paths.
@@ -169,7 +177,9 @@ const stateFixtures = `
     AND status = 'queued';
 
   UPDATE "recognition_attempt"
-  SET next_execution_ordinal = 3
+  SET next_execution_ordinal = 3,
+      user_grant_state = 'reserved',
+      user_grant_execution_id = '00000000-0000-0000-0000-000000000105'
   WHERE id = '00000000-0000-0000-0000-000000000103';
 
   INSERT INTO "recognition_execution" (

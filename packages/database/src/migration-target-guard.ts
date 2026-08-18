@@ -174,8 +174,13 @@ function branchIsReady(value: unknown, input: GuardInput): boolean {
 function activeEndpoint(value: unknown, input: GuardInput): NeonEndpoint {
   if (!value || typeof value !== 'object' || !Array.isArray((value as { endpoints?: unknown }).endpoints)) return fail();
   const endpoints = (value as { endpoints: unknown[] }).endpoints;
-  if (endpoints.length !== 1) return fail();
-  const endpoint = endpoints[0];
+  const matchingEndpoints = endpoints.filter((endpoint) => {
+    if (!endpoint || typeof endpoint !== 'object') return false;
+    const record = endpoint as Record<string, unknown>;
+    return record.project_id === input.projectId && record.branch_id === input.branchId;
+  });
+  if (matchingEndpoints.length !== 1) return fail();
+  const endpoint = matchingEndpoints[0];
   if (!endpoint || typeof endpoint !== 'object') return fail();
   const record = endpoint as Record<string, unknown>;
   if (

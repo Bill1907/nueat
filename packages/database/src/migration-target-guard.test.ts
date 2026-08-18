@@ -120,6 +120,29 @@ describe('Neon migration target guard', () => {
     await expect(verifyDatabaseTarget(baseEnv(), { fetch: neonFetch({ failAt: 2 }) })).rejects.toThrow();
   });
 
+  test('selects the exact branch endpoint in a multi-branch project', async () => {
+    const otherBranchEndpoint = {
+      ...endpointRecord,
+      id: 'endpoint-production',
+      host: 'ep-production.aws.neon.tech',
+      branch_id: 'branch-production',
+    };
+    const endpoints = { endpoints: [otherBranchEndpoint, endpointRecord] };
+    const target = await verifyDatabaseTarget(baseEnv(), {
+      fetch: neonFetch({ firstEndpoint: endpoints, secondEndpoint: endpoints }),
+    });
+    expect(target.endpointId).toBe('endpoint-123');
+  });
+
+  test('rejects duplicate endpoints for the selected branch', async () => {
+    const duplicate = {
+      endpoints: [endpointRecord, { ...endpointRecord, id: 'endpoint-duplicate' }],
+    };
+    await expect(verifyDatabaseTarget(baseEnv(), {
+      fetch: neonFetch({ firstEndpoint: duplicate, secondEndpoint: duplicate }),
+    })).rejects.toThrow('Database target verification failed');
+  });
+
   test('propagates only the verified exact URL to the Drizzle child', async () => {
     const target: VerifiedDatabaseTarget = {
       databaseUrl: directUrl,
