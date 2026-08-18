@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "kind": "production-canary-admission",
+  "generatedAt": "2026-08-18T06:19:32Z",
+  "approvedPlanSha256": "55ce3c177269528c14b7806da7696b685b6f8d87cf117356674f4cdcd8232ff8",
+  "commit": "8277219b67d385962943d8e40bca9a81515122ff",
+  "operator": "boseong",
+  "changeReference": "nueat-observation-first-20260818",
+  "isolatedValidation": {
+    "projectId": "red-boat-99399498",
+    "branchId": "br-rapid-cell-azhic6fy",
+    "result": "transactional_validation_passed_and_rolled_back"
+  },
+  "productionMigration": {
+    "projectId": "red-boat-99399498",
+    "branchId": "br-blue-cloud-azfldedk",
+    "capability": "recognition_reliability_v2",
+    "migrationId": 56,
+    "migrationSha256": "dc0d18ef2ea2e5e53599e6163d305c18dd2936797d98781e207d5c0cbde239b7",
+    "additiveTableCount": 10,
+    "result": "guarded_apply_passed"
+  },
+  "verification": {
+    "tests": "422 passed, 0 failed, 1779 assertions",
+    "typecheck": "passed",
+    "lint": "passed",
+    "databaseCheck": "passed",
+    "deploymentId": "5dd43ce9-55d2-4a47-ab9f-08947c6cd4f1",
+    "readiness": "ready",
+    "mode": "legacy_observe",
+    "cohortPercent": 0,
+    "recoveryEnabled": false,
+    "recognitionWorker": "idle",
+    "sdkMaxRetries": 0,
+    "productionProbe": "passed"
+  },
+  "canary": {
+    "mode": "v2_one_call",
+    "cohortPercent": 5,
+    "recoveryEnabledAtAdmission": false,
+    "minimumObservationHours": 24,
+    "ingressHardTimeoutMs": 300000,
+    "applicationHardTimeoutMs": 300000,
+    "rollback": "disable recovery and cohort, then switch to legacy_observe; preserve additive schema"
+  }
+}

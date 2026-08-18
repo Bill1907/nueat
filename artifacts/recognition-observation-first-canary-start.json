@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "kind": "production-recognition-canary-start",
+  "startedAt": "2026-08-18T06:21:50.810Z",
+  "recordedAt": "2026-08-18T06:23:04Z",
+  "commit": "8277219b67d385962943d8e40bca9a81515122ff",
+  "deploymentId": "c1cd321d-781e-4887-bb19-22440d2a715d",
+  "admissionEvidenceSha256": "ce668bc74e148df08aba214699c09eb36f47c8cc7b3efeb91993c203c032efde",
+  "productionProbe": {
+    "ready": true,
+    "mode": "v2_one_call",
+    "cohortPercent": 5,
+    "recoveryEnabled": false,
+    "sdkMaxRetries": 0,
+    "recognitionWorker": "idle",
+    "database": "up"
+  },
+  "minimumObservationHours": 24,
+  "earliestExpansionAt": "2026-08-19T06:21:50.810Z",
+  "expansionBlockedUntil": [
+    "minimum observation window has elapsed",
+    "request-count and latency population are sufficient",
+    "p95 eligible completion is at most 30000ms",
+    "all admitted executions are terminal within 60000ms",
+    "privacy, replay, reservation, authentication, deletion and compatibility checks pass",
+    "rollback drill receipt is captured"
+  ],
+  "rollback": "Set recovery false and cohort zero, then switch mode to legacy_observe; preserve additive schema and observations."
+}
